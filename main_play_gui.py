@@ -137,12 +137,16 @@ def main():
                     dashboard.speed = 20
                 elif event.key == pygame.K_5:
                     dashboard.speed = 100
+                elif event.key == pygame.K_h:
+                    dashboard.show_help = not dashboard.show_help
+                    dashboard.btn_help.is_active = dashboard.show_help
                 elif event.key == pygame.K_c:
                     # Save screenshot
                     os.makedirs("screenshots", exist_ok=True)
                     s_path = f"screenshots/monopoly_gui_{int(time.time())}.png"
                     pygame.image.save(screen, s_path)
                     print(f"Screenshot saved to: {s_path}")
+                    core.event_log.append(f"Screenshot saved: {os.path.basename(s_path)}")
 
             # Check dashboard button clicks
             action = dashboard.handle_event(event)
@@ -150,6 +154,12 @@ def main():
                 step_requested = True
             elif action == "reset":
                 core.reset(seed=args.seed)
+            elif action == "screenshot":
+                os.makedirs("screenshots", exist_ok=True)
+                s_path = f"screenshots/monopoly_gui_{int(time.time())}.png"
+                pygame.image.save(screen, s_path)
+                print(f"Screenshot saved to: {s_path}")
+                core.event_log.append(f"Screenshot saved: {os.path.basename(s_path)}")
 
         # Decide whether to step simulation
         step_interval = 1.0 / max(1, dashboard.speed * 2)

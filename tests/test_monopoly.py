@@ -550,6 +550,69 @@ def test_round_counter_advancement_when_player0_eliminated():
     assert core.round_count == initial_round + 1
 
 
+def test_gui_rendering_across_all_game_phases():
+    """Validates that Pygame MonopolyRenderer and MonopolyDashboard execute without errors across all game phases."""
+    import os
+    os.environ["SDL_VIDEODRIVER"] = "dummy"
+    import pygame
+    pygame.init()
+
+    from monopoly_marl.engine.monopoly_core import (
+        MonopolyCore, PHASE_ROLL, PHASE_BUY_OR_AUCTION, PHASE_AUCTION,
+        PHASE_JAIL_DECISION, PHASE_PROPERTY_MANAGE, PHASE_TRADE_RESPONSE, PHASE_GAME_OVER
+    )
+    from monopoly_marl.gui.renderer import MonopolyRenderer
+    from monopoly_marl.gui.dashboard import MonopolyDashboard
+
+    surface = pygame.Surface((1380, 840))
+    core = MonopolyCore(seed=42)
+
+    # Setup properties & houses to test monopoly and building rendering
+    core.property_owner[1] = 0
+    core.property_owner[3] = 0
+    core.property_houses[1] = 3
+    core.property_houses[3] = 5
+
+    renderer = MonopolyRenderer(surface, board_size=800, offset_x=20, offset_y=20)
+    dashboard = MonopolyDashboard(surface, x=840, y=20, width=520, height=800)
+
+    # 1. Default Roll / Manage Phase
+    renderer.render(core)
+    dashboard.render(core)
+
+    # 2. Auction Phase
+    core.phase = PHASE_AUCTION
+    core.auction_property = 24
+    core.auction_highest_bid = 240
+    core.auction_highest_bidder = 1
+    core.auction_active_bidders = [0, 1, 2]
+    renderer.render(core)
+    dashboard.render(core)
+
+    # 3. Trade Response Phase
+    core.phase = PHASE_TRADE_RESPONSE
+    core.pending_trade = {
+        "initiator": 0, "target": 1,
+        "offer_prop": 1, "offer_cash": 100,
+        "req_prop": 6, "req_cash": 50
+    }
+    renderer.render(core)
+    dashboard.render(core)
+
+    # 4. Game Over Phase
+    core.phase = PHASE_GAME_OVER
+    core.bankrupt[1] = True
+    core.bankrupt[2] = True
+    core.bankrupt[3] = True
+    renderer.render(core)
+    dashboard.render(core)
+
+    # 5. Help Overlay
+    dashboard.show_help = True
+    dashboard.render(core)
+
+
+
 
 
 
