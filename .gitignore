@@ -42,6 +42,7 @@ htmlcov/
 tmp/
 tmp_checkpoints/
 *.tmp
+checkpoints_backup*/
 
 # Operating System Files
 .DS_Store
