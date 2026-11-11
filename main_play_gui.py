@@ -24,6 +24,8 @@ def parse_args():
     parser.add_argument("--checkpoint", type=str, default=None, help="Path to trained Actor checkpoint")
     parser.add_argument("--max_rounds", type=int, default=None, help="Max game rounds (None for unbounded horizon survival)")
     parser.add_argument("--speed", type=int, default=5, choices=[1, 2, 5, 20, 100], help="Initial simulation speed multiplier")
+    parser.add_argument("--deterministic", action="store_true", default=True, help="Use deterministic policy actions (default: True)")
+    parser.add_argument("--stochastic", dest="deterministic", action="store_false", help="Use stochastic action sampling")
     parser.add_argument("--seed", type=int, default=None, help="Random seed")
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu", help="Device")
     return parser.parse_args()
@@ -199,7 +201,7 @@ def main():
 
                 policy = policies[p_act]
                 with torch.no_grad():
-                    actions_dict, _, _ = policy(obs_t, masks_t, deterministic=False)
+                    actions_dict, _, _ = policy(obs_t, masks_t, deterministic=args.deterministic)
 
                 # Convert to integer actions
                 act = {k: int(actions_dict[k].item()) for k in action_keys}

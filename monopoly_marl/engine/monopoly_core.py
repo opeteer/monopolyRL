@@ -754,6 +754,11 @@ class MonopolyCore:
                         if self.cash[player_id] >= unmtg_cost:
                             mask_property[120 + p] = 1
 
+            # If agent has any valid property management action (build, sell, unmortgage, emergency mortgage),
+            # allow ACT_CORE_ROLL_PASS (execute property action) alongside ACT_CORE_END_MANAGE
+            if np.any(mask_property):
+                mask_core[ACT_CORE_ROLL_PASS] = 1
+
             # Bilateral Trade Proposals (max 1 trade proposal per turn)
             if self.allow_trade and getattr(self, "trade_proposals_this_turn", 0) == 0:
                 # Target players (3 other players)

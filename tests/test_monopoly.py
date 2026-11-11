@@ -19,7 +19,7 @@ import torch
 
 from monopoly_marl.engine.monopoly_core import (
     MonopolyCore, PHASE_ROLL, PHASE_JAIL_DECISION, PHASE_BUY_OR_AUCTION,
-    PHASE_AUCTION, PHASE_PROPERTY_MANAGE, ACT_CORE_BUY_DIRECT,
+    PHASE_AUCTION, PHASE_PROPERTY_MANAGE, ACT_CORE_ROLL_PASS, ACT_CORE_BUY_DIRECT,
     ACT_CORE_DECLINE_BUY, ACT_CORE_PAY_JAIL_50, ACT_CORE_USE_GOOJF,
     ACT_CORE_END_MANAGE, ACT_AUC_FOLD, ACT_AUC_BID_1, ACT_AUC_BID_10,
     ACT_AUC_BID_50, ACT_AUC_BID_100, ACT_AUC_JUMP_LIST, ACT_AUC_JUMP_SQUEEZE
@@ -164,7 +164,7 @@ def test_mortgage_and_interest():
     core.active_decision_player = 0
 
     # Mortgage action: 80 + 1 = 81
-    act_mtg = {"core": ACT_CORE_END_MANAGE + 1, "auction": 0, "property": 81, "trade_target": 0,
+    act_mtg = {"core": ACT_CORE_ROLL_PASS, "auction": 0, "property": 81, "trade_target": 0,
                "trade_offer_prop": 40, "trade_offer_cash": 0, "trade_req_prop": 40,
                "trade_req_cash": 0, "trade_response": 0}
     core.step({"player_0": act_mtg})
@@ -176,7 +176,7 @@ def test_mortgage_and_interest():
     core.phase = PHASE_PROPERTY_MANAGE
     core.active_decision_player = 0
     # Unmortgage action: 120 + 1 = 121
-    act_unmtg = {"core": ACT_CORE_END_MANAGE + 1, "auction": 0, "property": 121, "trade_target": 0,
+    act_unmtg = {"core": ACT_CORE_ROLL_PASS, "auction": 0, "property": 121, "trade_target": 0,
                  "trade_offer_prop": 40, "trade_offer_cash": 0, "trade_req_prop": 40,
                  "trade_req_cash": 0, "trade_response": 0}
     core.step({"player_0": act_unmtg})
@@ -678,6 +678,77 @@ def test_gui_cards_rendering_and_interaction():
     close_btn_pos = (cx + 105, cy - 140)
     renderer.handle_click(close_btn_pos)
     assert renderer.inspect_tile_id is None
+
+
+def test_house_and_hotel_building_mechanics():
+    """Validates building houses, even building constraints, bank scarcity, hotel upgrades, and scaled rent."""
+    from monopoly_marl.engine.monopoly_core import MonopolyCore, PHASE_PROPERTY_MANAGE, ACT_CORE_ROLL_PASS, ACT_CORE_END_MANAGE
+
+    core = MonopolyCore(seed=42)
+    # Give Player 0 the Brown monopoly (Mediterranean #1 and Baltic #3)
+    core.property_owner[1] = 0
+    core.property_owner[3] = 0
+    core.cash[0] = 3000
+    core.phase = PHASE_PROPERTY_MANAGE
+    core.active_decision_player = 0
+
+    assert core.bank_houses == 32
+    assert core.bank_hotels == 12
+
+    # Step 1: Build house on tile 1 ($50)
+    masks = core.get_action_masks(0)
+    assert masks["core"][ACT_CORE_ROLL_PASS] == 1
+    assert masks["core"][ACT_CORE_END_MANAGE] == 1
+    assert masks["property"][1] == 1
+    assert masks["property"][3] == 1
+
+    act_b1 = {"core": ACT_CORE_ROLL_PASS, "auction": 0, "property": 1, "trade_target": 0,
+              "trade_offer_prop": 40, "trade_offer_cash": 0, "trade_req_prop": 40,
+              "trade_req_cash": 0, "trade_response": 0}
+    core.step({"player_0": act_b1})
+
+    assert core.property_houses[1] == 1
+    assert core.property_houses[3] == 0
+    assert core.bank_houses == 31
+    assert core.cash[0] == 2950
+    assert core.phase == PHASE_PROPERTY_MANAGE
+
+    # Step 2: Even building constraint - tile 1 has 1 house, min_h is 0, so must build on tile 3!
+    masks2 = core.get_action_masks(0)
+    assert masks2["property"][1] == 0  # Cannot build 2nd house on 1 until 3 gets 1st house
+    assert masks2["property"][3] == 1
+
+    act_b3 = {"core": ACT_CORE_ROLL_PASS, "auction": 0, "property": 3, "trade_target": 0,
+              "trade_offer_prop": 40, "trade_offer_cash": 0, "trade_req_prop": 40,
+              "trade_req_cash": 0, "trade_response": 0}
+    core.step({"player_0": act_b3})
+
+    assert core.property_houses[1] == 1
+    assert core.property_houses[3] == 1
+    assert core.bank_houses == 30
+    assert core.cash[0] == 2900
+
+    # Fast forward to 4 houses each
+    core.property_houses[1] = 4
+    core.property_houses[3] = 4
+    core.bank_houses = 24
+
+    # Upgrade tile 1 to HOTEL ($50)
+    # Consumes 1 hotel, releases 4 houses back to bank
+    core.phase = PHASE_PROPERTY_MANAGE
+    core.active_decision_player = 0
+    core.manage_actions_this_turn = 0
+    core.step({"player_0": act_b1})
+
+    assert core.property_houses[1] == 5  # 5 = Hotel
+    assert core.bank_hotels == 11        # Consumed 1 hotel
+    assert core.bank_houses == 28        # 24 + 4 houses returned!
+
+    # Verify scaled hotel rent when player 1 lands on Mediterranean Ave (#1)
+    # Base rent is $2, but with hotel, Mediterranean rent is $250!
+    rent = core._calculate_rent(1, dice_sum=7)
+    assert rent == 250
+
 
 
 
