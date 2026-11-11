@@ -11,7 +11,7 @@ import gymnasium as gym
 from gymnasium import spaces
 from pettingzoo import ParallelEnv
 
-from monopoly_marl.engine.monopoly_core import MonopolyCore, TRADE_CASH_BRACKETS
+from monopoly_marl.engine.monopoly_core import MonopolyCore, TRADE_CASH_BRACKETS, DEFAULT_PLAYER_NAMES
 
 
 class MonopolyParallelEnv(ParallelEnv):
@@ -21,7 +21,7 @@ class MonopolyParallelEnv(ParallelEnv):
 
     def __init__(
         self,
-        max_rounds: int = 150,
+        max_rounds: Optional[int] = None,
         gamma: float = 0.99,
         seed: Optional[int] = None,
         w1: float = 0.03,
@@ -31,15 +31,21 @@ class MonopolyParallelEnv(ParallelEnv):
         w_syn: float = 0.005,
         allow_trade: bool = True,
         include_synergy_obs: bool = True,
+        player_names: Optional[List[str]] = None,
     ):
         super().__init__()
         self.possible_agents = [f"player_{i}" for i in range(4)]
         self.agents = list(self.possible_agents)
+        self.player_names = list(player_names) if player_names is not None else list(DEFAULT_PLAYER_NAMES)
+        self.agent_to_name = {
+            f"player_{i}": self.player_names[i] for i in range(len(self.player_names))
+        }
         self.core = MonopolyCore(
             seed=seed, max_rounds=max_rounds, gamma=gamma,
             w1=w1, w2=w2, w3=w3, w4=w4, w_syn=w_syn,
             allow_trade=allow_trade,
             include_synergy_obs=include_synergy_obs,
+            player_names=self.player_names,
         )
         self.seed_val = seed
 
@@ -148,8 +154,11 @@ class MonopolyParallelEnv(ParallelEnv):
 
     def render(self):
         """Headless text render."""
-        print(f"--- Round {self.core.round_count} (Active: Player {self.core.active_decision_player}, Phase {self.core.phase}) ---")
+        round_str = f"{self.core.round_count}/∞ (Unbounded Survival)" if self.core.max_rounds is None else f"{self.core.round_count}/{self.core.max_rounds}"
+        active_name = self.core.get_player_name(self.core.active_decision_player)
+        print(f"--- Round {round_str} (Active: {active_name}, Phase {self.core.phase}) ---")
         for i in range(4):
-            print(f"Player {i}: Cash=${self.core.cash[i]} Pos={self.core.position[i]} Jail={self.core.in_jail[i]} Bankrupt={self.core.bankrupt[i]}")
+            p_name = self.core.get_player_name(i)
+            print(f"{p_name} (P{i}): Cash=${self.core.cash[i]} Pos={self.core.position[i]} Jail={self.core.in_jail[i]} Bankrupt={self.core.bankrupt[i]}")
         print(f"Bank: Houses={self.core.bank_houses}/32, Hotels={self.core.bank_hotels}/12")
         print("Recent logs:", self.core.event_log[-3:])

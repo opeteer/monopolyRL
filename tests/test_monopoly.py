@@ -488,5 +488,68 @@ def test_property_transaction_features_in_buy_phase():
     assert global_state.shape == (1628,), f"Expected 1628-dim global state, got {global_state.shape}"
 
 
+def test_agent_names_and_unbounded_horizon_survival():
+    """Validates player names (Luke, Graham, Pieter, Allison) and unbounded survival victory conditions."""
+    from monopoly_marl.engine.monopoly_core import DEFAULT_PLAYER_NAMES, PHASE_GAME_OVER
+    from monopoly_marl.engine.pettingzoo_wrapper import MonopolyParallelEnv
+
+    assert DEFAULT_PLAYER_NAMES == ["Luke", "Graham", "Pieter", "Allison"]
+
+    core = MonopolyCore(seed=42, max_rounds=None)
+    assert core.max_rounds is None, "max_rounds should be None for unbounded horizon"
+    assert core.get_player_name(0) == "Luke"
+    assert core.get_player_name(1) == "Graham"
+    assert core.get_player_name(2) == "Pieter"
+    assert core.get_player_name(3) == "Allison"
+
+    # Observation must have valid dimension (399,)
+    obs = core.get_actor_observation(0)
+    assert obs.shape == (399,)
+
+    # Bankrupt players 1, 2, 3 one by one
+    core.cash[1] = -100
+    core.cash[2] = -100
+    core.cash[3] = -100
+
+    dummy_actions = {
+        f"player_{i}": {
+            "core": 0, "auction": 0, "property": 0,
+            "trade_target": 0, "trade_offer_prop": 40, "trade_offer_cash": 0,
+            "trade_req_prop": 40, "trade_req_cash": 0, "trade_response": 0
+        }
+        for i in range(4)
+    }
+
+    obs, rewards, dones, infos = core.step(dummy_actions)
+    assert dones["player_1"] is True
+    assert dones["player_2"] is True
+    assert dones["player_3"] is True
+    assert dones["__all__"] is True
+    assert core.phase == PHASE_GAME_OVER
+    # Luke is the last agent standing
+    assert any("Luke is the TOURNAMENT CHAMPION (Last Agent Standing)" in msg for msg in core.event_log)
+
+    # Test PettingZoo wrapper integration
+    pz_env = MonopolyParallelEnv(max_rounds=None)
+    assert pz_env.agent_to_name["player_0"] == "Luke"
+    assert pz_env.agent_to_name["player_1"] == "Graham"
+    assert pz_env.agent_to_name["player_2"] == "Pieter"
+    assert pz_env.agent_to_name["player_3"] == "Allison"
+
+
+def test_round_counter_advancement_when_player0_eliminated():
+    """Validates that round_count advances even when Player 0 (Luke) is bankrupt."""
+    core = MonopolyCore(seed=123, max_rounds=None)
+    core.bankrupt[0] = True  # Luke eliminated
+    core.current_player = 3
+    initial_round = core.round_count
+
+    # Ending turn for player 3 wraps around to player 1 (skipping 0) and increments round_count
+    core._end_turn()
+    assert core.current_player == 1
+    assert core.round_count == initial_round + 1
+
+
+
 
 

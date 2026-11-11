@@ -22,7 +22,7 @@ from monopoly_marl.gui.dashboard import MonopolyDashboard
 def parse_args():
     parser = argparse.ArgumentParser(description="Monopoly MARL Real-Time Pygame GUI")
     parser.add_argument("--checkpoint", type=str, default=None, help="Path to trained Actor checkpoint")
-    parser.add_argument("--max_rounds", type=int, default=150, help="Max game rounds")
+    parser.add_argument("--max_rounds", type=int, default=None, help="Max game rounds (None for unbounded horizon survival)")
     parser.add_argument("--seed", type=int, default=None, help="Random seed")
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu", help="Device")
     return parser.parse_args()
@@ -103,6 +103,8 @@ def main():
     last_step_time = time.time()
 
     print("=== Pygame MARL Monopoly GUI Running ===")
+    print(f"Agents: {', '.join(core.player_names)} (P0..P3)")
+    print("Rule: Unbounded Horizon Survival (Winner: Last Agent Standing)")
     print("Controls: Space: Pause/Play | S: Step | R: Reset | 1-5: Speed | C: Screenshot | Esc: Quit")
 
     while running:

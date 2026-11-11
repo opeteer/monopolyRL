@@ -55,6 +55,9 @@ ACT_AUC_JUMP_SQUEEZE = 6  # Jump bid to squeeze max active opponent cash (+ $1)
 # Trade Cash Brackets (10 options)
 TRADE_CASH_BRACKETS = [0, 25, 50, 100, 150, 200, 250, 300, 400, 500]
 
+# Default Tournament Agent Names (P0: Luke, P1: Graham, P2: Pieter, P3: Allison)
+DEFAULT_PLAYER_NAMES = ["Luke", "Graham", "Pieter", "Allison"]
+
 
 class MonopolyCore:
     """Official Tournament-Grade Monopoly Game State Machine."""
@@ -62,7 +65,7 @@ class MonopolyCore:
     def __init__(
         self,
         seed: Optional[int] = None,
-        max_rounds: int = 150,
+        max_rounds: Optional[int] = None,
         gamma: float = 0.99,
         w1: float = 0.03,
         w2: float = 0.001,
@@ -71,11 +74,13 @@ class MonopolyCore:
         w_syn: float = 0.005,
         allow_trade: bool = True,
         include_synergy_obs: bool = True,
+        player_names: Optional[List[str]] = None,
     ):
         self.rng = random.Random(seed)
         self.np_rng = np.random.default_rng(seed)
-        self.max_rounds = max_rounds
+        self.max_rounds = max_rounds  # None indicates unbounded horizon (infinite survival)
         self.gamma = gamma
+        self.player_names = list(player_names) if player_names is not None else list(DEFAULT_PLAYER_NAMES)
 
         # Calibrated PBRS Weights
         self.w1 = w1   # Cash log potential (calibrated to 0.03 to balance cash vs development)
@@ -92,6 +97,12 @@ class MonopolyCore:
     def set_allow_trade(self, allow: bool):
         """Curriculum learning toggle: enable or disable trade proposals via action mask."""
         self.allow_trade = bool(allow)
+
+    def get_player_name(self, player_id: int) -> str:
+        """Returns the tournament agent name for player_id."""
+        if 0 <= player_id < len(self.player_names):
+            return self.player_names[player_id]
+        return f"Player {player_id}"
 
     def reset(self, seed: Optional[int] = None) -> Dict[str, Any]:
         """Resets the environment to initial tournament starting state."""
@@ -862,8 +873,8 @@ class MonopolyCore:
         B_h = [self.bank_houses / 32.0]
         B_ht = [self.bank_hotels / 12.0]
 
-        # Tau: round progress
-        tau = [self.round_count / float(self.max_rounds)]
+        # Tau: round progress (0.0 for unbounded infinite horizon)
+        tau = [0.0 if self.max_rounds is None or self.max_rounds <= 0 else self.round_count / float(self.max_rounds)]
 
         # u: phase one-hot (NUM_PHASES = 7)
         u = [0.0] * NUM_PHASES
@@ -983,12 +994,12 @@ class MonopolyCore:
                 if self.bankrupt[pl]:
                     env_rewards[pl] -= 1.0
 
-        # Check terminal conditions
+        # Check terminal conditions (Unbounded horizon survival or max rounds reached)
         active_players = [pl for pl in range(4) if not self.bankrupt[pl]]
         dones = {f"player_{pl}": self.bankrupt[pl] for pl in range(4)}
         
-        # If only 1 player remains: winner!
-        if len(active_players) <= 1 or self.round_count >= self.max_rounds:
+        max_rounds_reached = (self.max_rounds is not None) and (self.round_count >= self.max_rounds)
+        if len(active_players) <= 1 or max_rounds_reached:
             self.phase = PHASE_GAME_OVER
             for pl in range(4):
                 dones[f"player_{pl}"] = True
@@ -997,13 +1008,15 @@ class MonopolyCore:
             if len(active_players) == 1:
                 winner = active_players[0]
                 env_rewards[winner] += 1.0
-                self.event_log.append(f"Game Over! Player {winner} is the TOURNAMENT CHAMPION!")
+                self.event_log.append(f"Game Over! {self.get_player_name(winner)} is the TOURNAMENT CHAMPION (Last Agent Standing)!")
+            elif len(active_players) == 0:
+                self.event_log.append("Game Over! All players eliminated simultaneously.")
             else:
-                # Max rounds reached: player with highest net worth wins
+                # Max rounds reached (if finite horizon was configured): player with highest net worth wins
                 net_worths = [self.get_player_net_worth(pl) if not self.bankrupt[pl] else -99999 for pl in range(4)]
                 winner = int(np.argmax(net_worths))
                 env_rewards[winner] += 1.0
-                self.event_log.append(f"Max rounds ({self.max_rounds}) reached. Player {winner} wins on Net Worth!")
+                self.event_log.append(f"Max rounds ({self.max_rounds}) reached. {self.get_player_name(winner)} wins on Net Worth!")
         else:
             dones["__all__"] = False
 
@@ -1046,7 +1059,7 @@ class MonopolyCore:
 
         # SPEEDING RULE: 3 consecutive doubles -> immediately to Jail!
         if self.consecutive_doubles >= 3:
-            self.event_log.append(f"Player {p} rolled doubles 3 times in a row! SPEEDING -> Sent directly to JAIL!")
+            self.event_log.append(f"{self.get_player_name(p)} rolled doubles 3 times in a row! SPEEDING -> Sent directly to JAIL!")
             self._send_to_jail(p)
             self._end_turn()
             return
@@ -1056,12 +1069,12 @@ class MonopolyCore:
         new_pos = (old_pos + dice_sum) % 40
         self.position[p] = new_pos
 
-        self.event_log.append(f"Player {p} rolled ({d1}, {d2}) = {dice_sum}. Moved from {old_pos} to {new_pos} ({TILES_DATA[new_pos]['name']}).")
+        self.event_log.append(f"{self.get_player_name(p)} rolled ({d1}, {d2}) = {dice_sum}. Moved from {old_pos} to {new_pos} ({TILES_DATA[new_pos]['name']}).")
 
         # Check Passing GO
         if new_pos < old_pos:
             self.cash[p] += 200
-            self.event_log.append(f"Player {p} passed GO and collected $200.")
+            self.event_log.append(f"{self.get_player_name(p)} passed GO and collected $200.")
 
         self._handle_landing(p, new_pos, dice_sum, is_double)
 
@@ -1071,7 +1084,7 @@ class MonopolyCore:
             self.cash[p] -= 50
             self.in_jail[p] = False
             self.jail_turns[p] = 0
-            self.event_log.append(f"Player {p} paid $50 fine to get out of Jail.")
+            self.event_log.append(f"{self.get_player_name(p)} paid $50 fine to get out of Jail.")
             self.phase = PHASE_ROLL
             self.active_decision_player = p
             return
@@ -1082,7 +1095,7 @@ class MonopolyCore:
             self.deck_manager.return_goojf(source_deck)
             self.in_jail[p] = False
             self.jail_turns[p] = 0
-            self.event_log.append(f"Player {p} used a Get Out of Jail Free card.")
+            self.event_log.append(f"{self.get_player_name(p)} used a Get Out of Jail Free card.")
             self.phase = PHASE_ROLL
             self.active_decision_player = p
             return
@@ -1098,7 +1111,7 @@ class MonopolyCore:
                 self.in_jail[p] = False
                 self.jail_turns[p] = 0
                 self.consecutive_doubles = 0
-                self.event_log.append(f"Player {p} rolled doubles ({d1}, {d2}) and got out of Jail!")
+                self.event_log.append(f"{self.get_player_name(p)} rolled doubles ({d1}, {d2}) and got out of Jail!")
                 # Move by dice sum, but rolling out of jail does not grant another turn
                 old_pos = self.position[p]
                 new_pos = (old_pos + d1 + d2) % 40
@@ -1106,13 +1119,13 @@ class MonopolyCore:
                 self._handle_landing(p, new_pos, d1 + d2, is_double=False)
             else:
                 self.jail_turns[p] += 1
-                self.event_log.append(f"Player {p} rolled ({d1}, {d2}) (no doubles). Remains in Jail (turn {self.jail_turns[p]}/3).")
+                self.event_log.append(f"{self.get_player_name(p)} rolled ({d1}, {d2}) (no doubles). Remains in Jail (turn {self.jail_turns[p]}/3).")
                 if self.jail_turns[p] >= 3:
                     # Turn 3 failed double: must pay $50 fine and move!
                     self.cash[p] -= 50
                     self.in_jail[p] = False
                     self.jail_turns[p] = 0
-                    self.event_log.append(f"Player {p} served 3 turns in Jail. Paid $50 mandatory fine and moves {d1 + d2} spaces.")
+                    self.event_log.append(f"{self.get_player_name(p)} served 3 turns in Jail. Paid $50 mandatory fine and moves {d1 + d2} spaces.")
                     old_pos = self.position[p]
                     new_pos = (old_pos + d1 + d2) % 40
                     self.position[p] = new_pos
@@ -1126,7 +1139,7 @@ class MonopolyCore:
         t_type = tile["type"]
 
         if pos == 30:  # Go To Jail
-            self.event_log.append(f"Player {p} landed on Go To Jail!")
+            self.event_log.append(f"{self.get_player_name(p)} landed on Go To Jail!")
             self._send_to_jail(p)
             self._end_turn()
             return
@@ -1135,7 +1148,7 @@ class MonopolyCore:
             tax = tile["tax_amount"]
             self.cash[p] -= tax
             self.last_creditor = None
-            self.event_log.append(f"Player {p} paid tax of ${tax} on {tile['name']}.")
+            self.event_log.append(f"{self.get_player_name(p)} paid tax of ${tax} on {tile['name']}.")
             self._proceed_to_manage_or_next(p, is_double)
             return
 
@@ -1143,7 +1156,7 @@ class MonopolyCore:
             deck_name = tile["deck"]
             card = self.deck_manager.draw_chance() if deck_name == "chance" else self.deck_manager.draw_chest()
             self.last_card_drawn = card
-            self.event_log.append(f"Player {p} drew {deck_name.upper()} card: '{card['name']}'.")
+            self.event_log.append(f"{self.get_player_name(p)} drew {deck_name.upper()} card: '{card['name']}'.")
             self._execute_card_action(p, card, is_double)
             return
 
@@ -1162,7 +1175,7 @@ class MonopolyCore:
                 self.cash[p] -= rent
                 self.cash[owner] += rent
                 self.last_creditor = owner
-                self.event_log.append(f"Player {p} paid ${rent} rent to Player {owner} on {tile['name']}.")
+                self.event_log.append(f"{self.get_player_name(p)} paid ${rent} rent to {self.get_player_name(owner)} on {tile['name']}.")
                 self._proceed_to_manage_or_next(p, is_double)
                 return
             else:
@@ -1186,12 +1199,12 @@ class MonopolyCore:
         if core_act == ACT_CORE_BUY_DIRECT and self.cash[p] >= price:
             self.cash[p] -= price
             self.property_owner[tile_id] = p
-            self.event_log.append(f"Player {p} purchased {tile['name']} directly for ${price}.")
+            self.event_log.append(f"{self.get_player_name(p)} purchased {tile['name']} directly for ${price}.")
             self.landed_property = None
             self._proceed_to_manage_or_next(p, getattr(self, "pending_is_double", False))
         else:
             # DECLINE BUY -> MANDATORY OPEN AUCTION TRIGGERED!
-            self.event_log.append(f"Player {p} declined buying {tile['name']}. Mandatory AUCTION begins!")
+            self.event_log.append(f"{self.get_player_name(p)} declined buying {tile['name']}. Mandatory AUCTION begins!")
             self._start_auction(tile_id, getattr(self, "pending_is_double", False))
 
     # ----------------------------------------------------------------------
@@ -1244,13 +1257,13 @@ class MonopolyCore:
         if bid_inc > 0 and cash >= current_bid + bid_inc:
             self.auction_highest_bid = current_bid + bid_inc
             self.auction_highest_bidder = p
-            self.event_log.append(f"Player {p} bids ${self.auction_highest_bid} (+${bid_inc}) on {TILES_DATA[self.auction_property]['name']}.")
+            self.event_log.append(f"{self.get_player_name(p)} bids ${self.auction_highest_bid} (+${bid_inc}) on {TILES_DATA[self.auction_property]['name']}.")
             # Advance to next bidder
             self.auction_current_bidder_idx = (self.auction_current_bidder_idx + 1) % len(self.auction_active_bidders)
             self.active_decision_player = self.auction_active_bidders[self.auction_current_bidder_idx]
         else:
             # Fold
-            self.event_log.append(f"Player {p} folded in auction.")
+            self.event_log.append(f"{self.get_player_name(p)} folded in auction.")
             self.auction_active_bidders.remove(p)
             if len(self.auction_active_bidders) == 0 or (len(self.auction_active_bidders) == 1 and self.auction_highest_bidder != -1):
                 self._finish_auction()
@@ -1268,7 +1281,7 @@ class MonopolyCore:
             price = self.auction_highest_bid
             self.cash[winner] -= price
             self.property_owner[tile_id] = winner
-            self.event_log.append(f"AUCTION WON! Player {winner} won {tile['name']} for ${price}!")
+            self.event_log.append(f"AUCTION WON! {self.get_player_name(winner)} won {tile['name']} for ${price}!")
         else:
             self.event_log.append(f"Auction ended with no bids. {tile['name']} remains with Bank.")
 
@@ -1287,7 +1300,7 @@ class MonopolyCore:
         self.manage_actions_this_turn = 0
         self.trade_proposals_this_turn = 0
         if is_double and not self.in_jail[p] and not self.bankrupt[p]:
-            self.event_log.append(f"Player {p} rolled doubles! Gets another roll.")
+            self.event_log.append(f"{self.get_player_name(p)} rolled doubles! Gets another roll.")
             self.phase = PHASE_ROLL
             self.active_decision_player = p
         else:
@@ -1342,14 +1355,14 @@ class MonopolyCore:
                     self.property_houses[prop_act] += 1
                     self.bank_houses -= 1
                     self.cash[p] -= h_cost
-                    self.event_log.append(f"Player {p} built a house on {tile['name']} for ${h_cost}. (Bank houses left: {self.bank_houses})")
+                    self.event_log.append(f"{self.get_player_name(p)} built a house on {tile['name']} for ${h_cost}. (Bank houses left: {self.bank_houses})")
                 elif h == 4:
                     # Upgrade to hotel: consumes 1 hotel, releases 4 houses to bank!
                     self.property_houses[prop_act] = 5
                     self.bank_hotels -= 1
                     self.bank_houses += 4
                     self.cash[p] -= h_cost
-                    self.event_log.append(f"Player {p} upgraded to a HOTEL on {tile['name']} for ${h_cost}! (4 houses returned to bank).")
+                    self.event_log.append(f"{self.get_player_name(p)} upgraded to a HOTEL on {tile['name']} for ${h_cost}! (4 houses returned to bank).")
 
         # [40..79]: Sell House / Hotel
         elif 40 <= prop_act < 80 and masks["property"][prop_act]:
@@ -1363,14 +1376,14 @@ class MonopolyCore:
                     self.property_houses[p_idx] -= 1
                     self.bank_houses += 1
                     self.cash[p] += refund
-                    self.event_log.append(f"Player {p} sold a house on {tile['name']} for ${refund}.")
+                    self.event_log.append(f"{self.get_player_name(p)} sold a house on {tile['name']} for ${refund}.")
                 elif h == 5:
                     # Sell hotel: downgrade to 4 houses
                     self.property_houses[p_idx] = 4
                     self.bank_hotels += 1
                     self.bank_houses -= 4
                     self.cash[p] += refund
-                    self.event_log.append(f"Player {p} sold hotel on {tile['name']} for ${refund} (converted to 4 houses).")
+                    self.event_log.append(f"{self.get_player_name(p)} sold hotel on {tile['name']} for ${refund} (converted to 4 houses).")
 
         # [80..119]: Mortgage
         elif 80 <= prop_act < 120 and masks["property"][prop_act]:
@@ -1380,7 +1393,7 @@ class MonopolyCore:
                 mtg_val = tile["mortgage"]
                 self.property_mortgaged[p_idx] = True
                 self.cash[p] += mtg_val
-                self.event_log.append(f"Player {p} mortgaged {tile['name']} for ${mtg_val}.")
+                self.event_log.append(f"{self.get_player_name(p)} mortgaged {tile['name']} for ${mtg_val}.")
 
         # [120..159]: Unmortgage
         elif 120 <= prop_act < 160 and masks["property"][prop_act]:
@@ -1390,7 +1403,7 @@ class MonopolyCore:
                 cost = int(tile["mortgage"] * (1.0 + UNMORTGAGE_INTEREST_RATE))
                 self.property_mortgaged[p_idx] = False
                 self.cash[p] -= cost
-                self.event_log.append(f"Player {p} unmortgaged {tile['name']} for ${cost} (incl. 10% interest).")
+                self.event_log.append(f"{self.get_player_name(p)} unmortgaged {tile['name']} for ${cost} (incl. 10% interest).")
 
         if self.manage_actions_this_turn >= 5:
             self._finish_manage_or_next(p, is_double)
@@ -1425,7 +1438,7 @@ class MonopolyCore:
         }
         self.phase = PHASE_TRADE_RESPONSE
         self.active_decision_player = target
-        self.event_log.append(f"TRADE PROPOSAL: Player {initiator} -> Player {target}: Offer(Prop={offer_prop if offer_prop<40 else 'None'}, Cash=${offer_cash}) for Request(Prop={req_prop if req_prop<40 else 'None'}, Cash=${req_cash}).")
+        self.event_log.append(f"TRADE PROPOSAL: {self.get_player_name(initiator)} -> {self.get_player_name(target)}: Offer(Prop={offer_prop if offer_prop<40 else 'None'}, Cash=${offer_cash}) for Request(Prop={req_prop if req_prop<40 else 'None'}, Cash=${req_cash}).")
         return True
 
     def _handle_trade_response(self, target: int, trade_response: int):
@@ -1452,11 +1465,11 @@ class MonopolyCore:
                     if req_p < 40 and self.property_owner[req_p] == target:
                         self.property_owner[req_p] = init
 
-                    self.event_log.append(f"TRADE ACCEPTED between Player {init} and Player {target}!")
+                    self.event_log.append(f"TRADE ACCEPTED between {self.get_player_name(init)} and {self.get_player_name(target)}!")
                 else:
                     self.event_log.append(f"Trade failed due to insufficient funds.")
             else:
-                self.event_log.append(f"Trade REJECTED by Player {target}.")
+                self.event_log.append(f"Trade REJECTED by {self.get_player_name(target)}.")
 
         self.pending_trade = None
         is_double = getattr(self, "pending_manage_double", False)
@@ -1476,7 +1489,7 @@ class MonopolyCore:
             self.position[p] = target
             if card.get("collect_pass_go", False) and target < old_pos:
                 self.cash[p] += 200
-                self.event_log.append(f"Player {p} passed GO and collected $200.")
+                self.event_log.append(f"{self.get_player_name(p)} passed GO and collected $200.")
             self._handle_landing(p, target, dice_sum=self.last_dice[0] + self.last_dice[1], is_double=is_double)
 
         elif action == "advance_nearest_utility":
@@ -1499,7 +1512,7 @@ class MonopolyCore:
                 self.cash[p] -= rent
                 self.cash[owner] += rent
                 self.last_creditor = owner
-                self.event_log.append(f"Player {p} threw {d_roll} and paid ${rent} (10x fresh roll) to Player {owner} on {TILES_DATA[target]['name']}.")
+                self.event_log.append(f"{self.get_player_name(p)} threw {d_roll} and paid ${rent} (10x fresh roll) to {self.get_player_name(owner)} on {TILES_DATA[target]['name']}.")
                 self._proceed_to_manage_or_next(p, is_double)
             else:
                 self._proceed_to_manage_or_next(p, is_double)
@@ -1524,7 +1537,7 @@ class MonopolyCore:
                 self.cash[p] -= rent
                 self.cash[owner] += rent
                 self.last_creditor = owner
-                self.event_log.append(f"Player {p} paid ${rent} (2x railroad rent) to Player {owner} on {TILES_DATA[target]['name']}.")
+                self.event_log.append(f"{self.get_player_name(p)} paid ${rent} (2x railroad rent) to {self.get_player_name(owner)} on {TILES_DATA[target]['name']}.")
                 self._proceed_to_manage_or_next(p, is_double)
             else:
                 self._proceed_to_manage_or_next(p, is_double)
@@ -1563,7 +1576,7 @@ class MonopolyCore:
             total_hotels = sum(1 for t in owned if self.property_houses[t] == 5)
             repairs = total_houses * h_cost + total_hotels * hotel_cost
             self.cash[p] -= repairs
-            self.event_log.append(f"Player {p} paid ${repairs} in property repairs.")
+            self.event_log.append(f"{self.get_player_name(p)} paid ${repairs} in property repairs.")
             self._proceed_to_manage_or_next(p, is_double)
 
         elif action == "pay_each_player":
@@ -1632,7 +1645,7 @@ class MonopolyCore:
                 # All remaining properties (mortgaged) and GOOJF cards transfer to creditor!
                 for t in owned_props:
                     self.property_owner[t] = creditor
-                self.event_log.append(f"PLAYER {p} IS BANKRUPT! All properties transferred to creditor Player {creditor}.")
+                self.event_log.append(f"{self.get_player_name(p).upper()} IS BANKRUPT! All properties transferred to creditor {self.get_player_name(creditor)}.")
 
                 # Transfer GOOJF cards to creditor
                 while self.goojf_cards[p] > 0:
@@ -1642,7 +1655,7 @@ class MonopolyCore:
                     self.goojf_sources[creditor].append(src)
             else:
                 # Official Tournament Rule: Bankrupt to the Bank (taxes, fees)
-                self.event_log.append(f"PLAYER {p} IS BANKRUPT to the Bank! Properties returned to Bank.")
+                self.event_log.append(f"{self.get_player_name(p).upper()} IS BANKRUPT to the Bank! Properties returned to Bank.")
                 for t in owned_props:
                     # Return houses/hotels
                     h = self.property_houses[t]
@@ -1671,12 +1684,13 @@ class MonopolyCore:
         self.trade_proposals_this_turn = 0
 
         # Advance current_player to next non-bankrupt player
+        prev_player = self.current_player
         for _ in range(4):
             self.current_player = (self.current_player + 1) % 4
             if not self.bankrupt[self.current_player]:
                 break
 
-        if self.current_player == 0:
+        if self.current_player <= prev_player:
             self.round_count += 1
 
         # If next player is in jail, prompt jail decision; otherwise roll phase

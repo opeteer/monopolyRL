@@ -153,23 +153,24 @@ class MonopolyDashboard:
         border_col = PLAYER_COLORS[p] if is_active else CARD_BORDER
         pygame.draw.rect(self.surface, border_col, card_rect, width=2 if is_active else 1, border_radius=6)
 
-        # Player Pill
-        pill_rect = pygame.Rect(x + 10, y + 10, 65, 20)
-        pygame.draw.rect(self.surface, PLAYER_COLORS[p], pill_rect, border_radius=4)
-        p_name = f"Agent {p}"
+        # Player Pill with Agent Name (Luke, Graham, Pieter, Allison)
+        p_name = core.get_player_name(p)
         p_txt = self.font_card_title.render(p_name, True, (255, 255, 255))
+        pill_w = max(75, p_txt.get_width() + 16)
+        pill_rect = pygame.Rect(x + 10, y + 10, pill_w, 20)
+        pygame.draw.rect(self.surface, PLAYER_COLORS[p], pill_rect, border_radius=4)
         self.surface.blit(p_txt, (pill_rect.centerx - p_txt.get_width() // 2, pill_rect.centery - p_txt.get_height() // 2))
 
         # Bankruptcy Badge
         if core.bankrupt[p]:
             b_txt = self.font_card_title.render("BANKRUPT", True, (230, 60, 60))
-            self.surface.blit(b_txt, (x + 85, y + 12))
+            self.surface.blit(b_txt, (pill_rect.right + 12, y + 12))
             return
 
         # Jail badge
         if core.in_jail[p]:
             j_txt = self.font_stat.render(f"JAIL ({core.jail_turns[p]}/3)", True, (240, 160, 40))
-            self.surface.blit(j_txt, (x + 85, y + 12))
+            self.surface.blit(j_txt, (pill_rect.right + 12, y + 12))
 
         # Financial Stats: Cash & Net Worth
         cash = core.cash[p]

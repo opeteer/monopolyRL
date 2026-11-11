@@ -270,17 +270,22 @@ class MonopolyRenderer:
         title_surf = self.font_center_title.render("TOURNAMENT MARL MONOPOLY", True, (35, 45, 60))
         self.surface.blit(title_surf, (cx - title_surf.get_width() // 2, hud_box.y + 14))
 
-        # Round and Turn step
-        round_text = f"Round: {core.round_count}/{core.max_rounds}   |   Turn Step: {core.turn_step}"
+        # Round and Turn step (Unbounded Survival support)
+        if core.max_rounds is None:
+            round_text = f"Round: {core.round_count} (Unbounded Survival)   |   Turn Step: {core.turn_step}"
+        else:
+            round_text = f"Round: {core.round_count}/{core.max_rounds}   |   Turn Step: {core.turn_step}"
         r_surf = self.font_center_sub.render(round_text, True, (80, 90, 105))
         self.surface.blit(r_surf, (cx - r_surf.get_width() // 2, hud_box.y + 42))
 
         # Active Player Indicator
         p_act = core.active_decision_player
         p_col = PLAYER_COLORS[p_act]
-        act_text = f"Active Player: P{p_act} ({['Roll', 'Buy/Auction', 'Auction', 'Jail', 'Manage', 'Trade', 'Over'][min(core.phase, 6)]})"
+        p_name = core.get_player_name(p_act)
+        act_text = f"Active: {p_name} ({['Roll', 'Buy/Auction', 'Auction', 'Jail', 'Manage', 'Trade', 'Over'][min(core.phase, 6)]})"
         act_surf = self.font_badge.render(act_text, True, (255, 255, 255))
-        badge_rect = pygame.Rect(cx - 100, hud_box.y + 68, 200, 24)
+        badge_w = max(200, act_surf.get_width() + 24)
+        badge_rect = pygame.Rect(cx - badge_w // 2, hud_box.y + 68, badge_w, 24)
         pygame.draw.rect(self.surface, p_col, badge_rect, border_radius=6)
         self.surface.blit(act_surf, (cx - act_surf.get_width() // 2, badge_rect.y + 4))
 
@@ -292,7 +297,8 @@ class MonopolyRenderer:
         # Auction Badge if active
         if core.phase == PHASE_AUCTION and core.auction_property is not None:
             prop_name = TILES_DATA[core.auction_property]["name"]
-            auc_text = f"AUCTION: {prop_name}  |  Bid: ${core.auction_highest_bid} by P{core.auction_highest_bidder}"
+            bidder_name = core.get_player_name(core.auction_highest_bidder) if core.auction_highest_bidder != -1 else "None"
+            auc_text = f"AUCTION: {prop_name}  |  Bid: ${core.auction_highest_bid} by {bidder_name}"
             auc_surf = self.font_center_sub.render(auc_text, True, (200, 50, 50))
             self.surface.blit(auc_surf, (cx - auc_surf.get_width() // 2, hud_box.bottom - 48))
 
