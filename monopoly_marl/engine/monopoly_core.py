@@ -1,0 +1,1281 @@
+"""Tournament-Grade Official Monopoly State Machine Engine.
+
+Implements all official tournament rules:
+- Physical bank scarcity: exactly 32 houses and 12 hotels.
+- Mandatory auction on landed unowned property if active player declines purchase.
+- Speeding penalty: 3 consecutive doubles in one turn sends player to Jail immediately.
+- Jail mechanics: up to 3 turns, roll doubles, pay $50, or use GOOJF card.
+- Even building rule across color group properties.
+- Mortgages (50% value) and 10% unmortgage interest.
+- FIFO Card decks for Chance and Community Chest.
+- Bilateral trading protocol.
+- Potential-Based Reward Shaping (PBRS) maintaining policy invariance.
+"""
+
+from typing import Dict, List, Tuple, Optional, Any, Set
+import numpy as np
+import random
+import math
+
+from monopoly_marl.engine.board_data import (
+    TILES_DATA, COLOR_GROUPS, TILE_TO_GROUP, GROUP_MONOPOLY_BONUS,
+    PURCHASABLE_TILES, TILE_STREET, TILE_RAILROAD, TILE_UTILITY,
+    TILE_TAX, TILE_CARD, TILE_SPECIAL, UNMORTGAGE_INTEREST_RATE,
+    HOUSE_REFUND_RATE, DICE_OUTCOMES, DICE_PROBABILITIES
+)
+from monopoly_marl.engine.cards_data import CardDeckManager
+
+# Phase Definitions
+PHASE_ROLL = 0
+PHASE_BUY_OR_AUCTION = 1
+PHASE_AUCTION = 2
+PHASE_JAIL_DECISION = 3
+PHASE_PROPERTY_MANAGE = 4
+PHASE_TRADE_RESPONSE = 5
+PHASE_GAME_OVER = 6
+NUM_PHASES = 7
+
+# Core Action Head (6 dimensions)
+ACT_CORE_ROLL_PASS = 0
+ACT_CORE_BUY_DIRECT = 1
+ACT_CORE_DECLINE_BUY = 2
+ACT_CORE_PAY_JAIL_50 = 3
+ACT_CORE_USE_GOOJF = 4
+ACT_CORE_END_MANAGE = 5
+
+# Auction Action Head (5 dimensions)
+ACT_AUC_FOLD = 0
+ACT_AUC_BID_1 = 1
+ACT_AUC_BID_10 = 2
+ACT_AUC_BID_50 = 3
+ACT_AUC_BID_100 = 4
+
+# Trade Cash Brackets (10 options)
+TRADE_CASH_BRACKETS = [0, 25, 50, 100, 150, 200, 250, 300, 400, 500]
+
+
+class MonopolyCore:
+    """Official Tournament-Grade Monopoly Game State Machine."""
+
+    def __init__(self, seed: Optional[int] = None, max_rounds: int = 150, gamma: float = 0.99):
+        self.rng = random.Random(seed)
+        self.np_rng = np.random.default_rng(seed)
+        self.max_rounds = max_rounds
+        self.gamma = gamma
+
+        # PBRS Weights
+        self.w1 = 0.05   # Cash log potential
+        self.w2 = 0.001  # Property equity potential
+        self.w3 = 0.002  # Monopoly bonus potential
+        self.w4 = 0.002  # Rent risk potential
+
+        self.deck_manager = CardDeckManager(self.rng)
+        self.reset(seed)
+
+    def reset(self, seed: Optional[int] = None) -> Dict[str, Any]:
+        """Resets the environment to initial tournament starting state."""
+        if seed is not None:
+            self.rng.seed(seed)
+            self.np_rng = np.random.default_rng(seed)
+
+        self.deck_manager.reset(seed)
+
+        # 4 Players: 0, 1, 2, 3
+        self.cash = [1500, 1500, 1500, 1500]
+        self.position = [0, 0, 0, 0]
+        self.in_jail = [False, False, False, False]
+        self.jail_turns = [0, 0, 0, 0]
+        self.goojf_cards = [0, 0, 0, 0]
+        self.goojf_sources: List[List[str]] = [[], [], [], []]
+        self.bankrupt = [False, False, False, False]
+
+        # Bank Physical Scarcity
+        self.bank_houses = 32
+        self.bank_hotels = 12
+
+        # 40 Tiles State
+        # Owner: -1 if unowned / not purchasable, 0..3 if owned
+        self.property_owner = [-1] * 40
+        # Houses: 0 to 5 (5 = hotel)
+        self.property_houses = [0] * 40
+        # Mortgaged flags
+        self.property_mortgaged = [False] * 40
+
+        # Turn & State Machine Trackers
+        self.current_player = 0
+        self.active_decision_player = 0
+        self.round_count = 0
+        self.turn_step = 0
+        self.consecutive_doubles = 0
+        self.last_dice: Tuple[int, int] = (1, 1)
+        self.phase = PHASE_ROLL
+
+        # Sub-phase specifics
+        self.landed_property: Optional[int] = None
+        
+        # Auction state
+        self.auction_property: Optional[int] = None
+        self.auction_highest_bid = 0
+        self.auction_highest_bidder = -1
+        self.auction_active_bidders: List[int] = []
+        self.auction_current_bidder_idx = 0
+
+        # Trade proposal state
+        self.pending_trade: Optional[Dict[str, Any]] = None
+
+        # Event log history for UI / replay
+        self.event_log: List[str] = ["Tournament game started. All players initialized with $1500."]
+        self.last_card_drawn: Optional[Dict[str, Any]] = None
+
+        # Precompute initial potentials for PBRS
+        self.prev_potentials = [self._compute_potential(p) for p in range(4)]
+
+        # If player 0 starts in jail (not standard, but handle general case)
+        if self.in_jail[self.current_player]:
+            self.phase = PHASE_JAIL_DECISION
+        else:
+            self.phase = PHASE_ROLL
+        self.active_decision_player = self.current_player
+
+        return self.get_observations()
+
+    # ----------------------------------------------------------------------
+    # PBRS & Value Calculations
+    # ----------------------------------------------------------------------
+    def _compute_potential(self, player_id: int) -> float:
+        """Computes Φ^i(s) potential function as mathematically specified:
+
+        Φ^i(s) = w1 * ln(c_i + 1)
+                 + w2 * sum_{p in O_i} (V_base(p) + sum_{l=1}^{h_p} V_bld(p, l) - m_p * V_mtg(p))
+                 + w3 * sum_{g in G} I(g subseteq O_i) * U_g
+                 - w4 * sum_{j != i} sum_{d=2}^{12} P(D=d) * Rent_{j -> i}((x_i + d) % 40)
+        """
+        if self.bankrupt[player_id]:
+            return 0.0
+
+        # Term 1: w1 * ln(c_i + 1)
+        c_i = max(0, self.cash[player_id])
+        term1 = self.w1 * math.log(c_i + 1.0)
+
+        # Term 2: Property equity
+        term2_sum = 0.0
+        owned_props = [p for p in PURCHASABLE_TILES if self.property_owner[p] == player_id]
+        for p in owned_props:
+            tile = TILES_DATA[p]
+            v_base = float(tile["price"])
+            h_p = self.property_houses[p]
+            v_bld = float(h_p * tile.get("house_cost", 0))
+            m_p = 1.0 if self.property_mortgaged[p] else 0.0
+            v_mtg = float(tile.get("mortgage", 0))
+            term2_sum += (v_base + v_bld - m_p * v_mtg)
+        term2 = self.w2 * term2_sum
+
+        # Term 3: Monopoly complete groups
+        term3_sum = 0.0
+        for grp_name, tiles in COLOR_GROUPS.items():
+            if all(self.property_owner[t] == player_id for t in tiles):
+                term3_sum += GROUP_MONOPOLY_BONUS.get(grp_name, 0.0)
+        term3 = self.w3 * term3_sum
+
+        # Term 4: Expected rent risk from next roll
+        pos_i = self.position[player_id]
+        term4_sum = 0.0
+        if not self.in_jail[player_id]:
+            for d in DICE_OUTCOMES:
+                prob = DICE_PROBABILITIES[d]
+                target_tile = (pos_i + d) % 40
+                owner = self.property_owner[target_tile]
+                if owner != -1 and owner != player_id and not self.bankrupt[owner] and not self.property_mortgaged[target_tile]:
+                    rent = self._calculate_rent(target_tile, dice_sum=d)
+                    term4_sum += prob * rent
+        term4 = self.w4 * term4_sum
+
+        return float(term1 + term2 + term3 - term4)
+
+    def _calculate_rent(self, tile_id: int, dice_sum: int, multiplier_override: Optional[int] = None) -> int:
+        """Calculates official rent for tile given current state."""
+        tile = TILES_DATA[tile_id]
+        owner = self.property_owner[tile_id]
+        if owner == -1 or self.property_mortgaged[tile_id]:
+            return 0
+
+        t_type = tile["type"]
+        if t_type == TILE_STREET:
+            h = self.property_houses[tile_id]
+            rents = tile["rent"]
+            if h == 0:
+                # Double rent if owner holds entire color group AND none are mortgaged
+                grp = tile["color"]
+                group_tiles = COLOR_GROUPS[grp]
+                all_owned = all(self.property_owner[t] == owner for t in group_tiles)
+                none_mortgaged = all(not self.property_mortgaged[t] for t in group_tiles)
+                return rents[0] * 2 if (all_owned and none_mortgaged) else rents[0]
+            else:
+                return rents[h]
+
+        elif t_type == TILE_RAILROAD:
+            rr_tiles = COLOR_GROUPS["RAILROAD"]
+            rr_owned = sum(1 for t in rr_tiles if self.property_owner[t] == owner and not self.property_mortgaged[t])
+            base_rent = 25 * (2 ** (max(1, rr_owned) - 1))
+            if multiplier_override:
+                return base_rent * multiplier_override
+            return base_rent
+
+        elif t_type == TILE_UTILITY:
+            ut_tiles = COLOR_GROUPS["UTILITY"]
+            ut_owned = sum(1 for t in ut_tiles if self.property_owner[t] == owner and not self.property_mortgaged[t])
+            mult = 10 if ut_owned == 2 or multiplier_override == 10 else 4
+            return mult * dice_sum
+
+        return 0
+
+    # ----------------------------------------------------------------------
+    # Action Masking Generators
+    # ----------------------------------------------------------------------
+    def get_action_masks(self, player_id: int) -> Dict[str, np.ndarray]:
+        """Strict Action Masking generator:
+
+        Returns binary masks for each factorized head:
+        - core: (6,)
+        - auction: (5,)
+        - property: (160,)
+        - trade: (3 + 41 + 10 + 41 + 10 + 2 = 107,)
+        Invalid actions have 0, valid actions have 1.
+        """
+        mask_core = np.zeros(6, dtype=np.int8)
+        mask_auction = np.zeros(5, dtype=np.int8)
+        mask_property = np.zeros(160, dtype=np.int8)
+        
+        # Trade masks: target(3), offer_prop(41), offer_cash(10), req_prop(41), req_cash(10), respond(2)
+        mask_trade_target = np.zeros(3, dtype=np.int8)
+        mask_trade_offer_prop = np.zeros(41, dtype=np.int8)
+        mask_trade_offer_cash = np.zeros(10, dtype=np.int8)
+        mask_trade_req_prop = np.zeros(41, dtype=np.int8)
+        mask_trade_req_cash = np.zeros(10, dtype=np.int8)
+        mask_trade_response = np.zeros(2, dtype=np.int8)
+
+        # Default fallback for inactive players or game over
+        if player_id != self.active_decision_player or self.bankrupt[player_id] or self.phase == PHASE_GAME_OVER:
+            mask_core[ACT_CORE_ROLL_PASS] = 1
+            mask_auction[ACT_AUC_FOLD] = 1
+            mask_property[0] = 1
+            mask_trade_target[0] = 1
+            mask_trade_offer_prop[40] = 1  # 40 = No property
+            mask_trade_offer_cash[0] = 1   # 0 cash
+            mask_trade_req_prop[40] = 1
+            mask_trade_req_cash[0] = 1
+            mask_trade_response[0] = 1     # Decline
+            return {
+                "core": mask_core,
+                "auction": mask_auction,
+                "property": mask_property,
+                "trade_target": mask_trade_target,
+                "trade_offer_prop": mask_trade_offer_prop,
+                "trade_offer_cash": mask_trade_offer_cash,
+                "trade_req_prop": mask_trade_req_prop,
+                "trade_req_cash": mask_trade_req_cash,
+                "trade_response": mask_trade_response,
+            }
+
+        # 1. PHASE_ROLL
+        if self.phase == PHASE_ROLL:
+            mask_core[ACT_CORE_ROLL_PASS] = 1
+
+        # 2. PHASE_JAIL_DECISION
+        elif self.phase == PHASE_JAIL_DECISION:
+            # Can always roll for doubles
+            mask_core[ACT_CORE_ROLL_PASS] = 1
+            # Pay $50 fine if has enough cash
+            if self.cash[player_id] >= 50:
+                mask_core[ACT_CORE_PAY_JAIL_50] = 1
+            # Use GOOJF if owns card
+            if self.goojf_cards[player_id] > 0:
+                mask_core[ACT_CORE_USE_GOOJF] = 1
+
+        # 3. PHASE_BUY_OR_AUCTION
+        elif self.phase == PHASE_BUY_OR_AUCTION:
+            tile_id = self.landed_property
+            price = TILES_DATA[tile_id]["price"] if tile_id is not None else 999999
+            if self.cash[player_id] >= price:
+                mask_core[ACT_CORE_BUY_DIRECT] = 1
+            # Always allowed to decline buy -> triggers mandatory auction!
+            mask_core[ACT_CORE_DECLINE_BUY] = 1
+
+        # 4. PHASE_AUCTION
+        elif self.phase == PHASE_AUCTION:
+            # Auction actions
+            mask_auction[ACT_AUC_FOLD] = 1
+            current_bid = self.auction_highest_bid
+            cash = self.cash[player_id]
+            if cash >= current_bid + 1:
+                mask_auction[ACT_AUC_BID_1] = 1
+            if cash >= current_bid + 10:
+                mask_auction[ACT_AUC_BID_10] = 1
+            if cash >= current_bid + 50:
+                mask_auction[ACT_AUC_BID_50] = 1
+            if cash >= current_bid + 100:
+                mask_auction[ACT_AUC_BID_100] = 1
+
+        # 5. PHASE_PROPERTY_MANAGE
+        elif self.phase == PHASE_PROPERTY_MANAGE:
+            # Always allowed to end turn
+            mask_core[ACT_CORE_END_MANAGE] = 1
+
+            # Property Management Sub-actions:
+            # [0..39]: Build House
+            # [40..79]: Sell House
+            # [80..119]: Mortgage
+            # [120..159]: Unmortgage
+            for p in PURCHASABLE_TILES:
+                tile = TILES_DATA[p]
+                if self.property_owner[p] == player_id:
+                    grp = tile.get("color")
+                    h = self.property_houses[p]
+                    h_cost = tile.get("house_cost", 0)
+
+                    # BUILD HOUSE / HOTEL
+                    if tile["type"] == TILE_STREET and grp:
+                        group_tiles = COLOR_GROUPS[grp]
+                        all_owned = all(self.property_owner[t] == player_id for t in group_tiles)
+                        none_mortgaged = all(not self.property_mortgaged[t] for t in group_tiles)
+                        if all_owned and none_mortgaged:
+                            min_h = min(self.property_houses[t] for t in group_tiles)
+                            # Even building: current tile house count must equal min_h and be < 5
+                            if h == min_h and h < 5 and self.cash[player_id] >= h_cost:
+                                # Physical bank scarcity check
+                                if h < 4 and self.bank_houses > 0:
+                                    mask_property[p] = 1
+                                elif h == 4 and self.bank_hotels > 0:
+                                    # Hotel needs bank hotel
+                                    mask_property[p] = 1
+
+                    # SELL HOUSE / HOTEL
+                    if tile["type"] == TILE_STREET and grp and h > 0:
+                        group_tiles = COLOR_GROUPS[grp]
+                        max_h = max(self.property_houses[t] for t in group_tiles)
+                        if h == max_h:
+                            if h <= 4:
+                                mask_property[40 + p] = 1
+                            elif h == 5:
+                                # Selling hotel: bank must have 4 houses or downgrade cleanly
+                                if self.bank_houses >= 4:
+                                    mask_property[40 + p] = 1
+
+                    # MORTGAGE
+                    if not self.property_mortgaged[p]:
+                        # Cannot mortgage if any tile in color group has houses
+                        grp = tile.get("color")
+                        has_houses = False
+                        if grp and tile["type"] == TILE_STREET:
+                            has_houses = any(self.property_houses[t] > 0 for t in COLOR_GROUPS[grp])
+                        if not has_houses:
+                            mask_property[80 + p] = 1
+
+                    # UNMORTGAGE
+                    if self.property_mortgaged[p]:
+                        unmtg_cost = int(tile["mortgage"] * (1.0 + UNMORTGAGE_INTEREST_RATE))
+                        if self.cash[player_id] >= unmtg_cost:
+                            mask_property[120 + p] = 1
+
+            # Bilateral Trade Proposals
+            # Target players (3 other players)
+            other_players = [pl for pl in range(4) if pl != player_id and not self.bankrupt[pl]]
+            for idx, pl in enumerate(other_players):
+                mask_trade_target[idx] = 1
+
+            # Offer properties: owned by player with 0 houses in group
+            mask_trade_offer_prop[40] = 1  # 40 = None
+            for p in PURCHASABLE_TILES:
+                if self.property_owner[p] == player_id:
+                    grp = TILES_DATA[p].get("color")
+                    if not (grp and any(self.property_houses[t] > 0 for t in COLOR_GROUPS.get(grp, []))):
+                        mask_trade_offer_prop[p] = 1
+
+            # Offer cash: brackets <= player cash
+            for b_idx, b_val in enumerate(TRADE_CASH_BRACKETS):
+                if self.cash[player_id] >= b_val:
+                    mask_trade_offer_cash[b_idx] = 1
+
+            # Request properties: owned by someone else with 0 houses in group
+            mask_trade_req_prop[40] = 1  # 40 = None
+            for p in PURCHASABLE_TILES:
+                owner = self.property_owner[p]
+                if owner != -1 and owner != player_id and not self.bankrupt[owner]:
+                    grp = TILES_DATA[p].get("color")
+                    if not (grp and any(self.property_houses[t] > 0 for t in COLOR_GROUPS.get(grp, []))):
+                        mask_trade_req_prop[p] = 1
+
+            # Request cash: all brackets (target will decide if they have it)
+            mask_trade_req_cash[:] = 1
+
+        # 6. PHASE_TRADE_RESPONSE
+        elif self.phase == PHASE_TRADE_RESPONSE:
+            # 0: Reject, 1: Accept (if target has enough cash)
+            mask_trade_response[0] = 1
+            if self.pending_trade:
+                req_cash = self.pending_trade["req_cash"]
+                if self.cash[player_id] >= req_cash:
+                    mask_trade_response[1] = 1
+
+        # Safety: guarantee at least one valid action for each head
+        if not np.any(mask_core):
+            mask_core[0] = 1
+        if not np.any(mask_auction):
+            mask_auction[0] = 1
+        if not np.any(mask_property):
+            mask_property[0] = 1
+        if not np.any(mask_trade_target):
+            mask_trade_target[0] = 1
+        if not np.any(mask_trade_offer_prop):
+            mask_trade_offer_prop[40] = 1
+        if not np.any(mask_trade_offer_cash):
+            mask_trade_offer_cash[0] = 1
+        if not np.any(mask_trade_req_prop):
+            mask_trade_req_prop[40] = 1
+        if not np.any(mask_trade_req_cash):
+            mask_trade_req_cash[0] = 1
+        if not np.any(mask_trade_response):
+            mask_trade_response[0] = 1
+
+        return {
+            "core": mask_core,
+            "auction": mask_auction,
+            "property": mask_property,
+            "trade_target": mask_trade_target,
+            "trade_offer_prop": mask_trade_offer_prop,
+            "trade_offer_cash": mask_trade_offer_cash,
+            "trade_req_prop": mask_trade_req_prop,
+            "trade_req_cash": mask_trade_req_cash,
+            "trade_response": mask_trade_response,
+        }
+
+    # ----------------------------------------------------------------------
+    # Observations & Centralized Critic Global State
+    # ----------------------------------------------------------------------
+    def get_actor_observation(self, player_id: int) -> np.ndarray:
+        """Constructs private actor observation vector s_t^i:
+
+        s_t^i = [ X, C, J, K, O, H, M, B_h, B_ht, tau, u, OneHot(i) ]
+        """
+        # X: positions (4)
+        X = [self.position[p] / 40.0 for p in range(4)]
+        # C: cash balances (4)
+        C = [self.cash[p] / 2000.0 for p in range(4)]
+        # J: jail status (12)
+        J_in = [1.0 if self.in_jail[p] else 0.0 for p in range(4)]
+        J_turns = [self.jail_turns[p] / 3.0 for p in range(4)]
+        J_goojf = [self.goojf_cards[p] / 2.0 for p in range(4)]
+        # K: bankrupt (4)
+        K = [1.0 if self.bankrupt[p] else 0.0 for p in range(4)]
+
+        # O: Property ownership one-hot (40 tiles * 5 categories: unowned + 4 players = 200 dims)
+        O = []
+        for p in range(40):
+            owner = self.property_owner[p]
+            one_hot_o = [0.0] * 5
+            if owner == -1:
+                one_hot_o[0] = 1.0
+            else:
+                one_hot_o[owner + 1] = 1.0
+            O.extend(one_hot_o)
+
+        # H: houses (40)
+        H = [self.property_houses[p] / 5.0 for p in range(40)]
+        # M: mortgaged (40)
+        M = [1.0 if self.property_mortgaged[p] else 0.0 for p in range(40)]
+
+        # Scarcity
+        B_h = [self.bank_houses / 32.0]
+        B_ht = [self.bank_hotels / 12.0]
+
+        # Tau: round progress
+        tau = [self.round_count / float(self.max_rounds)]
+
+        # u: phase one-hot (NUM_PHASES = 7)
+        u = [0.0] * NUM_PHASES
+        if 0 <= self.phase < NUM_PHASES:
+            u[self.phase] = 1.0
+
+        # OneHot(i): 4
+        id_onehot = [0.0] * 4
+        id_onehot[player_id] = 1.0
+
+        # Current dice (2)
+        dice_feat = [self.last_dice[0] / 6.0, self.last_dice[1] / 6.0]
+
+        # Auction info (6): active, prop/40, bid/1000, highest_bidder one-hot (4)
+        auc_active = 1.0 if self.phase == PHASE_AUCTION else 0.0
+        auc_prop = (self.auction_property or 0) / 40.0
+        auc_bid = self.auction_highest_bid / 1000.0
+        auc_bidder = [0.0] * 4
+        if 0 <= self.auction_highest_bidder < 4:
+            auc_bidder[self.auction_highest_bidder] = 1.0
+
+        obs_vec = np.array(
+            X + C + J_in + J_turns + J_goojf + K + O + H + M +
+            B_h + B_ht + tau + u + id_onehot + dice_feat +
+            [auc_active, auc_prop, auc_bid] + auc_bidder,
+            dtype=np.float32
+        )
+        return obs_vec
+
+    def get_global_state(self) -> np.ndarray:
+        """Constructs Centralized Critic Global State S_t^{global}:
+
+        S_t^{global} = [ s_t^1, s_t^2, s_t^3, s_t^4, Deck_chance, Deck_chest ]
+        """
+        actor_obs = [self.get_actor_observation(p) for p in range(4)]
+        deck_state = np.array(self.deck_manager.get_state_vector(), dtype=np.float32)
+        global_state = np.concatenate(actor_obs + [deck_state])
+        return global_state
+
+    def get_observations(self) -> Dict[str, Any]:
+        """Returns observation dictionary for all agents and global critic state."""
+        obs_dict = {}
+        masks_dict = {}
+        for p in range(4):
+            p_name = f"player_{p}"
+            obs_dict[p_name] = self.get_actor_observation(p)
+            masks_dict[p_name] = self.get_action_masks(p)
+
+        return {
+            "obs": obs_dict,
+            "action_mask": masks_dict,
+            "global_state": self.get_global_state(),
+            "active_player": self.active_decision_player,
+            "phase": self.phase,
+        }
+
+    # ----------------------------------------------------------------------
+    # Game Step Transition & Execution
+    # ----------------------------------------------------------------------
+    def step(self, actions: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[str, float], Dict[str, bool], Dict[str, Any]]:
+        """Executes a micro-step given factorized actions from active agent.
+
+        Returns (observations, rewards, dones, infos).
+        """
+        p = self.active_decision_player
+        p_act = actions.get(f"player_{p}", actions)
+        
+        # Parse action heads
+        core_act = int(p_act.get("core", 0))
+        auc_act = int(p_act.get("auction", 0))
+        prop_act = int(p_act.get("property", 0))
+        
+        trade_target_idx = int(p_act.get("trade_target", 0))
+        trade_offer_prop = int(p_act.get("trade_offer_prop", 40))
+        trade_offer_cash_idx = int(p_act.get("trade_offer_cash", 0))
+        trade_req_prop = int(p_act.get("trade_req_prop", 40))
+        trade_req_cash_idx = int(p_act.get("trade_req_cash", 0))
+        trade_response = int(p_act.get("trade_response", 0))
+
+        # Check action mask validity
+        masks = self.get_action_masks(p)
+
+        # Environment rewards before potential shaping
+        env_rewards = [0.0, 0.0, 0.0, 0.0]
+
+        # ----------------- EXECUTE ACCORDING TO PHASE -----------------
+        if self.phase == PHASE_ROLL:
+            self._handle_roll_phase(p)
+
+        elif self.phase == PHASE_JAIL_DECISION:
+            self._handle_jail_phase(p, core_act, masks)
+
+        elif self.phase == PHASE_BUY_OR_AUCTION:
+            self._handle_buy_auction_phase(p, core_act)
+
+        elif self.phase == PHASE_AUCTION:
+            self._handle_auction_phase(p, auc_act)
+
+        elif self.phase == PHASE_PROPERTY_MANAGE:
+            self._handle_management_phase(
+                p, core_act, prop_act, masks,
+                trade_target_idx, trade_offer_prop, trade_offer_cash_idx,
+                trade_req_prop, trade_req_cash_idx
+            )
+
+        elif self.phase == PHASE_TRADE_RESPONSE:
+            self._handle_trade_response(p, trade_response)
+
+        # ----------------- CHECK BANKRUPTCY & VICTORY -----------------
+        for pl in range(4):
+            if not self.bankrupt[pl] and self.cash[pl] < 0:
+                self._resolve_bankruptcy(pl)
+                if self.bankrupt[pl]:
+                    env_rewards[pl] -= 1.0
+
+        # Check terminal conditions
+        active_players = [pl for pl in range(4) if not self.bankrupt[pl]]
+        dones = {f"player_{pl}": self.bankrupt[pl] for pl in range(4)}
+        
+        # If only 1 player remains: winner!
+        if len(active_players) <= 1 or self.round_count >= self.max_rounds:
+            self.phase = PHASE_GAME_OVER
+            for pl in range(4):
+                dones[f"player_{pl}"] = True
+            dones["__all__"] = True
+
+            if len(active_players) == 1:
+                winner = active_players[0]
+                env_rewards[winner] += 1.0
+                self.event_log.append(f"Game Over! Player {winner} is the TOURNAMENT CHAMPION!")
+            else:
+                # Max rounds reached: player with highest net worth wins
+                net_worths = [self.get_player_net_worth(pl) if not self.bankrupt[pl] else -99999 for pl in range(4)]
+                winner = int(np.argmax(net_worths))
+                env_rewards[winner] += 1.0
+                self.event_log.append(f"Max rounds ({self.max_rounds}) reached. Player {winner} wins on Net Worth!")
+        else:
+            dones["__all__"] = False
+
+        # ----------------- POTENTIAL-BASED REWARD SHAPING (PBRS) -----------------
+        # R'^i(s, a, s') = R_{env}^i + gamma * Phi^i(s') - Phi^i(s)
+        shaped_rewards = {}
+        for pl in range(4):
+            new_phi = self._compute_potential(pl)
+            pbrs = self.gamma * new_phi - self.prev_potentials[pl]
+            shaped_r = env_rewards[pl] + pbrs
+            shaped_rewards[f"player_{pl}"] = float(shaped_r)
+            self.prev_potentials[pl] = new_phi
+
+        observations = self.get_observations()
+        infos = {
+            "event_log": list(self.event_log[-5:]),
+            "round": self.round_count,
+            "turn_step": self.turn_step,
+            "bank_houses": self.bank_houses,
+            "bank_hotels": self.bank_hotels,
+            "last_dice": self.last_dice,
+        }
+
+        return observations, shaped_rewards, dones, infos
+
+    # ----------------------------------------------------------------------
+    # Core Phase Handlers
+    # ----------------------------------------------------------------------
+    def _handle_roll_phase(self, p: int):
+        """Rolls dice, handles Speeding (3x doubles), and moves player."""
+        d1 = self.rng.randint(1, 6)
+        d2 = self.rng.randint(1, 6)
+        self.last_dice = (d1, d2)
+        is_double = (d1 == d2)
+
+        if is_double:
+            self.consecutive_doubles += 1
+        else:
+            self.consecutive_doubles = 0
+
+        # SPEEDING RULE: 3 consecutive doubles -> immediately to Jail!
+        if self.consecutive_doubles >= 3:
+            self.event_log.append(f"Player {p} rolled doubles 3 times in a row! SPEEDING -> Sent directly to JAIL!")
+            self._send_to_jail(p)
+            self._end_turn()
+            return
+
+        dice_sum = d1 + d2
+        old_pos = self.position[p]
+        new_pos = (old_pos + dice_sum) % 40
+        self.position[p] = new_pos
+
+        self.event_log.append(f"Player {p} rolled ({d1}, {d2}) = {dice_sum}. Moved from {old_pos} to {new_pos} ({TILES_DATA[new_pos]['name']}).")
+
+        # Check Passing GO
+        if new_pos < old_pos:
+            self.cash[p] += 200
+            self.event_log.append(f"Player {p} passed GO and collected $200.")
+
+        self._handle_landing(p, new_pos, dice_sum, is_double)
+
+    def _handle_jail_phase(self, p: int, core_act: int, masks: Dict[str, np.ndarray]):
+        """Handles player in jail: roll doubles, pay $50, or use GOOJF card."""
+        if core_act == ACT_CORE_PAY_JAIL_50 and masks["core"][ACT_CORE_PAY_JAIL_50]:
+            self.cash[p] -= 50
+            self.in_jail[p] = False
+            self.jail_turns[p] = 0
+            self.event_log.append(f"Player {p} paid $50 fine to get out of Jail.")
+            self.phase = PHASE_ROLL
+            self.active_decision_player = p
+            return
+
+        elif core_act == ACT_CORE_USE_GOOJF and masks["core"][ACT_CORE_USE_GOOJF]:
+            self.goojf_cards[p] -= 1
+            source_deck = self.goojf_sources[p].pop()
+            self.deck_manager.return_goojf(source_deck)
+            self.in_jail[p] = False
+            self.jail_turns[p] = 0
+            self.event_log.append(f"Player {p} used a Get Out of Jail Free card.")
+            self.phase = PHASE_ROLL
+            self.active_decision_player = p
+            return
+
+        else:
+            # Action 0: Roll for doubles
+            d1 = self.rng.randint(1, 6)
+            d2 = self.rng.randint(1, 6)
+            self.last_dice = (d1, d2)
+            is_double = (d1 == d2)
+
+            if is_double:
+                self.in_jail[p] = False
+                self.jail_turns[p] = 0
+                self.consecutive_doubles = 0
+                self.event_log.append(f"Player {p} rolled doubles ({d1}, {d2}) and got out of Jail!")
+                # Move by dice sum, but rolling out of jail does not grant another turn
+                old_pos = self.position[p]
+                new_pos = (old_pos + d1 + d2) % 40
+                self.position[p] = new_pos
+                self._handle_landing(p, new_pos, d1 + d2, is_double=False)
+            else:
+                self.jail_turns[p] += 1
+                self.event_log.append(f"Player {p} rolled ({d1}, {d2}) (no doubles). Remains in Jail (turn {self.jail_turns[p]}/3).")
+                if self.jail_turns[p] >= 3:
+                    # Turn 3 failed double: must pay $50 fine and move!
+                    self.cash[p] -= 50
+                    self.in_jail[p] = False
+                    self.jail_turns[p] = 0
+                    self.event_log.append(f"Player {p} served 3 turns in Jail. Paid $50 mandatory fine and moves {d1 + d2} spaces.")
+                    old_pos = self.position[p]
+                    new_pos = (old_pos + d1 + d2) % 40
+                    self.position[p] = new_pos
+                    self._handle_landing(p, new_pos, d1 + d2, is_double=False)
+                else:
+                    self._end_turn()
+
+    def _handle_landing(self, p: int, pos: int, dice_sum: int, is_double: bool):
+        """Resolves landing on tile pos."""
+        tile = TILES_DATA[pos]
+        t_type = tile["type"]
+
+        if pos == 30:  # Go To Jail
+            self.event_log.append(f"Player {p} landed on Go To Jail!")
+            self._send_to_jail(p)
+            self._end_turn()
+            return
+
+        if t_type == TILE_TAX:
+            tax = tile["tax_amount"]
+            self.cash[p] -= tax
+            self.last_creditor = None
+            self.event_log.append(f"Player {p} paid tax of ${tax} on {tile['name']}.")
+            self._proceed_to_manage_or_next(p, is_double)
+            return
+
+        if t_type == TILE_CARD:
+            deck_name = tile["deck"]
+            card = self.deck_manager.draw_chance() if deck_name == "chance" else self.deck_manager.draw_chest()
+            self.last_card_drawn = card
+            self.event_log.append(f"Player {p} drew {deck_name.upper()} card: '{card['name']}'.")
+            self._execute_card_action(p, card, is_double)
+            return
+
+        if t_type in (TILE_STREET, TILE_RAILROAD, TILE_UTILITY):
+            owner = self.property_owner[pos]
+            if owner == -1:
+                # Unowned property: Player can buy directly or decline (triggering auction)
+                self.landed_property = pos
+                self.phase = PHASE_BUY_OR_AUCTION
+                self.active_decision_player = p
+                self.pending_is_double = is_double
+                return
+            elif owner != p and not self.property_mortgaged[pos]:
+                # Pay rent
+                rent = self._calculate_rent(pos, dice_sum)
+                self.cash[p] -= rent
+                self.cash[owner] += rent
+                self.last_creditor = owner
+                self.event_log.append(f"Player {p} paid ${rent} rent to Player {owner} on {tile['name']}.")
+                self._proceed_to_manage_or_next(p, is_double)
+                return
+            else:
+                # Owned by self or mortgaged
+                self._proceed_to_manage_or_next(p, is_double)
+                return
+
+        # Special / Free Parking / GO / Jail visiting
+        self._proceed_to_manage_or_next(p, is_double)
+
+    def _handle_buy_auction_phase(self, p: int, core_act: int):
+        """Active player chooses to buy directly or decline (triggers auction)."""
+        tile_id = self.landed_property
+        if tile_id is None:
+            self._proceed_to_manage_or_next(p, getattr(self, "pending_is_double", False))
+            return
+
+        tile = TILES_DATA[tile_id]
+        price = tile["price"]
+
+        if core_act == ACT_CORE_BUY_DIRECT and self.cash[p] >= price:
+            self.cash[p] -= price
+            self.property_owner[tile_id] = p
+            self.event_log.append(f"Player {p} purchased {tile['name']} directly for ${price}.")
+            self.landed_property = None
+            self._proceed_to_manage_or_next(p, getattr(self, "pending_is_double", False))
+        else:
+            # DECLINE BUY -> MANDATORY OPEN AUCTION TRIGGERED!
+            self.event_log.append(f"Player {p} declined buying {tile['name']}. Mandatory AUCTION begins!")
+            self._start_auction(tile_id, getattr(self, "pending_is_double", False))
+
+    # ----------------------------------------------------------------------
+    # Auction Engine
+    # ----------------------------------------------------------------------
+    def _start_auction(self, property_id: int, is_double_pending: bool):
+        """Initializes open ascending auction among all non-bankrupt players."""
+        self.auction_property = property_id
+        self.auction_highest_bid = 0
+        self.auction_highest_bidder = -1
+        self.auction_active_bidders = [pl for pl in range(4) if not self.bankrupt[pl]]
+        self.auction_current_bidder_idx = 0
+        self.pending_auction_double = is_double_pending
+        self.phase = PHASE_AUCTION
+        self.active_decision_player = self.auction_active_bidders[0]
+
+    def _handle_auction_phase(self, p: int, auc_act: int):
+        """Processes auction bid or fold for active bidder."""
+        current_bid = self.auction_highest_bid
+        cash = self.cash[p]
+
+        bid_inc = 0
+        if auc_act == ACT_AUC_BID_1:
+            bid_inc = 1
+        elif auc_act == ACT_AUC_BID_10:
+            bid_inc = 10
+        elif auc_act == ACT_AUC_BID_50:
+            bid_inc = 50
+        elif auc_act == ACT_AUC_BID_100:
+            bid_inc = 100
+
+        if bid_inc > 0 and cash >= current_bid + bid_inc:
+            self.auction_highest_bid = current_bid + bid_inc
+            self.auction_highest_bidder = p
+            self.event_log.append(f"Player {p} bids ${self.auction_highest_bid} (+${bid_inc}) on {TILES_DATA[self.auction_property]['name']}.")
+            # Advance to next bidder
+            self.auction_current_bidder_idx = (self.auction_current_bidder_idx + 1) % len(self.auction_active_bidders)
+            self.active_decision_player = self.auction_active_bidders[self.auction_current_bidder_idx]
+        else:
+            # Fold
+            self.event_log.append(f"Player {p} folded in auction.")
+            self.auction_active_bidders.remove(p)
+            if len(self.auction_active_bidders) == 0 or (len(self.auction_active_bidders) == 1 and self.auction_highest_bidder != -1):
+                self._finish_auction()
+                return
+            else:
+                self.auction_current_bidder_idx %= len(self.auction_active_bidders)
+                self.active_decision_player = self.auction_active_bidders[self.auction_current_bidder_idx]
+
+    def _finish_auction(self):
+        """Concludes auction and awards property to highest bidder."""
+        tile_id = self.auction_property
+        tile = TILES_DATA[tile_id]
+        if self.auction_highest_bidder != -1 and self.auction_highest_bid > 0:
+            winner = self.auction_highest_bidder
+            price = self.auction_highest_bid
+            self.cash[winner] -= price
+            self.property_owner[tile_id] = winner
+            self.event_log.append(f"AUCTION WON! Player {winner} won {tile['name']} for ${price}!")
+        else:
+            self.event_log.append(f"Auction ended with no bids. {tile['name']} remains with Bank.")
+
+        self.auction_property = None
+        self.auction_highest_bid = 0
+        self.auction_highest_bidder = -1
+        self.auction_active_bidders = []
+        is_double = getattr(self, "pending_auction_double", False)
+        self._proceed_to_manage_or_next(self.current_player, is_double)
+
+    # ----------------------------------------------------------------------
+    # Property Management & Trading
+    # ----------------------------------------------------------------------
+    def _proceed_to_manage_or_next(self, p: int, is_double: bool):
+        """Enters property management phase before ending turn or re-rolling."""
+        self.phase = PHASE_PROPERTY_MANAGE
+        self.active_decision_player = p
+        self.pending_manage_double = is_double
+
+    def _handle_management_phase(
+        self, p: int, core_act: int, prop_act: int, masks: Dict[str, np.ndarray],
+        trade_target_idx: int, trade_offer_prop: int, trade_offer_cash_idx: int,
+        trade_req_prop: int, trade_req_cash_idx: int
+    ):
+        """Handles house/hotel building/selling, mortgaging, and trade proposals."""
+        is_double = getattr(self, "pending_manage_double", False)
+
+        # 1. End Management -> Proceed to Next Turn or Double Roll
+        if core_act == ACT_CORE_END_MANAGE or masks["property"][prop_act] == 0:
+            # Check bilateral trade proposal if any
+            if trade_offer_prop < 40 or trade_req_prop < 40 or trade_offer_cash_idx > 0 or trade_req_cash_idx > 0:
+                self._propose_trade(p, trade_target_idx, trade_offer_prop, trade_offer_cash_idx, trade_req_prop, trade_req_cash_idx)
+                return
+
+            if is_double and not self.in_jail[p] and not self.bankrupt[p]:
+                self.event_log.append(f"Player {p} rolled doubles! Gets another roll.")
+                self.phase = PHASE_ROLL
+                self.active_decision_player = p
+            else:
+                self._end_turn()
+            return
+
+        # 2. Property Sub-actions:
+        # [0..39]: Build House / Hotel
+        if 0 <= prop_act < 40 and masks["property"][prop_act]:
+            tile = TILES_DATA[prop_act]
+            if tile["type"] == TILE_STREET and "house_cost" in tile:
+                h_cost = tile["house_cost"]
+                h = self.property_houses[prop_act]
+                if h < 4:
+                    # Add house
+                    self.property_houses[prop_act] += 1
+                    self.bank_houses -= 1
+                    self.cash[p] -= h_cost
+                    self.event_log.append(f"Player {p} built a house on {tile['name']} for ${h_cost}. (Bank houses left: {self.bank_houses})")
+                elif h == 4:
+                    # Upgrade to hotel: consumes 1 hotel, releases 4 houses to bank!
+                    self.property_houses[prop_act] = 5
+                    self.bank_hotels -= 1
+                    self.bank_houses += 4
+                    self.cash[p] -= h_cost
+                    self.event_log.append(f"Player {p} upgraded to a HOTEL on {tile['name']} for ${h_cost}! (4 houses returned to bank).")
+
+        # [40..79]: Sell House / Hotel
+        elif 40 <= prop_act < 80 and masks["property"][prop_act]:
+            p_idx = prop_act - 40
+            tile = TILES_DATA[p_idx]
+            if tile["type"] == TILE_STREET and "house_cost" in tile:
+                h_cost = tile["house_cost"]
+                h = self.property_houses[p_idx]
+                refund = int(h_cost * HOUSE_REFUND_RATE)
+                if h <= 4:
+                    self.property_houses[p_idx] -= 1
+                    self.bank_houses += 1
+                    self.cash[p] += refund
+                    self.event_log.append(f"Player {p} sold a house on {tile['name']} for ${refund}.")
+                elif h == 5:
+                    # Sell hotel: downgrade to 4 houses
+                    self.property_houses[p_idx] = 4
+                    self.bank_hotels += 1
+                    self.bank_houses -= 4
+                    self.cash[p] += refund
+                    self.event_log.append(f"Player {p} sold hotel on {tile['name']} for ${refund} (converted to 4 houses).")
+
+        # [80..119]: Mortgage
+        elif 80 <= prop_act < 120 and masks["property"][prop_act]:
+            p_idx = prop_act - 80
+            tile = TILES_DATA[p_idx]
+            if "mortgage" in tile and p_idx in PURCHASABLE_TILES:
+                mtg_val = tile["mortgage"]
+                self.property_mortgaged[p_idx] = True
+                self.cash[p] += mtg_val
+                self.event_log.append(f"Player {p} mortgaged {tile['name']} for ${mtg_val}.")
+
+        # [120..159]: Unmortgage
+        elif 120 <= prop_act < 160 and masks["property"][prop_act]:
+            p_idx = prop_act - 120
+            tile = TILES_DATA[p_idx]
+            if "mortgage" in tile and p_idx in PURCHASABLE_TILES:
+                cost = int(tile["mortgage"] * (1.0 + UNMORTGAGE_INTEREST_RATE))
+                self.property_mortgaged[p_idx] = False
+                self.cash[p] -= cost
+                self.event_log.append(f"Player {p} unmortgaged {tile['name']} for ${cost} (incl. 10% interest).")
+
+    def _propose_trade(
+        self, initiator: int, target_idx: int, offer_prop: int,
+        offer_cash_idx: int, req_prop: int, req_cash_idx: int
+    ):
+        """Initiates a bilateral trade negotiation."""
+        other_players = [pl for pl in range(4) if pl != initiator and not self.bankrupt[pl]]
+        if not other_players:
+            return
+        target = other_players[target_idx % len(other_players)]
+        offer_cash = TRADE_CASH_BRACKETS[min(offer_cash_idx, len(TRADE_CASH_BRACKETS) - 1)]
+        req_cash = TRADE_CASH_BRACKETS[min(req_cash_idx, len(TRADE_CASH_BRACKETS) - 1)]
+
+        # Validate offer
+        if offer_prop < 40 and self.property_owner[offer_prop] != initiator:
+            return
+        if req_prop < 40 and self.property_owner[req_prop] != target:
+            return
+        if self.cash[initiator] < offer_cash:
+            return
+
+        self.pending_trade = {
+            "initiator": initiator,
+            "target": target,
+            "offer_prop": offer_prop,
+            "offer_cash": offer_cash,
+            "req_prop": req_prop,
+            "req_cash": req_cash,
+        }
+        self.phase = PHASE_TRADE_RESPONSE
+        self.active_decision_player = target
+        self.event_log.append(f"TRADE PROPOSAL: Player {initiator} -> Player {target}: Offer(Prop={offer_prop if offer_prop<40 else 'None'}, Cash=${offer_cash}) for Request(Prop={req_prop if req_prop<40 else 'None'}, Cash=${req_cash}).")
+
+    def _handle_trade_response(self, target: int, trade_response: int):
+        """Processes acceptance or rejection of bilateral trade."""
+        if self.pending_trade and trade_response == 1:
+            trade = self.pending_trade
+            init = trade["initiator"]
+            req_cash = trade["req_cash"]
+            offer_cash = trade["offer_cash"]
+            offer_p = trade["offer_prop"]
+            req_p = trade["req_prop"]
+
+            if self.cash[target] >= req_cash and self.cash[init] >= offer_cash:
+                # Atomic transfer
+                self.cash[init] -= offer_cash
+                self.cash[target] += offer_cash
+                self.cash[target] -= req_cash
+                self.cash[init] += req_cash
+
+                if offer_p < 40 and self.property_owner[offer_p] == init:
+                    self.property_owner[offer_p] = target
+                if req_p < 40 and self.property_owner[req_p] == target:
+                    self.property_owner[req_p] = init
+
+                self.event_log.append(f"TRADE ACCEPTED between Player {init} and Player {target}!")
+            else:
+                self.event_log.append(f"Trade failed due to insufficient funds.")
+        else:
+            self.event_log.append(f"Trade REJECTED by Player {target}.")
+
+        self.pending_trade = None
+        self.phase = PHASE_PROPERTY_MANAGE
+        self.active_decision_player = self.current_player
+
+    # ----------------------------------------------------------------------
+    # Cards & Actions Handling
+    # ----------------------------------------------------------------------
+    def _execute_card_action(self, p: int, card: Dict[str, Any], is_double: bool):
+        """Executes official Chance or Community Chest card effects."""
+        action = card["action"]
+
+        if action == "advance_to":
+            target = card["target"]
+            old_pos = self.position[p]
+            self.position[p] = target
+            if card.get("collect_pass_go", False) and target < old_pos:
+                self.cash[p] += 200
+                self.event_log.append(f"Player {p} passed GO and collected $200.")
+            self._handle_landing(p, target, dice_sum=self.last_dice[0] + self.last_dice[1], is_double=is_double)
+
+        elif action == "advance_nearest_utility":
+            # Utilities are 12 and 28
+            curr = self.position[p]
+            target = 12 if curr < 12 or curr >= 28 else 28
+            if target < curr:
+                self.cash[p] += 200
+            self.position[p] = target
+            owner = self.property_owner[target]
+            if owner == -1:
+                self.landed_property = target
+                self.phase = PHASE_BUY_OR_AUCTION
+                self.active_decision_player = p
+                self.pending_is_double = is_double
+            elif owner != p and not self.property_mortgaged[target]:
+                # Official Card Rule: throw fresh dice and pay 10x
+                d_roll = self.rng.randint(1, 6) + self.rng.randint(1, 6)
+                rent = 10 * d_roll
+                self.cash[p] -= rent
+                self.cash[owner] += rent
+                self.last_creditor = owner
+                self.event_log.append(f"Player {p} threw {d_roll} and paid ${rent} (10x fresh roll) to Player {owner} on {TILES_DATA[target]['name']}.")
+                self._proceed_to_manage_or_next(p, is_double)
+            else:
+                self._proceed_to_manage_or_next(p, is_double)
+
+        elif action == "advance_nearest_railroad":
+            # Railroads are 5, 15, 25, 35
+            curr = self.position[p]
+            rr_tiles = [5, 15, 25, 35]
+            target = min([r for r in rr_tiles if r > curr] or [5])
+            if target < curr:
+                self.cash[p] += 200
+            self.position[p] = target
+            owner = self.property_owner[target]
+            if owner == -1:
+                self.landed_property = target
+                self.phase = PHASE_BUY_OR_AUCTION
+                self.active_decision_player = p
+                self.pending_is_double = is_double
+            elif owner != p and not self.property_mortgaged[target]:
+                # 2x normal rent
+                rent = self._calculate_rent(target, dice_sum=self.last_dice[0] + self.last_dice[1], multiplier_override=2)
+                self.cash[p] -= rent
+                self.cash[owner] += rent
+                self.last_creditor = owner
+                self.event_log.append(f"Player {p} paid ${rent} (2x railroad rent) to Player {owner} on {TILES_DATA[target]['name']}.")
+                self._proceed_to_manage_or_next(p, is_double)
+            else:
+                self._proceed_to_manage_or_next(p, is_double)
+
+        elif action == "cash_from_bank":
+            amount = card["amount"]
+            self.cash[p] += amount
+            self._proceed_to_manage_or_next(p, is_double)
+
+        elif action == "pay_bank":
+            amount = card["amount"]
+            self.cash[p] -= amount
+            self._proceed_to_manage_or_next(p, is_double)
+
+        elif action == "goojf":
+            deck = card["deck"]
+            self.goojf_cards[p] += 1
+            self.goojf_sources[p].append(deck)
+            self._proceed_to_manage_or_next(p, is_double)
+
+        elif action == "go_to_jail":
+            self._send_to_jail(p)
+            self._end_turn()
+
+        elif action == "move_relative":
+            steps = card["steps"]
+            new_pos = (self.position[p] + steps) % 40
+            self.position[p] = new_pos
+            self._handle_landing(p, new_pos, dice_sum=self.last_dice[0] + self.last_dice[1], is_double=is_double)
+
+        elif action == "property_repairs":
+            h_cost = card["house_cost"]
+            hotel_cost = card["hotel_cost"]
+            owned = [t for t in PURCHASABLE_TILES if self.property_owner[t] == p]
+            total_houses = sum(self.property_houses[t] for t in owned if 1 <= self.property_houses[t] <= 4)
+            total_hotels = sum(1 for t in owned if self.property_houses[t] == 5)
+            repairs = total_houses * h_cost + total_hotels * hotel_cost
+            self.cash[p] -= repairs
+            self.event_log.append(f"Player {p} paid ${repairs} in property repairs.")
+            self._proceed_to_manage_or_next(p, is_double)
+
+        elif action == "pay_each_player":
+            amt = card["amount"]
+            for pl in range(4):
+                if pl != p and not self.bankrupt[pl]:
+                    self.cash[p] -= amt
+                    self.cash[pl] += amt
+            self._proceed_to_manage_or_next(p, is_double)
+
+        elif action == "collect_from_each_player":
+            amt = card["amount"]
+            for pl in range(4):
+                if pl != p and not self.bankrupt[pl]:
+                    self.cash[pl] -= amt
+                    self.cash[p] += amt
+            self._proceed_to_manage_or_next(p, is_double)
+
+        else:
+            self._proceed_to_manage_or_next(p, is_double)
+
+    # ----------------------------------------------------------------------
+    # Bankruptcy & End Turn
+    # ----------------------------------------------------------------------
+    def _send_to_jail(self, p: int):
+        """Sends player p directly to Jail."""
+        self.position[p] = 10
+        self.in_jail[p] = True
+        self.jail_turns[p] = 0
+        self.consecutive_doubles = 0
+
+    def _resolve_bankruptcy(self, p: int):
+        """Liquidates assets or eliminates bankrupt player under official tournament rules."""
+        owned_props = [t for t in PURCHASABLE_TILES if self.property_owner[t] == p]
+        creditor = getattr(self, "last_creditor", None)
+        if creditor == p or (creditor is not None and self.bankrupt[creditor]):
+            creditor = None
+
+        # 1. Sell houses/hotels first at 50% refund to raise cash
+        for t in owned_props:
+            while self.property_houses[t] > 0 and self.cash[p] < 0:
+                h = self.property_houses[t]
+                cost = TILES_DATA[t]["house_cost"]
+                refund = int(cost * HOUSE_REFUND_RATE)
+                if h == 5:
+                    self.property_houses[t] = 4
+                    self.bank_hotels += 1
+                    self.bank_houses -= 4
+                else:
+                    self.property_houses[t] -= 1
+                    self.bank_houses += 1
+                self.cash[p] += refund
+
+        # 2. Mortgage properties if still in debt
+        for t in owned_props:
+            if not self.property_mortgaged[t] and self.cash[p] < 0:
+                mtg = TILES_DATA[t]["mortgage"]
+                self.property_mortgaged[t] = True
+                self.cash[p] += mtg
+
+        # If still in debt: PLAYER IS OFFICIALLY BANKRUPT!
+        if self.cash[p] < 0:
+            self.bankrupt[p] = True
+            if creditor is not None:
+                # Official Tournament Rule: Bankrupt to another player!
+                # All remaining properties (mortgaged) and GOOJF cards transfer to creditor!
+                for t in owned_props:
+                    self.property_owner[t] = creditor
+                self.event_log.append(f"PLAYER {p} IS BANKRUPT! All properties transferred to creditor Player {creditor}.")
+
+                # Transfer GOOJF cards to creditor
+                while self.goojf_cards[p] > 0:
+                    self.goojf_cards[p] -= 1
+                    src = self.goojf_sources[p].pop()
+                    self.goojf_cards[creditor] += 1
+                    self.goojf_sources[creditor].append(src)
+            else:
+                # Official Tournament Rule: Bankrupt to the Bank (taxes, fees)
+                self.event_log.append(f"PLAYER {p} IS BANKRUPT to the Bank! Properties returned to Bank.")
+                for t in owned_props:
+                    # Return houses/hotels
+                    h = self.property_houses[t]
+                    if h == 5:
+                        self.bank_hotels += 1
+                    elif h > 0:
+                        self.bank_houses += h
+                    self.property_houses[t] = 0
+                    self.property_mortgaged[t] = False
+                    self.property_owner[t] = -1
+
+                # Return GOOJF cards to decks
+                while self.goojf_cards[p] > 0:
+                    self.goojf_cards[p] -= 1
+                    src = self.goojf_sources[p].pop()
+                    self.deck_manager.return_goojf(src)
+
+        self.last_creditor = None
+
+    def _end_turn(self):
+        """Rotates to next active player."""
+        self.consecutive_doubles = 0
+        self.landed_property = None
+        self.turn_step += 1
+
+        # Advance current_player to next non-bankrupt player
+        for _ in range(4):
+            self.current_player = (self.current_player + 1) % 4
+            if not self.bankrupt[self.current_player]:
+                break
+
+        if self.current_player == 0:
+            self.round_count += 1
+
+        # If next player is in jail, prompt jail decision; otherwise roll phase
+        if self.in_jail[self.current_player]:
+            self.phase = PHASE_JAIL_DECISION
+        else:
+            self.phase = PHASE_ROLL
+
+        self.active_decision_player = self.current_player
+
+    def get_player_net_worth(self, pl: int) -> int:
+        """Calculates total net worth: Cash + Property Purchase Prices + Building Equity."""
+        if self.bankrupt[pl]:
+            return 0
+        nw = max(0, self.cash[pl])
+        for p in PURCHASABLE_TILES:
+            if self.property_owner[p] == pl:
+                tile = TILES_DATA[p]
+                if not self.property_mortgaged[p]:
+                    nw += tile["price"]
+                else:
+                    nw += tile["mortgage"]
+                h = self.property_houses[p]
+                if h > 0:
+                    nw += h * tile.get("house_cost", 0)
+        return nw
