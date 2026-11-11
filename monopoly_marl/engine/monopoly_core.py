@@ -619,78 +619,38 @@ class MonopolyCore:
             price = TILES_DATA[tile_id]["price"] if tile_id is not None and 0 <= tile_id < len(TILES_DATA) else 999999
             cash = self.cash[player_id]
 
-            # Check if property completes my monopoly or denies an opponent monopoly
-            completes_my_monopoly = False
-            denies_opponent_monopoly = False
-            if tile_id is not None and 0 <= tile_id < len(TILES_DATA):
-                grp = TILES_DATA[tile_id].get("color")
-                if grp and grp in COLOR_GROUPS:
-                    group_tiles = COLOR_GROUPS[grp]
-                    owned_by_me = sum(1 for t in group_tiles if self.property_owner[t] == player_id)
-                    if owned_by_me == len(group_tiles) - 1:
-                        completes_my_monopoly = True
-                    for pl in range(4):
-                        if pl != player_id and not self.bankrupt[pl]:
-                            owned_by_pl = sum(1 for t in group_tiles if self.property_owner[t] == pl)
-                            if owned_by_pl == len(group_tiles) - 1:
-                                denies_opponent_monopoly = True
-                                break
-
-            # 1. Direct Purchase Masking (Hazard Survival Check)
+            # Official Monopoly Rule: Direct purchase is legal whenever player has enough cash
             if cash >= price:
-                hazard_threat = self.compute_hazard_threat(player_id)
-                survival_buffer = max(30, int(0.5 * hazard_threat))
-                # Buying is allowed if post-purchase cash >= survival buffer, OR if it's a monopoly/denial
-                if (cash - price) >= survival_buffer or completes_my_monopoly or denies_opponent_monopoly:
-                    mask_core[ACT_CORE_BUY_DIRECT] = 1
+                mask_core[ACT_CORE_BUY_DIRECT] = 1
 
-            # 2. Decline Buy Masking (Anti-Blunder Monopoly Protection)
-            # Declining is allowed by default, UNLESS completing own monopoly while opponents can afford to steal it
-            can_decline = True
-            if completes_my_monopoly and mask_core[ACT_CORE_BUY_DIRECT] == 1:
-                has_wealthy_opponent = any(
-                    pl != player_id and not self.bankrupt[pl] and self.cash[pl] >= price
-                    for pl in range(4)
-                )
-                if has_wealthy_opponent:
-                    # Declining to auction when opponents can steal your completed monopoly is strictly irrational
-                    can_decline = False
-
-            if can_decline:
-                mask_core[ACT_CORE_DECLINE_BUY] = 1
-
-            # Safety fallback: ensure at least one action is legal
-            if mask_core[ACT_CORE_BUY_DIRECT] == 0 and mask_core[ACT_CORE_DECLINE_BUY] == 0:
-                mask_core[ACT_CORE_DECLINE_BUY] = 1
+            # Official Monopoly Rule: Player can always decline purchase (sending property to public auction)
+            mask_core[ACT_CORE_DECLINE_BUY] = 1
 
         # 4. PHASE_AUCTION
         elif self.phase == PHASE_AUCTION:
-            # Auction actions: Fold (0) is always valid
+            # Official Monopoly Rule: Fold (0) is always valid
             mask_auction[ACT_AUC_FOLD] = 1
             if self.auction_property is not None:
                 current_bid = self.auction_highest_bid
                 cash = self.cash[player_id]
-                ceiling = self.compute_bidding_ceiling(player_id, self.auction_property)
 
-                # Increments: +1, +10, +50, +100
+                # Official Monopoly Rule: Any active player can bid any increment they have cash for
                 increments = [1, 10, 50, 100]
                 for act_idx, inc in enumerate(increments, start=1):
-                    if cash >= current_bid + inc and current_bid + inc <= ceiling:
+                    if cash >= current_bid + inc:
                         mask_auction[act_idx] = 1
 
-                # Strategic Jump Bids
+                # Jump Bids (allowed if bidder has cash)
                 tile = TILES_DATA[self.auction_property]
                 price = tile.get("price", 100)
-                # Jump 1: Match printed list price (if higher than current bid and within ceiling)
-                if price > current_bid and cash >= price and price <= ceiling:
+                if price > current_bid and cash >= price:
                     mask_auction[ACT_AUC_JUMP_LIST] = 1
 
-                # Jump 2: Squeeze max active opponent cash (+ $1)
                 other_bidders = [b for b in self.auction_active_bidders if b != player_id and not self.bankrupt[b]]
                 if other_bidders:
                     max_opp_c = max(self.cash[b] for b in other_bidders)
                     squeeze_target = max_opp_c + 1
-                    if squeeze_target > current_bid and cash >= squeeze_target and squeeze_target <= ceiling:
+                    if squeeze_target > current_bid and cash >= squeeze_target:
                         mask_auction[ACT_AUC_JUMP_SQUEEZE] = 1
 
         # 5. PHASE_PROPERTY_MANAGE
@@ -803,8 +763,10 @@ class MonopolyCore:
             # 0: Reject (always valid)
             mask_trade_response[0] = 1
             if self.pending_trade:
-                is_rational, _ = self.evaluate_trade_rationality(self.pending_trade)
-                if is_rational:
+                req_cash = self.pending_trade["req_cash"]
+                init = self.pending_trade["initiator"]
+                offer_cash = self.pending_trade["offer_cash"]
+                if self.cash[player_id] >= req_cash and self.cash[init] >= offer_cash:
                     mask_trade_response[1] = 1
 
         # Safety: guarantee at least one valid action for each head

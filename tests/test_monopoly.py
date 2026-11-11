@@ -406,9 +406,8 @@ def test_advanced_auction_ceiling_and_jump_bidding():
     assert core.phase != PHASE_AUCTION
 
 
-def test_property_purchase_hazard_survival_masking():
-    """Validates that purchasing neutral properties when post-purchase cash is below
-    survival buffer is masked to 0, but strategic monopoly/denial purchases are permitted."""
+def test_property_purchase_official_affordability_masking():
+    """Validates that purchasing is strictly permitted when cash >= price, and forbidden when cash < price."""
     core = MonopolyCore(seed=123, include_synergy_obs=True)
 
     # Setup player 0 in PHASE_BUY_OR_AUCTION on tile 21 (Kentucky Ave, Red, price $220)
@@ -417,27 +416,21 @@ def test_property_purchase_hazard_survival_masking():
     core.active_decision_player = 0
     core.position[0] = 21
 
-    # Place lethal opponent hotel nearby (tile 23: Indiana Ave, 3 houses, rent $700)
-    core.property_owner[23] = 1
-    core.property_houses[23] = 3
-
-    # Player 0 has $240 cash (cash - price = $20, while survival_buffer is > $30)
+    # Player 0 has $240 cash (cash >= price $220): BUY_DIRECT must be legal!
     core.cash[0] = 240
     masks = core.get_action_masks(0)
-    # Since tile 21 is neutral (does not complete or deny monopoly), BUY_DIRECT must be masked out to prevent ruin!
-    assert masks["core"][ACT_CORE_BUY_DIRECT] == 0, "Buying neutral property leaving <$30 before lethal hazard must be masked 0"
-    assert masks["core"][ACT_CORE_DECLINE_BUY] == 1, "Must be able to decline"
+    assert masks["core"][ACT_CORE_BUY_DIRECT] == 1, "Direct buy must be legal when player can afford it"
+    assert masks["core"][ACT_CORE_DECLINE_BUY] == 1, "Decline buy is always legal under official rules"
 
-    # Now give player 0 the other two Red properties: tiles 23 (Indiana) and 24 (Illinois)
-    core.property_owner[23] = 0
-    core.property_owner[24] = 0
-    # Now tile 21 completes player 0's Red monopoly!
-    masks_monopoly = core.get_action_masks(0)
-    assert masks_monopoly["core"][ACT_CORE_BUY_DIRECT] == 1, "Monopoly completion override must allow BUY_DIRECT despite hazard"
+    # Player 0 has $100 cash (cash < price $220): BUY_DIRECT must be illegal!
+    core.cash[0] = 100
+    masks_poor = core.get_action_masks(0)
+    assert masks_poor["core"][ACT_CORE_BUY_DIRECT] == 0, "Cannot buy directly when cash is insufficient"
+    assert masks_poor["core"][ACT_CORE_DECLINE_BUY] == 1, "Must be able to decline to auction"
 
 
-def test_property_purchase_anti_blunder_decline_masking():
-    """Validates that declining a monopoly completion when opponents can afford to steal it is masked 0."""
+def test_property_purchase_official_decline_masking():
+    """Validates that under official Monopoly rules, declining purchase is always legal."""
     core = MonopolyCore(seed=456, include_synergy_obs=True)
 
     # Player 0 lands on tile 19 (New York Ave, Orange, price $200)
@@ -446,24 +439,9 @@ def test_property_purchase_anti_blunder_decline_masking():
     core.active_decision_player = 0
     core.cash[0] = 500
 
-    # Player 0 already owns the other two Oranges (tiles 16 and 18)
-    core.property_owner[16] = 0
-    core.property_owner[18] = 0
-
-    # Opponent 1 has $600 (can afford $200 in auction)
-    core.cash[1] = 600
-
     masks = core.get_action_masks(0)
     assert masks["core"][ACT_CORE_BUY_DIRECT] == 1
-    assert masks["core"][ACT_CORE_DECLINE_BUY] == 0, "Cannot decline completed monopoly when opponents can steal it in auction!"
-
-    # Now make all opponents cash-poor (< $200)
-    core.cash[1] = 50
-    core.cash[2] = 40
-    core.cash[3] = 30
-    masks_poor_opps = core.get_action_masks(0)
-    assert masks_poor_opps["core"][ACT_CORE_BUY_DIRECT] == 1
-    assert masks_poor_opps["core"][ACT_CORE_DECLINE_BUY] == 1, "Declining permitted when opponents are too broke to steal monopoly (strategic discount opportunity)"
+    assert masks["core"][ACT_CORE_DECLINE_BUY] == 1, "Official Monopoly rules always allow declining to auction"
 
 
 def test_property_transaction_features_in_buy_phase():
