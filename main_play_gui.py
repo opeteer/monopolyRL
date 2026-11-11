@@ -23,6 +23,7 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Monopoly MARL Real-Time Pygame GUI")
     parser.add_argument("--checkpoint", type=str, default=None, help="Path to trained Actor checkpoint")
     parser.add_argument("--max_rounds", type=int, default=None, help="Max game rounds (None for unbounded horizon survival)")
+    parser.add_argument("--speed", type=int, default=5, choices=[1, 2, 5, 20, 100], help="Initial simulation speed multiplier")
     parser.add_argument("--seed", type=int, default=None, help="Random seed")
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu", help="Device")
     return parser.parse_args()
@@ -87,6 +88,10 @@ def main():
     # Renderer & Dashboard
     renderer = MonopolyRenderer(screen, board_size=800, offset_x=20, offset_y=20)
     dashboard = MonopolyDashboard(screen, x=840, y=20, width=520, height=800)
+    dashboard.speed = args.speed
+    for b in dashboard.buttons:
+        if b.action_id.startswith("speed_"):
+            b.is_active = (b.action_id == f"speed_{dashboard.speed}")
 
     # Load 4 Identical Blueprint Autonomous Agents
     target_obs_dim = core.get_actor_observation(0).shape[0]
@@ -101,6 +106,8 @@ def main():
     running = True
     step_requested = False
     last_step_time = time.time()
+    game_over_captured = False
+    last_bankrupt_count = 0
 
     print("=== Pygame MARL Monopoly GUI Running ===")
     print(f"Agents: {', '.join(core.player_names)} (P0..P3)")
@@ -127,6 +134,8 @@ def main():
                     step_requested = True
                 elif event.key == pygame.K_r:
                     core.reset(seed=args.seed)
+                    game_over_captured = False
+                    last_bankrupt_count = 0
                 elif event.key == pygame.K_1:
                     dashboard.speed = 1
                 elif event.key == pygame.K_2:
@@ -158,6 +167,8 @@ def main():
                 step_requested = True
             elif action == "reset":
                 core.reset(seed=args.seed)
+                game_over_captured = False
+                last_bankrupt_count = 0
             elif action == "screenshot":
                 os.makedirs("screenshots", exist_ok=True)
                 s_path = f"screenshots/monopoly_gui_{int(time.time())}.png"
@@ -196,12 +207,38 @@ def main():
                 # Step state machine
                 core.step({f"player_{p_act}": act})
 
+                # Check for new bankruptcies
+                curr_bankrupt_count = sum(1 for b in core.bankrupt if b)
+                if curr_bankrupt_count > last_bankrupt_count:
+                    eliminated = [core.get_player_name(pl) for pl in range(4) if core.bankrupt[pl]]
+                    survivors = [core.get_player_name(pl) for pl in range(4) if not core.bankrupt[pl]]
+                    print(f"[ROUND {core.round_count} - STEP {core.turn_step}] Player eliminated! Eliminated: {', '.join(eliminated)} | Survivors remaining ({len(survivors)}): {', '.join(survivors)}")
+                    last_bankrupt_count = curr_bankrupt_count
+
         # Clear background
         screen.fill(BG_COLOR)
 
         # Render Board & Dashboard
         renderer.render(core)
         dashboard.render(core)
+
+        # Check Tournament Game Over (Last Agent Standing)
+        if core.phase == 6 and not game_over_captured:
+            game_over_captured = True
+            active = [pl for pl in range(4) if not core.bankrupt[pl]]
+            winner_name = core.get_player_name(active[0]) if len(active) == 1 else "Unknown"
+            winner_nw = core.get_player_net_worth(active[0]) if len(active) == 1 else 0
+            print("\n" + "=" * 55)
+            print(f"*** TOURNAMENT CHAMPION: {winner_name.upper()} ***")
+            print("Rule Condition: Last Agent Standing (Survival Victory)")
+            print(f"Surviving Rounds: {core.round_count} | Total Turn Steps: {core.turn_step}")
+            print(f"Final Net Worth: ${winner_nw:,}")
+            print("=" * 55 + "\n")
+            os.makedirs("screenshots", exist_ok=True)
+            v_path = f"screenshots/tournament_victory_{int(time.time())}.png"
+            pygame.image.save(screen, v_path)
+            print(f"Victory screenshot captured: {v_path}")
+            core.event_log.append(f"Auto-saved: {os.path.basename(v_path)}")
 
         pygame.display.flip()
         clock.tick(60)
