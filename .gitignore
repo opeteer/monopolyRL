@@ -24,12 +24,16 @@ share/python-wheels/
 MANIFEST
 
 # Virtual environments
+.venv
 .venv/
 venv/
 ENV/
 env/
 env.bak/
 venv.bak/
+
+# Logs
+*.log
 
 # Pytest / coverage / tooling
 .pytest_cache/

@@ -351,7 +351,7 @@ def main():
 
     total_time = time.time() - start_time
     print(f"\n=======================================================")
-    print(f"=== Training 1,000,000 Steps Finished Successfully! ===")
+    print(f"=== Training {total_steps_executed:,} Steps Finished Successfully! ===")
     print(f"Total Steps: {total_steps_executed:,} | Elapsed Time: {total_time:.2f}s ({total_time/60:.1f} min)")
     print(f"Average Speed: {int(total_steps_executed/total_time):,} steps/sec")
     print(f"Checkpoints and League Summary saved in: {args.checkpoint_dir}/")
