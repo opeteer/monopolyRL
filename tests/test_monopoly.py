@@ -612,6 +612,75 @@ def test_gui_rendering_across_all_game_phases():
     dashboard.render(core)
 
 
+def test_gui_cards_rendering_and_interaction():
+    """Validates rendering of Title Deed, Chance, and Community Chest cards along with click inspection."""
+    import os
+    os.environ["SDL_VIDEODRIVER"] = "dummy"
+    import pygame
+    pygame.init()
+
+    from monopoly_marl.engine.monopoly_core import MonopolyCore, PHASE_BUY_OR_AUCTION, PHASE_ROLL
+    from monopoly_marl.gui.renderer import MonopolyRenderer
+    from monopoly_marl.engine.cards_data import CHANCE_CARDS, COMMUNITY_CHEST_CARDS
+
+    surface = pygame.Surface((1380, 840))
+    core = MonopolyCore(seed=42)
+    renderer = MonopolyRenderer(surface, board_size=800, offset_x=20, offset_y=20)
+
+    # 1. Title Deed Card in Center HUD during Buy/Auction phase
+    core.phase = PHASE_BUY_OR_AUCTION
+    core.landed_property = 39 # Boardwalk
+    renderer.render(core)
+
+    # 2. Chance Card in Center HUD
+    core.phase = PHASE_ROLL
+    core.position[0] = 7
+    core.last_card_drawn = CHANCE_CARDS[0]
+    renderer.render(core)
+
+    # 3. Community Chest Card in Center HUD
+    core.position[0] = 2
+    core.last_card_drawn = COMMUNITY_CHEST_CARDS[1]
+    renderer.render(core)
+
+    # 4. Interactive Tile Inspection click
+    # Click tile 24 (Illinois Ave)
+    tile_rect_24 = renderer.tile_rects[24]
+    clicked = renderer.handle_click(tile_rect_24.center)
+    assert clicked is True
+    assert renderer.inspect_tile_id == 24
+    renderer.render(core)
+
+    # Click Railroad (tile 5)
+    tile_rect_5 = renderer.tile_rects[5]
+    clicked = renderer.handle_click(tile_rect_5.center)
+    assert clicked is True
+    assert renderer.inspect_tile_id == 5
+    renderer.render(core)
+
+    # Click Utility (tile 12)
+    tile_rect_12 = renderer.tile_rects[12]
+    clicked = renderer.handle_click(tile_rect_12.center)
+    assert clicked is True
+    assert renderer.inspect_tile_id == 12
+    renderer.render(core)
+
+    # Click Chance (tile 7)
+    tile_rect_7 = renderer.tile_rects[7]
+    clicked = renderer.handle_click(tile_rect_7.center)
+    assert clicked is True
+    assert renderer.inspect_tile_id == 7
+    renderer.render(core)
+
+    # Click close button to dismiss inspection
+    cx = renderer.offset_x + renderer.board_size // 2
+    cy = renderer.offset_y + renderer.board_size // 2
+    close_btn_pos = (cx + 105, cy - 140)
+    renderer.handle_click(close_btn_pos)
+    assert renderer.inspect_tile_id is None
+
+
+
 
 
 

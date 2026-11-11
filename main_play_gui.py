@@ -147,6 +147,10 @@ def main():
                     pygame.image.save(screen, s_path)
                     print(f"Screenshot saved to: {s_path}")
                     core.event_log.append(f"Screenshot saved: {os.path.basename(s_path)}")
+            elif event.type == pygame.MOUSEBUTTONDOWN:
+                # Board tile card inspection click
+                if renderer.handle_click(event.pos):
+                    continue
 
             # Check dashboard button clicks
             action = dashboard.handle_event(event)
