@@ -28,17 +28,22 @@ An autonomous Multi-Agent Reinforcement Learning (MARL) tournament Monopoly engi
 $$\mathcal{M} = \big\langle \mathcal{N}, \mathcal{S}, \{\mathcal{A}^i\}_{i \in \mathcal{N}}, \mathcal{P}, \{\mathcal{R}^i\}_{i \in \mathcal{N}}, \gamma \big\rangle$$
 
 ### Observation Space
-- **Decentralized Actor Observation ($s_t^i \in \mathbb{R}^{327}$)**:
-  $$s_t^i = \Big[ \mathbf{X}, \; \mathbf{C}, \; \mathbf{J}, \; \mathbf{K}, \; \mathbf{O}, \; \mathbf{H}, \; \mathbf{M}, \; B_h, \; B_{ht}, \; \tau, \; \mathbf{u}, \; \text{OneHot}(i) \Big]$$
-- **Centralized Critic Global State ($S_t^{\text{global}} \in \mathbb{R}^{1340}$)**:
+- **Decentralized Actor Observation ($s_t^i \in \mathbb{R}^{399}$)**:
+  $$s_t^i = \Big[ \mathbf{X}, \; \mathbf{C}, \; \mathbf{J}, \; \mathbf{K}, \; \mathbf{O}, \; \mathbf{H}, \; \mathbf{M}, \; B_h, \; B_{ht}, \; \tau, \; \mathbf{u}, \; \text{OneHot}(i), \; \text{Dice}, \; \mathbf{Auction}_{\text{base}}, \; \mathbf{Synergy}_{64}, \; \mathbf{MarketFeatures}_8 \Big]$$
+- **Centralized Critic Global State ($S_t^{\text{global}} \in \mathbb{R}^{1628}$)**:
   $$S_t^{\text{global}} = \Big[ s_t^1, \; s_t^2, \; s_t^3, \; s_t^4, \; \mathbf{Deck}_{\text{chance}}, \; \mathbf{Deck}_{\text{chest}} \Big]$$
 
 ### Factorized Multi-Head Action Space ($\mathcal{A}^i$)
 $$\mathcal{A}^i = \mathcal{A}_{\text{core}} \times \mathcal{A}_{\text{auction}} \times \mathcal{A}_{\text{property}} \times \mathcal{A}_{\text{trade}}$$
 1. $\mathcal{A}_{\text{core}}$ (6 dims): Roll/Pass, Buy Direct, Decline Buy (Trigger Auction), Pay $50 Jail Fine, Use GOOJF, End Management.
-2. $\mathcal{A}_{\text{auction}}$ (5 dims): Fold, Bid +$1, Bid +$10, Bid +$50, Bid +$100.
+2. $\mathcal{A}_{\text{auction}}$ (7 dims): Fold, Bid +$1, Bid +$10, Bid +$50, Bid +$100, Jump to List Price, Jump to Opponent Squeeze.
 3. $\mathcal{A}_{\text{property}}$ (160 dims): Build House ($p$), Sell House ($p$), Mortgage ($p$), Unmortgage ($p$) for $p \in \{0, \dots, 39\}$.
 4. $\mathcal{A}_{\text{trade}}$: Bilateral negotiation protocol (Target Player, Offer Property, Offer Cash, Request Property, Request Cash, Response).
+
+### Advanced Game-Theoretic Mechanisms
+1. **Game-Theoretic Barter Engine**: 64-dim color synergy vector, dynamic trade rationality verification, cash liquidity safety threshold ($>\$50$), and anti-kingmaking protection.
+2. **Dynamic Auction Engine**: Dynamic bidding ceiling bounded by cash liquidity ($c_i$), hazard proximity, bank house scarcity, and color tier multipliers; spite bidding ceiling bounded by the threatening opponent's budget; strategic jump bidding.
+3. **Smart Property Purchase**: Hazard survival checking to prevent Gambler's Ruin, monopoly completion override, anti-blunder decline masking, and strategic discount auction execution.
 
 ### Strict Action Masking
 $$\pi_{\theta, k}(a_k \mid s_t^i) = \frac{\exp\big(z_k(s_t^i)\big) \cdot M_k^i(s_t^i)}{\sum_{j} \exp\big(z_j(s_t^i)\big) \cdot M_j^i(s_t^i)}$$

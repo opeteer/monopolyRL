@@ -19,17 +19,34 @@ class MonopolyParallelEnv(ParallelEnv):
 
     metadata = {"render_modes": ["human", "rgb_array"], "name": "monopoly_marl_v1"}
 
-    def __init__(self, max_rounds: int = 150, gamma: float = 0.99, seed: Optional[int] = None):
+    def __init__(
+        self,
+        max_rounds: int = 150,
+        gamma: float = 0.99,
+        seed: Optional[int] = None,
+        w1: float = 0.03,
+        w2: float = 0.001,
+        w3: float = 0.005,
+        w4: float = 0.007,
+        w_syn: float = 0.005,
+        allow_trade: bool = True,
+        include_synergy_obs: bool = True,
+    ):
         super().__init__()
         self.possible_agents = [f"player_{i}" for i in range(4)]
         self.agents = list(self.possible_agents)
-        self.core = MonopolyCore(seed=seed, max_rounds=max_rounds, gamma=gamma)
+        self.core = MonopolyCore(
+            seed=seed, max_rounds=max_rounds, gamma=gamma,
+            w1=w1, w2=w2, w3=w3, w4=w4, w_syn=w_syn,
+            allow_trade=allow_trade,
+            include_synergy_obs=include_synergy_obs,
+        )
         self.seed_val = seed
 
-        # Observation dimension: 327
-        self.obs_dim = 327
-        # Centralized Critic Global State dimension: 1340
-        self.state_dim = 1340
+        # Observation dimension: 399 (if synergy + auction features enabled) or 327
+        self.obs_dim = 399 if include_synergy_obs else 327
+        # Centralized Critic Global State dimension: 1628 (if enabled) or 1340
+        self.state_dim = (4 * self.obs_dim) + 32
 
         # Define Observation Spaces for each agent
         # Dict with 'obs' Box and 'action_mask' Dict
@@ -38,7 +55,7 @@ class MonopolyParallelEnv(ParallelEnv):
                 "obs": spaces.Box(low=-10.0, high=100.0, shape=(self.obs_dim,), dtype=np.float32),
                 "action_mask": spaces.Dict({
                     "core": spaces.Box(low=0, high=1, shape=(6,), dtype=np.int8),
-                    "auction": spaces.Box(low=0, high=1, shape=(5,), dtype=np.int8),
+                    "auction": spaces.Box(low=0, high=1, shape=(7,), dtype=np.int8),
                     "property": spaces.Box(low=0, high=1, shape=(160,), dtype=np.int8),
                     "trade_target": spaces.Box(low=0, high=1, shape=(3,), dtype=np.int8),
                     "trade_offer_prop": spaces.Box(low=0, high=1, shape=(41,), dtype=np.int8),
@@ -55,7 +72,7 @@ class MonopolyParallelEnv(ParallelEnv):
         self.action_spaces = {
             agent: spaces.Dict({
                 "core": spaces.Discrete(6),
-                "auction": spaces.Discrete(5),
+                "auction": spaces.Discrete(7),
                 "property": spaces.Discrete(160),
                 "trade_target": spaces.Discrete(3),
                 "trade_offer_prop": spaces.Discrete(41),
@@ -66,6 +83,10 @@ class MonopolyParallelEnv(ParallelEnv):
             })
             for agent in self.possible_agents
         }
+
+    def set_allow_trade(self, allow: bool):
+        """Curriculum learning toggle: enable or disable trade proposals via action mask."""
+        self.core.set_allow_trade(allow)
 
     def reset(self, seed: Optional[int] = None, options: Optional[Dict[str, Any]] = None) -> Tuple[Dict[str, Any], Dict[str, Any]]:
         """Resets the environment and returns (observations, infos)."""

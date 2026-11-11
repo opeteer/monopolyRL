@@ -4,7 +4,7 @@ Stores vectorized transitions, computes multi-agent GAE advantages and target va
 and samples mini-batches for centralized MAPPO updates.
 """
 
-from typing import Dict, Generator, Tuple, Any
+from typing import Dict, Generator, Tuple, Any, Optional
 import numpy as np
 import torch
 
@@ -39,7 +39,7 @@ class RolloutBuffer:
         ]
         self.mask_dims = {
             "core": 6,
-            "auction": 5,
+            "auction": 7,
             "property": 160,
             "trade_target": 3,
             "trade_offer_prop": 41,
@@ -67,6 +67,7 @@ class RolloutBuffer:
         self.dones = torch.zeros((buffer_size, num_envs, self.num_agents), dtype=torch.float32, device=device)
         self.values = torch.zeros((buffer_size, num_envs, self.num_agents), dtype=torch.float32, device=device)
         self.log_probs = torch.zeros((buffer_size, num_envs, self.num_agents), dtype=torch.float32, device=device)
+        self.active_masks = torch.ones((buffer_size, num_envs, self.num_agents), dtype=torch.float32, device=device)
 
         # Computed GAE targets
         self.advantages = torch.zeros((buffer_size, num_envs, self.num_agents), dtype=torch.float32, device=device)
@@ -85,6 +86,7 @@ class RolloutBuffer:
         dones: torch.Tensor,
         values: torch.Tensor,
         log_probs: torch.Tensor,
+        active_masks: Optional[torch.Tensor] = None,
     ):
         """Inserts a single environment transition into buffer."""
         self.obs[self.step] = obs
@@ -97,6 +99,10 @@ class RolloutBuffer:
         self.dones[self.step] = dones
         self.values[self.step] = values
         self.log_probs[self.step] = log_probs
+        if active_masks is not None:
+            self.active_masks[self.step] = active_masks
+        else:
+            self.active_masks[self.step] = 1.0
 
         self.step = (self.step + 1) % self.buffer_size
         if self.step == 0:
@@ -131,6 +137,7 @@ class RolloutBuffer:
         flat_log_probs = self.log_probs.view(batch_size, self.num_agents)
         flat_advantages = self.advantages.view(batch_size, self.num_agents)
         flat_returns = self.returns.view(batch_size, self.num_agents)
+        flat_active_masks = self.active_masks.view(batch_size, self.num_agents)
 
         flat_actions = {k: self.actions[k].view(batch_size, self.num_agents) for k in self.action_keys}
         flat_masks = {k: self.action_masks[k].view(batch_size, self.num_agents, self.mask_dims[k]) for k in self.action_keys}
@@ -154,4 +161,5 @@ class RolloutBuffer:
                 "log_probs": flat_log_probs[mb_idx],
                 "advantages": norm_advantages[mb_idx],
                 "returns": flat_returns[mb_idx],
+                "active_masks": flat_active_masks[mb_idx],
             }

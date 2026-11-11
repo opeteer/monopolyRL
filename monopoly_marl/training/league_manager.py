@@ -148,12 +148,35 @@ class LeagueManager:
 
         return lineup_policies, lineup_records
 
+    def get_random_historical_policy(self) -> Optional[ActorNetwork]:
+        """Returns a cached policy randomly sampled from the historical pool."""
+        if not self.historical_records:
+            return None
+        rec = np.random.choice(self.historical_records)
+        return self._get_cached_policy(rec)
+
     def _get_cached_policy(self, record: LeagueAgentRecord) -> ActorNetwork:
-        """Loads and caches a historical checkpoint policy."""
+        """Loads and caches a historical checkpoint policy with seamless head adaptation."""
         if record.name not in self.cached_historical_policies:
-            policy = ActorNetwork(obs_dim=327).to(self.device)
             ckpt = torch.load(record.checkpoint_path, map_location=self.device)
-            policy.load_state_dict(ckpt["state_dict"])
+            state_dict = ckpt["state_dict"]
+            ckpt_obs_dim = state_dict["trunk.0.weight"].shape[1]
+            policy = ActorNetwork(obs_dim=ckpt_obs_dim).to(self.device)
+            new_sd = policy.state_dict()
+            old_auc_dim = state_dict["head_auction.weight"].shape[0] if "head_auction.weight" in state_dict else 5
+            curr_auc_dim = new_sd["head_auction.weight"].shape[0]
+
+            for k in state_dict:
+                if k == "head_auction.weight" and old_auc_dim != curr_auc_dim:
+                    new_sd[k][:old_auc_dim, :] = state_dict[k]
+                    new_sd[k][old_auc_dim:, :] = 0.0
+                elif k == "head_auction.bias" and old_auc_dim != curr_auc_dim:
+                    new_sd[k][:old_auc_dim] = state_dict[k]
+                    new_sd[k][old_auc_dim:] = -0.1
+                elif k in new_sd and new_sd[k].shape == state_dict[k].shape:
+                    new_sd[k] = state_dict[k]
+
+            policy.load_state_dict(new_sd)
             policy.eval()
             self.cached_historical_policies[record.name] = policy
         return self.cached_historical_policies[record.name]

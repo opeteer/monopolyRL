@@ -28,21 +28,39 @@ def parse_args():
     return parser.parse_args()
 
 
-def load_agent_policies(checkpoint_path: str = None, device: torch.device = torch.device("cpu")):
-    """Loads 4 identical blueprint actor networks, optionally restored from checkpoint."""
+def load_agent_policies(checkpoint_path: str = None, target_obs_dim: int = 399, device: torch.device = torch.device("cpu")):
+    """Loads 4 identical blueprint actor networks, optionally restored from checkpoint with weight adaptation."""
     policies = []
-    obs_dim = 327
-
     state_dict = None
+    ckpt_obs_dim = target_obs_dim
+
     if checkpoint_path and os.path.exists(checkpoint_path):
         print(f"Loading policy checkpoint: {checkpoint_path}")
         ckpt = torch.load(checkpoint_path, map_location=device)
         state_dict = ckpt.get("state_dict", ckpt)
+        if "trunk.0.weight" in state_dict:
+            ckpt_obs_dim = state_dict["trunk.0.weight"].shape[1]
 
     for p_id in range(4):
-        actor = ActorNetwork(obs_dim=obs_dim).to(device)
+        actor = ActorNetwork(obs_dim=target_obs_dim).to(device)
         if state_dict is not None:
-            actor.load_state_dict(state_dict)
+            new_sd = actor.state_dict()
+            old_auc_dim = state_dict["head_auction.weight"].shape[0] if "head_auction.weight" in state_dict else 5
+            curr_auc_dim = new_sd["head_auction.weight"].shape[0]
+
+            for k in state_dict:
+                if k == "trunk.0.weight" and ckpt_obs_dim != target_obs_dim:
+                    new_sd[k][:, :ckpt_obs_dim] = state_dict[k]
+                    new_sd[k][:, ckpt_obs_dim:] = 0.0
+                elif k == "head_auction.weight" and old_auc_dim != curr_auc_dim:
+                    new_sd[k][:old_auc_dim, :] = state_dict[k]
+                    new_sd[k][old_auc_dim:, :] = 0.0
+                elif k == "head_auction.bias" and old_auc_dim != curr_auc_dim:
+                    new_sd[k][:old_auc_dim] = state_dict[k]
+                    new_sd[k][old_auc_dim:] = -0.1
+                elif k in new_sd and new_sd[k].shape == state_dict[k].shape:
+                    new_sd[k] = state_dict[k]
+            actor.load_state_dict(new_sd)
         actor.eval()
         policies.append(actor)
 
@@ -71,7 +89,8 @@ def main():
     dashboard = MonopolyDashboard(screen, x=840, y=20, width=520, height=800)
 
     # Load 4 Identical Blueprint Autonomous Agents
-    policies = load_agent_policies(args.checkpoint, device=device)
+    target_obs_dim = core.get_actor_observation(0).shape[0]
+    policies = load_agent_policies(args.checkpoint, target_obs_dim=target_obs_dim, device=device)
 
     action_keys = [
         "core", "auction", "property", "trade_target",

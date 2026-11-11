@@ -68,6 +68,9 @@ class MAPPOTrainer:
                 old_log_probs = sample["log_probs"]          # (batch_size, 4)
                 advantages = sample["advantages"]            # (batch_size, 4)
                 returns = sample["returns"]                  # (batch_size, 4)
+                active_mask = sample.get("active_masks", torch.ones_like(advantages))
+                flat_active_mask = active_mask.view(-1)
+                active_count = flat_active_mask.sum().clamp(min=1.0)
 
                 batch_size = obs.shape[0]
 
@@ -84,12 +87,13 @@ class MAPPOTrainer:
                 # Importance sampling ratio r_t(theta)
                 ratio = torch.exp(new_log_probs - flat_old_log_probs)
 
-                # Clipped surrogate objective
+                # Clipped surrogate objective filtered by active_mask
                 surr1 = ratio * flat_advantages
                 surr2 = torch.clamp(ratio, 1.0 - self.clip_param, 1.0 + self.clip_param) * flat_advantages
-                policy_loss = -torch.min(surr1, surr2).mean()
+                surr = torch.min(surr1, surr2) * flat_active_mask
+                policy_loss = -(surr.sum() / active_count)
 
-                entropy_loss = -entropy.mean()
+                entropy_loss = -((entropy * flat_active_mask).sum() / active_count)
 
                 actor_loss = policy_loss + self.entropy_coef * entropy_loss
 
@@ -102,8 +106,8 @@ class MAPPOTrainer:
                 # Critic evaluates global_state: (batch_size, state_dim) -> (batch_size, 4)
                 predicted_values = self.critic(global_state)
 
-                # Clipped value loss or MSE
-                value_loss = 0.5 * nn.functional.mse_loss(predicted_values, returns)
+                # Active-agent weighted MSE value loss
+                value_loss = 0.5 * (((predicted_values - returns) ** 2) * active_mask).sum() / active_mask.sum().clamp(min=1.0)
 
                 self.optimizer_critic.zero_grad()
                 value_loss.backward()
@@ -112,7 +116,7 @@ class MAPPOTrainer:
 
                 total_policy_loss += policy_loss.item()
                 total_value_loss += value_loss.item()
-                total_entropy_loss += entropy.mean().item()
+                total_entropy_loss += (entropy * flat_active_mask).sum().item() / active_count.item()
                 num_updates += 1
 
         return {

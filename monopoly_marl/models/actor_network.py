@@ -42,8 +42,8 @@ class ActorNetwork(nn.Module):
         # Factorized Action Heads
         # 1. Core Actions (6 dims)
         self.head_core = nn.Linear(hidden_dim, 6)
-        # 2. Auction Actions (5 dims)
-        self.head_auction = nn.Linear(hidden_dim, 5)
+        # 2. Auction Actions (7 dims: 5 discrete increments + 2 strategic jump bids)
+        self.head_auction = nn.Linear(hidden_dim, 7)
         # 3. Property Management Sub-actions (160 dims: 4 x 40)
         self.head_property = nn.Linear(hidden_dim, 160)
         # 4. Bilateral Trade Heads
