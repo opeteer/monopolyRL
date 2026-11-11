@@ -143,6 +143,8 @@ class MonopolyCore:
 
         # Trade proposal state
         self.pending_trade: Optional[Dict[str, Any]] = None
+        self.manage_actions_this_turn = 0
+        self.trade_proposals_this_turn = 0
 
         # Event log history for UI / replay
         self.event_log: List[str] = ["Tournament game started. All players initialized with $1500."]
@@ -741,8 +743,8 @@ class MonopolyCore:
                         if self.cash[player_id] >= unmtg_cost:
                             mask_property[120 + p] = 1
 
-            # Bilateral Trade Proposals
-            if self.allow_trade:
+            # Bilateral Trade Proposals (max 1 trade proposal per turn)
+            if self.allow_trade and getattr(self, "trade_proposals_this_turn", 0) == 0:
                 # Target players (3 other players)
                 other_players = [pl for pl in range(4) if pl != player_id and not self.bankrupt[pl]]
                 for idx, pl in enumerate(other_players):
@@ -1280,11 +1282,23 @@ class MonopolyCore:
     # ----------------------------------------------------------------------
     # Property Management & Trading
     # ----------------------------------------------------------------------
+    def _finish_manage_or_next(self, p: int, is_double: bool):
+        """Finishes management phase and either executes double roll or rotates turn."""
+        self.manage_actions_this_turn = 0
+        self.trade_proposals_this_turn = 0
+        if is_double and not self.in_jail[p] and not self.bankrupt[p]:
+            self.event_log.append(f"Player {p} rolled doubles! Gets another roll.")
+            self.phase = PHASE_ROLL
+            self.active_decision_player = p
+        else:
+            self._end_turn()
+
     def _proceed_to_manage_or_next(self, p: int, is_double: bool):
         """Enters property management phase before ending turn or re-rolling."""
         self.phase = PHASE_PROPERTY_MANAGE
         self.active_decision_player = p
         self.pending_manage_double = is_double
+        self.manage_actions_this_turn = 0
 
     def _handle_management_phase(
         self, p: int, core_act: int, prop_act: int, masks: Dict[str, np.ndarray],
@@ -1293,20 +1307,27 @@ class MonopolyCore:
     ):
         """Handles house/hotel building/selling, mortgaging, and trade proposals."""
         is_double = getattr(self, "pending_manage_double", False)
+        self.manage_actions_this_turn = getattr(self, "manage_actions_this_turn", 0) + 1
 
-        # 1. End Management -> Proceed to Next Turn or Double Roll
-        if core_act == ACT_CORE_END_MANAGE or masks["property"][prop_act] == 0:
-            # Check bilateral trade proposal if any
-            if trade_offer_prop < 40 or trade_req_prop < 40 or trade_offer_cash_idx > 0 or trade_req_cash_idx > 0:
-                self._propose_trade(p, trade_target_idx, trade_offer_prop, trade_offer_cash_idx, trade_req_prop, trade_req_cash_idx)
+        # Check bilateral trade proposal (at most 1 trade per turn, and must involve an actual property)
+        has_trade_intent = (
+            self.allow_trade and
+            getattr(self, "trade_proposals_this_turn", 0) == 0 and
+            (trade_offer_prop < 40 or trade_req_prop < 40)
+        )
+
+        if has_trade_intent:
+            trade_started = self._propose_trade(
+                p, trade_target_idx, trade_offer_prop, trade_offer_cash_idx, trade_req_prop, trade_req_cash_idx
+            )
+            if trade_started:
+                self.trade_proposals_this_turn = 1
                 return
 
-            if is_double and not self.in_jail[p] and not self.bankrupt[p]:
-                self.event_log.append(f"Player {p} rolled doubles! Gets another roll.")
-                self.phase = PHASE_ROLL
-                self.active_decision_player = p
-            else:
-                self._end_turn()
+        # 1. End Management -> Proceed to Next Turn or Double Roll
+        # If agent explicitly requests END_MANAGE, or reached action limit (5), or property action is invalid:
+        if core_act == ACT_CORE_END_MANAGE or self.manage_actions_this_turn >= 5 or masks["property"][prop_act] == 0:
+            self._finish_manage_or_next(p, is_double)
             return
 
         # 2. Property Sub-actions:
@@ -1371,25 +1392,28 @@ class MonopolyCore:
                 self.cash[p] -= cost
                 self.event_log.append(f"Player {p} unmortgaged {tile['name']} for ${cost} (incl. 10% interest).")
 
+        if self.manage_actions_this_turn >= 5:
+            self._finish_manage_or_next(p, is_double)
+
     def _propose_trade(
         self, initiator: int, target_idx: int, offer_prop: int,
         offer_cash_idx: int, req_prop: int, req_cash_idx: int
-    ):
-        """Initiates a bilateral trade negotiation."""
+    ) -> bool:
+        """Initiates a bilateral trade negotiation. Returns True if trade proposal started."""
         other_players = [pl for pl in range(4) if pl != initiator and not self.bankrupt[pl]]
         if not other_players:
-            return
+            return False
         target = other_players[target_idx % len(other_players)]
         offer_cash = TRADE_CASH_BRACKETS[min(offer_cash_idx, len(TRADE_CASH_BRACKETS) - 1)]
         req_cash = TRADE_CASH_BRACKETS[min(req_cash_idx, len(TRADE_CASH_BRACKETS) - 1)]
 
         # Validate offer
         if offer_prop < 40 and self.property_owner[offer_prop] != initiator:
-            return
+            return False
         if req_prop < 40 and self.property_owner[req_prop] != target:
-            return
+            return False
         if self.cash[initiator] < offer_cash:
-            return
+            return False
 
         self.pending_trade = {
             "initiator": initiator,
@@ -1402,38 +1426,42 @@ class MonopolyCore:
         self.phase = PHASE_TRADE_RESPONSE
         self.active_decision_player = target
         self.event_log.append(f"TRADE PROPOSAL: Player {initiator} -> Player {target}: Offer(Prop={offer_prop if offer_prop<40 else 'None'}, Cash=${offer_cash}) for Request(Prop={req_prop if req_prop<40 else 'None'}, Cash=${req_cash}).")
+        return True
 
     def _handle_trade_response(self, target: int, trade_response: int):
         """Processes acceptance or rejection of bilateral trade."""
-        if self.pending_trade and trade_response == 1:
-            trade = self.pending_trade
-            init = trade["initiator"]
-            req_cash = trade["req_cash"]
-            offer_cash = trade["offer_cash"]
-            offer_p = trade["offer_prop"]
-            req_p = trade["req_prop"]
+        init = self.current_player
+        if self.pending_trade:
+            init = self.pending_trade["initiator"]
+            if trade_response == 1:
+                trade = self.pending_trade
+                req_cash = trade["req_cash"]
+                offer_cash = trade["offer_cash"]
+                offer_p = trade["offer_prop"]
+                req_p = trade["req_prop"]
 
-            if self.cash[target] >= req_cash and self.cash[init] >= offer_cash:
-                # Atomic transfer
-                self.cash[init] -= offer_cash
-                self.cash[target] += offer_cash
-                self.cash[target] -= req_cash
-                self.cash[init] += req_cash
+                if self.cash[target] >= req_cash and self.cash[init] >= offer_cash:
+                    # Atomic transfer
+                    self.cash[init] -= offer_cash
+                    self.cash[target] += offer_cash
+                    self.cash[target] -= req_cash
+                    self.cash[init] += req_cash
 
-                if offer_p < 40 and self.property_owner[offer_p] == init:
-                    self.property_owner[offer_p] = target
-                if req_p < 40 and self.property_owner[req_p] == target:
-                    self.property_owner[req_p] = init
+                    if offer_p < 40 and self.property_owner[offer_p] == init:
+                        self.property_owner[offer_p] = target
+                    if req_p < 40 and self.property_owner[req_p] == target:
+                        self.property_owner[req_p] = init
 
-                self.event_log.append(f"TRADE ACCEPTED between Player {init} and Player {target}!")
+                    self.event_log.append(f"TRADE ACCEPTED between Player {init} and Player {target}!")
+                else:
+                    self.event_log.append(f"Trade failed due to insufficient funds.")
             else:
-                self.event_log.append(f"Trade failed due to insufficient funds.")
-        else:
-            self.event_log.append(f"Trade REJECTED by Player {target}.")
+                self.event_log.append(f"Trade REJECTED by Player {target}.")
 
         self.pending_trade = None
-        self.phase = PHASE_PROPERTY_MANAGE
-        self.active_decision_player = self.current_player
+        is_double = getattr(self, "pending_manage_double", False)
+        # Advance turn cleanly after trade proposal resolution
+        self._finish_manage_or_next(init, is_double)
 
     # ----------------------------------------------------------------------
     # Cards & Actions Handling
@@ -1639,6 +1667,8 @@ class MonopolyCore:
         self.consecutive_doubles = 0
         self.landed_property = None
         self.turn_step += 1
+        self.manage_actions_this_turn = 0
+        self.trade_proposals_this_turn = 0
 
         # Advance current_player to next non-bankrupt player
         for _ in range(4):
