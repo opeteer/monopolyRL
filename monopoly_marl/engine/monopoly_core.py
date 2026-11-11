@@ -746,7 +746,11 @@ class MonopolyCore:
                         if grp and tile["type"] == TILE_STREET:
                             has_houses = any(self.property_houses[t] > 0 for t in COLOR_GROUPS[grp])
                         if not has_houses:
-                            mask_property[80 + p] = 1
+                            # Prudent tournament rule: mortgaging is an emergency liquidity valve.
+                            # Only permit mortgaging when cash is distressingly low (< $150).
+                            # Agents with abundant cash must not self-sabotage by mortgaging assets!
+                            if self.cash[player_id] < 150:
+                                mask_property[80 + p] = 1
 
                     # UNMORTGAGE
                     if self.property_mortgaged[p]:
