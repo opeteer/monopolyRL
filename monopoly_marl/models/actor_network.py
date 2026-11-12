@@ -80,6 +80,73 @@ class ActorNetwork(nn.Module):
         mask = mask.to(logits.device)
         return torch.where(mask > 0, logits, torch.tensor(-1e8, dtype=logits.dtype, device=logits.device))
 
+    def _compute_phase_aware_lp_entropy(
+        self,
+        obs: torch.Tensor,
+        action_masks: Dict[str, torch.Tensor],
+        actions: Dict[str, torch.Tensor],
+        dists: Dict[str, Categorical],
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Computes log_prob and entropy exclusively for heads actually active in the current phase.
+
+        Eliminates cross-head variance pollution and clipping interference from unused action heads.
+        """
+        lp_dict = {k: dists[k].log_prob(actions[k]) for k in dists}
+        ent_dict = {k: dists[k].entropy() for k in dists}
+
+        if obs.shape[-1] >= 327:
+            u = obs[..., 307:314]
+            valid_onehot = ((u.sum(dim=-1) - 1.0).abs() < 1e-4) & ((u == 1.0).sum(dim=-1) == 1)
+            if torch.all(valid_onehot):
+                is_core = (u[..., 0] + u[..., 1] + u[..., 3])
+                is_auc = u[..., 2]
+                is_manage = u[..., 4]
+                is_trade_resp = u[..., 5]
+
+                # Trade proposal heads only participate when prop == 160 (Pass physical mgmt) and trade is enabled
+                trade_enabled = (action_masks["trade_req_cash"].sum(dim=-1) > 1).float()
+                is_trade_check = is_manage * (actions["property"] == 160).float() * trade_enabled
+                has_trade_prop = ((actions["trade_offer_prop"] < 40) | (actions["trade_req_prop"] < 40)).float()
+                is_trade_detail = is_trade_check * has_trade_prop
+
+                log_prob = (
+                    is_core * lp_dict["core"] +
+                    is_auc * lp_dict["auction"] +
+                    is_manage * lp_dict["property"] +
+                    is_trade_check * (lp_dict["trade_offer_prop"] + lp_dict["trade_req_prop"]) +
+                    is_trade_detail * (lp_dict["trade_target"] + lp_dict["trade_offer_cash"] + lp_dict["trade_req_cash"]) +
+                    is_trade_resp * lp_dict["trade_response"]
+                )
+                entropy = (
+                    is_core * ent_dict["core"] +
+                    is_auc * ent_dict["auction"] +
+                    is_manage * ent_dict["property"] +
+                    is_trade_check * (ent_dict["trade_offer_prop"] + ent_dict["trade_req_prop"]) +
+                    is_trade_detail * (ent_dict["trade_target"] + ent_dict["trade_offer_cash"] + ent_dict["trade_req_cash"]) +
+                    is_trade_resp * ent_dict["trade_response"]
+                )
+                return log_prob, entropy
+
+        # Fallback for synthetic unit tests with random obs vectors
+        log_prob = sum(lp_dict.values())
+        entropy = sum(ent_dict.values())
+        return log_prob, entropy
+
+    def _get_distributions(self, obs: torch.Tensor, action_masks: Dict[str, torch.Tensor]) -> Dict[str, Categorical]:
+        """Runs shared trunk and constructs masked Categorical distributions for all 9 heads."""
+        features = self.trunk(obs)
+        return {
+            "core": Categorical(logits=self._mask_logits(self.head_core(features), action_masks["core"])),
+            "auction": Categorical(logits=self._mask_logits(self.head_auction(features), action_masks["auction"])),
+            "property": Categorical(logits=self._mask_logits(self.head_property(features), action_masks["property"])),
+            "trade_target": Categorical(logits=self._mask_logits(self.head_trade_target(features), action_masks["trade_target"])),
+            "trade_offer_prop": Categorical(logits=self._mask_logits(self.head_trade_offer_prop(features), action_masks["trade_offer_prop"])),
+            "trade_offer_cash": Categorical(logits=self._mask_logits(self.head_trade_offer_cash(features), action_masks["trade_offer_cash"])),
+            "trade_req_prop": Categorical(logits=self._mask_logits(self.head_trade_req_prop(features), action_masks["trade_req_prop"])),
+            "trade_req_cash": Categorical(logits=self._mask_logits(self.head_trade_req_cash(features), action_masks["trade_req_cash"])),
+            "trade_response": Categorical(logits=self._mask_logits(self.head_trade_response(features), action_masks["trade_response"])),
+        }
+
     def forward(
         self,
         obs: torch.Tensor,
@@ -90,89 +157,14 @@ class ActorNetwork(nn.Module):
 
         Returns (actions_dict, total_log_prob, total_entropy).
         """
-        features = self.trunk(obs)
+        dists = self._get_distributions(obs, action_masks)
 
-        # Compute raw logits
-        logits_core = self._mask_logits(self.head_core(features), action_masks["core"])
-        logits_auc = self._mask_logits(self.head_auction(features), action_masks["auction"])
-        logits_prop = self._mask_logits(self.head_property(features), action_masks["property"])
-        logits_tr_target = self._mask_logits(self.head_trade_target(features), action_masks["trade_target"])
-        logits_tr_off_prop = self._mask_logits(self.head_trade_offer_prop(features), action_masks["trade_offer_prop"])
-        logits_tr_off_cash = self._mask_logits(self.head_trade_offer_cash(features), action_masks["trade_offer_cash"])
-        logits_tr_req_prop = self._mask_logits(self.head_trade_req_prop(features), action_masks["trade_req_prop"])
-        logits_tr_req_cash = self._mask_logits(self.head_trade_req_cash(features), action_masks["trade_req_cash"])
-        logits_tr_resp = self._mask_logits(self.head_trade_response(features), action_masks["trade_response"])
-
-        # Categorical distributions
-        dist_core = Categorical(logits=logits_core)
-        dist_auc = Categorical(logits=logits_auc)
-        dist_prop = Categorical(logits=logits_prop)
-        dist_tr_target = Categorical(logits=logits_tr_target)
-        dist_tr_off_prop = Categorical(logits=logits_tr_off_prop)
-        dist_tr_off_cash = Categorical(logits=logits_tr_off_cash)
-        dist_tr_req_prop = Categorical(logits=logits_tr_req_prop)
-        dist_tr_req_cash = Categorical(logits=logits_tr_req_cash)
-        dist_tr_resp = Categorical(logits=logits_tr_resp)
-
-        # Sample or take argmax
         if deterministic:
-            act_core = torch.argmax(logits_core, dim=-1)
-            act_auc = torch.argmax(logits_auc, dim=-1)
-            act_prop = torch.argmax(logits_prop, dim=-1)
-            act_tr_target = torch.argmax(logits_tr_target, dim=-1)
-            act_tr_off_prop = torch.argmax(logits_tr_off_prop, dim=-1)
-            act_tr_off_cash = torch.argmax(logits_tr_off_cash, dim=-1)
-            act_tr_req_prop = torch.argmax(logits_tr_req_prop, dim=-1)
-            act_tr_req_cash = torch.argmax(logits_tr_req_cash, dim=-1)
-            act_tr_resp = torch.argmax(logits_tr_resp, dim=-1)
+            actions_dict = {k: torch.argmax(d.logits, dim=-1) for k, d in dists.items()}
         else:
-            act_core = dist_core.sample()
-            act_auc = dist_auc.sample()
-            act_prop = dist_prop.sample()
-            act_tr_target = dist_tr_target.sample()
-            act_tr_off_prop = dist_tr_off_prop.sample()
-            act_tr_off_cash = dist_tr_off_cash.sample()
-            act_tr_req_prop = dist_tr_req_prop.sample()
-            act_tr_req_cash = dist_tr_req_cash.sample()
-            act_tr_resp = dist_tr_resp.sample()
+            actions_dict = {k: d.sample() for k, d in dists.items()}
 
-        # Compute log probabilities and entropies
-        log_prob = (
-            dist_core.log_prob(act_core) +
-            dist_auc.log_prob(act_auc) +
-            dist_prop.log_prob(act_prop) +
-            dist_tr_target.log_prob(act_tr_target) +
-            dist_tr_off_prop.log_prob(act_tr_off_prop) +
-            dist_tr_off_cash.log_prob(act_tr_off_cash) +
-            dist_tr_req_prop.log_prob(act_tr_req_prop) +
-            dist_tr_req_cash.log_prob(act_tr_req_cash) +
-            dist_tr_resp.log_prob(act_tr_resp)
-        )
-
-        entropy = (
-            dist_core.entropy() +
-            dist_auc.entropy() +
-            dist_prop.entropy() +
-            dist_tr_target.entropy() +
-            dist_tr_off_prop.entropy() +
-            dist_tr_off_cash.entropy() +
-            dist_tr_req_prop.entropy() +
-            dist_tr_req_cash.entropy() +
-            dist_tr_resp.entropy()
-        )
-
-        actions_dict = {
-            "core": act_core,
-            "auction": act_auc,
-            "property": act_prop,
-            "trade_target": act_tr_target,
-            "trade_offer_prop": act_tr_off_prop,
-            "trade_offer_cash": act_tr_off_cash,
-            "trade_req_prop": act_tr_req_prop,
-            "trade_req_cash": act_tr_req_cash,
-            "trade_response": act_tr_resp,
-        }
-
+        log_prob, entropy = self._compute_phase_aware_lp_entropy(obs, action_masks, actions_dict, dists)
         return actions_dict, log_prob, entropy
 
     def evaluate_actions(
@@ -182,50 +174,5 @@ class ActorNetwork(nn.Module):
         actions: Dict[str, torch.Tensor],
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Evaluates log probabilities and entropies for specific given actions."""
-        features = self.trunk(obs)
-
-        logits_core = self._mask_logits(self.head_core(features), action_masks["core"])
-        logits_auc = self._mask_logits(self.head_auction(features), action_masks["auction"])
-        logits_prop = self._mask_logits(self.head_property(features), action_masks["property"])
-        logits_tr_target = self._mask_logits(self.head_trade_target(features), action_masks["trade_target"])
-        logits_tr_off_prop = self._mask_logits(self.head_trade_offer_prop(features), action_masks["trade_offer_prop"])
-        logits_tr_off_cash = self._mask_logits(self.head_trade_offer_cash(features), action_masks["trade_offer_cash"])
-        logits_tr_req_prop = self._mask_logits(self.head_trade_req_prop(features), action_masks["trade_req_prop"])
-        logits_tr_req_cash = self._mask_logits(self.head_trade_req_cash(features), action_masks["trade_req_cash"])
-        logits_tr_resp = self._mask_logits(self.head_trade_response(features), action_masks["trade_response"])
-
-        dist_core = Categorical(logits=logits_core)
-        dist_auc = Categorical(logits=logits_auc)
-        dist_prop = Categorical(logits=logits_prop)
-        dist_tr_target = Categorical(logits=logits_tr_target)
-        dist_tr_off_prop = Categorical(logits=logits_tr_off_prop)
-        dist_tr_off_cash = Categorical(logits=logits_tr_off_cash)
-        dist_tr_req_prop = Categorical(logits=logits_tr_req_prop)
-        dist_tr_req_cash = Categorical(logits=logits_tr_req_cash)
-        dist_tr_resp = Categorical(logits=logits_tr_resp)
-
-        log_prob = (
-            dist_core.log_prob(actions["core"]) +
-            dist_auc.log_prob(actions["auction"]) +
-            dist_prop.log_prob(actions["property"]) +
-            dist_tr_target.log_prob(actions["trade_target"]) +
-            dist_tr_off_prop.log_prob(actions["trade_offer_prop"]) +
-            dist_tr_off_cash.log_prob(actions["trade_offer_cash"]) +
-            dist_tr_req_prop.log_prob(actions["trade_req_prop"]) +
-            dist_tr_req_cash.log_prob(actions["trade_req_cash"]) +
-            dist_tr_resp.log_prob(actions["trade_response"])
-        )
-
-        entropy = (
-            dist_core.entropy() +
-            dist_auc.entropy() +
-            dist_prop.entropy() +
-            dist_tr_target.entropy() +
-            dist_tr_off_prop.entropy() +
-            dist_tr_off_cash.entropy() +
-            dist_tr_req_prop.entropy() +
-            dist_tr_req_cash.entropy() +
-            dist_tr_resp.entropy()
-        )
-
-        return log_prob, entropy
+        dists = self._get_distributions(obs, action_masks)
+        return self._compute_phase_aware_lp_entropy(obs, action_masks, actions, dists)

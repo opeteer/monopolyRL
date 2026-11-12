@@ -69,54 +69,50 @@ class MAPPOTrainer:
                 advantages = sample["advantages"]            # (batch_size, 4)
                 returns = sample["returns"]                  # (batch_size, 4)
                 active_mask = sample.get("active_masks", torch.ones_like(advantages))
+
+                # ----------------- 1. ACTOR UPDATE (Active Decision Players Only) -----------------
                 flat_active_mask = active_mask.view(-1)
-                active_count = flat_active_mask.sum().clamp(min=1.0)
+                active_idx = (flat_active_mask > 0.5).nonzero(as_tuple=True)[0]
 
-                batch_size = obs.shape[0]
+                if active_idx.numel() > 0:
+                    flat_obs = obs.view(-1, self.actor.obs_dim)[active_idx]
+                    flat_masks = {k: action_masks[k].view(-1, action_masks[k].shape[-1])[active_idx] for k in action_masks}
+                    flat_actions = {k: actions[k].view(-1)[active_idx] for k in actions}
+                    flat_old_log_probs = old_log_probs.view(-1)[active_idx]
+                    flat_advantages = advantages.view(-1)[active_idx]
 
-                # ----------------- 1. ACTOR UPDATE -----------------
-                # Reshape for multi-agent evaluation: (batch_size * 4, ...)
-                flat_obs = obs.view(-1, self.actor.obs_dim)
-                flat_masks = {k: action_masks[k].view(-1, action_masks[k].shape[-1]) for k in action_masks}
-                flat_actions = {k: actions[k].view(-1) for k in actions}
-                flat_old_log_probs = old_log_probs.view(-1)
-                flat_advantages = advantages.view(-1)
+                    new_log_probs, entropy = self.actor.evaluate_actions(flat_obs, flat_masks, flat_actions)
 
-                new_log_probs, entropy = self.actor.evaluate_actions(flat_obs, flat_masks, flat_actions)
+                    # Importance sampling ratio r_t(theta)
+                    ratio = torch.exp(new_log_probs - flat_old_log_probs)
 
-                # Importance sampling ratio r_t(theta)
-                ratio = torch.exp(new_log_probs - flat_old_log_probs)
+                    # Clipped surrogate objective
+                    surr1 = ratio * flat_advantages
+                    surr2 = torch.clamp(ratio, 1.0 - self.clip_param, 1.0 + self.clip_param) * flat_advantages
+                    policy_loss = -torch.min(surr1, surr2).mean()
+                    entropy_loss = -entropy.mean()
 
-                # Clipped surrogate objective filtered by active_mask
-                surr1 = ratio * flat_advantages
-                surr2 = torch.clamp(ratio, 1.0 - self.clip_param, 1.0 + self.clip_param) * flat_advantages
-                surr = torch.min(surr1, surr2) * flat_active_mask
-                policy_loss = -(surr.sum() / active_count)
+                    actor_loss = policy_loss + self.entropy_coef * entropy_loss
 
-                entropy_loss = -((entropy * flat_active_mask).sum() / active_count)
+                    self.optimizer_actor.zero_grad()
+                    actor_loss.backward()
+                    nn.utils.clip_grad_norm_(self.actor.parameters(), self.max_grad_norm)
+                    self.optimizer_actor.step()
 
-                actor_loss = policy_loss + self.entropy_coef * entropy_loss
-
-                self.optimizer_actor.zero_grad()
-                actor_loss.backward()
-                nn.utils.clip_grad_norm_(self.actor.parameters(), self.max_grad_norm)
-                self.optimizer_actor.step()
+                    total_policy_loss += policy_loss.item()
+                    total_entropy_loss += entropy.mean().item()
 
                 # ----------------- 2. CENTRALIZED CRITIC UPDATE -----------------
                 # Critic evaluates global_state: (batch_size, state_dim) -> (batch_size, 4)
                 predicted_values = self.critic(global_state)
-
-                # Active-agent weighted MSE value loss
-                value_loss = 0.5 * (((predicted_values - returns) ** 2) * active_mask).sum() / active_mask.sum().clamp(min=1.0)
+                value_loss = 0.5 * ((predicted_values - returns) ** 2).mean()
 
                 self.optimizer_critic.zero_grad()
                 value_loss.backward()
                 nn.utils.clip_grad_norm_(self.critic.parameters(), self.max_grad_norm)
                 self.optimizer_critic.step()
 
-                total_policy_loss += policy_loss.item()
                 total_value_loss += value_loss.item()
-                total_entropy_loss += (entropy * flat_active_mask).sum().item() / active_count.item()
                 num_updates += 1
 
         return {

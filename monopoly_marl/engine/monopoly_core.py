@@ -66,13 +66,14 @@ class MonopolyCore:
         self,
         seed: Optional[int] = None,
         max_rounds: Optional[int] = None,
-        gamma: float = 0.99,
-        w1: float = 0.010,
-        w2: float = 0.001,
-        w3: float = 0.050,
-        w4: float = 0.001,
+        gamma: float = 0.997,
+        w1: float = 0.050,
+        w2: float = 0.005,
+        w3: float = 0.008,
+        w4: float = 0.0005,
         w_syn: float = 0.020,
-        beta_starve: float = 25.0,
+        beta_starve: float = 3.5,
+        w_house: float = 0.015,
         allow_trade: bool = True,
         include_synergy_obs: bool = True,
         player_names: Optional[List[str]] = None,
@@ -83,13 +84,14 @@ class MonopolyCore:
         self.gamma = gamma
         self.player_names = list(player_names) if player_names is not None else list(DEFAULT_PLAYER_NAMES)
 
-        # Calibrated Offensive Arms-Race PBRS Weights
-        self.w1 = w1   # Cash log potential (0.010: de-emphasize hoarding cash)
-        self.w2 = w2   # Property equity potential (0.001)
-        self.w3 = w3   # Monopoly completion bonus potential (0.050: 10x surge for getting monopoly)
-        self.w4 = w4   # Rent hazard paranoia (0.001: 7x reduced to eliminate trade embargo paralysis)
-        self.w_syn = w_syn  # Color-matching synergy quadratic potential (0.020: 4x pull toward full sets)
-        self.beta_starve = beta_starve  # Monopoly starvation penalty (25.0: existential fear of 0 monopolies)
+        # Well-scaled, Anti-Exploit Offensive Arms-Race PBRS Weights
+        self.w1 = w1           # Cash log potential (0.050)
+        self.w2 = w2           # Property equity potential (0.005: buying unowned land is ALWAYS positive)
+        self.w3 = w3           # Monopoly completion bonus potential (0.008: +0.96 to +7.36)
+        self.w4 = w4           # Rent hazard paranoia (0.0005: low defensive paranoia)
+        self.w_syn = w_syn     # Color-matching synergy quadratic potential (0.020)
+        self.beta_starve = beta_starve  # Round-based monopoly starvation penalty (3.5: non-exploitable)
+        self.w_house = w_house # Building house/hotel equity multiplier (0.015: strong development reward)
         self.allow_trade = allow_trade
         self.include_synergy_obs = include_synergy_obs
 
@@ -196,8 +198,9 @@ class MonopolyCore:
         c_i = max(0, self.cash[player_id])
         term1 = self.w1 * math.log(c_i + 1.0)
 
-        # Term 2: Property equity
-        term2_sum = 0.0
+        # Term 2: Property equity + House/Hotel development value
+        term2_prop = 0.0
+        term2_house = 0.0
         owned_props = [p for p in PURCHASABLE_TILES if self.property_owner[p] == player_id]
         for p in owned_props:
             tile = TILES_DATA[p]
@@ -206,8 +209,9 @@ class MonopolyCore:
             v_bld = float(h_p * tile.get("house_cost", 0))
             m_p = 1.0 if self.property_mortgaged[p] else 0.0
             v_mtg = float(tile.get("mortgage", 0))
-            term2_sum += (v_base + v_bld - m_p * v_mtg)
-        term2 = self.w2 * term2_sum
+            term2_prop += (v_base - m_p * v_mtg)
+            term2_house += v_bld
+        term2 = (self.w2 * term2_prop) + (self.w_house * term2_house)
 
         # Term 3: Monopoly complete groups
         term3_sum = 0.0
@@ -242,13 +246,13 @@ class MonopolyCore:
             term5_sum += (frac ** 2) * 50.0
         term5 = self.w_syn * term5_sum
 
-        # Term 6: Monopoly Starvation Penalty (Existential urgency: fear of failing to achieve monopoly)
-        # As unowned properties vanish from board, having 0 street monopolies imposes escalating quadratic penalty!
-        unowned_count = sum(1 for p in PURCHASABLE_TILES if self.property_owner[p] == -1)
-        sold_frac = (len(PURCHASABLE_TILES) - unowned_count) / float(len(PURCHASABLE_TILES))
+        # Term 6: Anti-Exploit Round-Based Monopoly Starvation Penalty
+        # Keyed strictly to round_count (unstoppable time progression) rather than sold_frac,
+        # ensuring purchasing unowned properties is NEVER penalized (eliminating the Cobra Effect).
+        round_frac = min(1.0, self.round_count / 40.0)
         term6_starve = 0.0
         if street_monopolies_count == 0:
-            term6_starve = self.beta_starve * (sold_frac ** 2)
+            term6_starve = self.beta_starve * (round_frac ** 2)
 
         return float(term1 + term2 + term3 - term4 + term5 - term6_starve)
 
@@ -931,58 +935,32 @@ class MonopolyCore:
     # ----------------------------------------------------------------------
     # Observations & Centralized Critic Global State
     # ----------------------------------------------------------------------
-    def get_actor_observation(self, player_id: int) -> np.ndarray:
-        """Constructs private actor observation vector s_t^i:
-
-        s_t^i = [ X, C, J, K, O, H, M, B_h, B_ht, tau, u, OneHot(i) ]
-        """
-        # X: positions (4)
+    def _build_shared_obs_parts(self) -> Tuple[List[float], List[float], Optional[np.ndarray]]:
+        """Computes shared board observation components once per step for all 4 agents."""
         X = [self.position[p] / 40.0 for p in range(4)]
-        # C: cash balances (4)
         C = [self.cash[p] / 2000.0 for p in range(4)]
-        # J: jail status (12)
         J_in = [1.0 if self.in_jail[p] else 0.0 for p in range(4)]
         J_turns = [self.jail_turns[p] / 3.0 for p in range(4)]
         J_goojf = [self.goojf_cards[p] / 2.0 for p in range(4)]
-        # K: bankrupt (4)
         K = [1.0 if self.bankrupt[p] else 0.0 for p in range(4)]
 
-        # O: Property ownership one-hot (40 tiles * 5 categories: unowned + 4 players = 200 dims)
-        O = []
+        O = [0.0] * 200
         for p in range(40):
             owner = self.property_owner[p]
-            one_hot_o = [0.0] * 5
-            if owner == -1:
-                one_hot_o[0] = 1.0
-            else:
-                one_hot_o[owner + 1] = 1.0
-            O.extend(one_hot_o)
+            idx = (p * 5) + (0 if owner == -1 else (owner + 1))
+            O[idx] = 1.0
 
-        # H: houses (40)
         H = [self.property_houses[p] / 5.0 for p in range(40)]
-        # M: mortgaged (40)
         M = [1.0 if self.property_mortgaged[p] else 0.0 for p in range(40)]
-
-        # Scarcity
         B_h = [self.bank_houses / 32.0]
         B_ht = [self.bank_hotels / 12.0]
-
-        # Tau: round progress (0.0 for unbounded infinite horizon)
         tau = [0.0 if self.max_rounds is None or self.max_rounds <= 0 else self.round_count / float(self.max_rounds)]
 
-        # u: phase one-hot (NUM_PHASES = 7)
         u = [0.0] * NUM_PHASES
         if 0 <= self.phase < NUM_PHASES:
             u[self.phase] = 1.0
 
-        # OneHot(i): 4
-        id_onehot = [0.0] * 4
-        id_onehot[player_id] = 1.0
-
-        # Current dice (2)
         dice_feat = [self.last_dice[0] / 6.0, self.last_dice[1] / 6.0]
-
-        # Auction info (6): active, prop/40, bid/1000, highest_bidder one-hot (4)
         auc_active = 1.0 if self.phase == PHASE_AUCTION else 0.0
         auc_prop = (self.auction_property or 0) / 40.0
         auc_bid = self.auction_highest_bid / 1000.0
@@ -990,42 +968,59 @@ class MonopolyCore:
         if 0 <= self.auction_highest_bidder < 4:
             auc_bidder[self.auction_highest_bidder] = 1.0
 
-        obs_vec = np.array(
-            X + C + J_in + J_turns + J_goojf + K + O + H + M +
-            B_h + B_ht + tau + u + id_onehot + dice_feat +
-            [auc_active, auc_prop, auc_bid] + auc_bidder,
-            dtype=np.float32
-        )
-        if self.include_synergy_obs:
-            syn_vec = self.get_color_synergy_vector()
+        prefix_314 = X + C + J_in + J_turns + J_goojf + K + O + H + M + B_h + B_ht + tau + u
+        suffix_9 = dice_feat + [auc_active, auc_prop, auc_bid] + auc_bidder
+        syn_vec = self.get_color_synergy_vector() if self.include_synergy_obs else None
+        return prefix_314, suffix_9, syn_vec
+
+    def _assemble_actor_obs(
+        self, player_id: int, prefix_314: List[float], suffix_9: List[float], syn_vec: Optional[np.ndarray]
+    ) -> np.ndarray:
+        """Assembles complete private actor observation vector from shared components."""
+        id_onehot = [0.0] * 4
+        id_onehot[player_id] = 1.0
+        base_vec = np.array(prefix_314 + id_onehot + suffix_9, dtype=np.float32)
+        if syn_vec is not None:
             auc_vec = self.get_auction_features(player_id)
             trade_vec = self.get_trade_features(player_id)
-            obs_vec = np.concatenate([obs_vec, syn_vec, auc_vec, trade_vec])
-        return obs_vec
+            return np.concatenate([base_vec, syn_vec, auc_vec, trade_vec])
+        return base_vec
+
+    def get_actor_observation(self, player_id: int) -> np.ndarray:
+        """Constructs private actor observation vector s_t^i."""
+        prefix_314, suffix_9, syn_vec = self._build_shared_obs_parts()
+        return self._assemble_actor_obs(player_id, prefix_314, suffix_9, syn_vec)
 
     def get_global_state(self) -> np.ndarray:
         """Constructs Centralized Critic Global State S_t^{global}:
 
         S_t^{global} = [ s_t^1, s_t^2, s_t^3, s_t^4, Deck_chance, Deck_chest ]
         """
-        actor_obs = [self.get_actor_observation(p) for p in range(4)]
+        prefix_314, suffix_9, syn_vec = self._build_shared_obs_parts()
+        actor_obs = [self._assemble_actor_obs(p, prefix_314, suffix_9, syn_vec) for p in range(4)]
         deck_state = np.array(self.deck_manager.get_state_vector(), dtype=np.float32)
-        global_state = np.concatenate(actor_obs + [deck_state])
-        return global_state
+        return np.concatenate(actor_obs + [deck_state])
 
     def get_observations(self) -> Dict[str, Any]:
-        """Returns observation dictionary for all agents and global critic state."""
+        """Returns observation dictionary for all agents and global critic state (zero-redundancy)."""
+        prefix_314, suffix_9, syn_vec = self._build_shared_obs_parts()
         obs_dict = {}
         masks_dict = {}
+        actor_obs_list = []
         for p in range(4):
             p_name = f"player_{p}"
-            obs_dict[p_name] = self.get_actor_observation(p)
+            p_obs = self._assemble_actor_obs(p, prefix_314, suffix_9, syn_vec)
+            obs_dict[p_name] = p_obs
+            actor_obs_list.append(p_obs)
             masks_dict[p_name] = self.get_action_masks(p)
+
+        deck_state = np.array(self.deck_manager.get_state_vector(), dtype=np.float32)
+        global_state = np.concatenate(actor_obs_list + [deck_state])
 
         return {
             "obs": obs_dict,
             "action_mask": masks_dict,
-            "global_state": self.get_global_state(),
+            "global_state": global_state,
             "active_player": self.active_decision_player,
             "phase": self.phase,
         }
@@ -1087,7 +1082,7 @@ class MonopolyCore:
             if not self.bankrupt[pl] and self.cash[pl] < 0:
                 self._resolve_bankruptcy(pl)
                 if self.bankrupt[pl]:
-                    env_rewards[pl] -= 1.0
+                    env_rewards[pl] -= 5.0
 
         # Check terminal conditions (Unbounded horizon survival or max rounds reached)
         active_players = [pl for pl in range(4) if not self.bankrupt[pl]]
@@ -1102,7 +1097,7 @@ class MonopolyCore:
 
             if len(active_players) == 1:
                 winner = active_players[0]
-                env_rewards[winner] += 1.0
+                env_rewards[winner] += 5.0
                 self.event_log.append(f"Game Over! {self.get_player_name(winner)} is the TOURNAMENT CHAMPION (Last Agent Standing)!")
             elif len(active_players) == 0:
                 self.event_log.append("Game Over! All players eliminated simultaneously.")
@@ -1110,7 +1105,7 @@ class MonopolyCore:
                 # Max rounds reached (if finite horizon was configured): player with highest net worth wins
                 net_worths = [self.get_player_net_worth(pl) if not self.bankrupt[pl] else -99999 for pl in range(4)]
                 winner = int(np.argmax(net_worths))
-                env_rewards[winner] += 1.0
+                env_rewards[winner] += 2.0
                 self.event_log.append(f"Max rounds ({self.max_rounds}) reached. {self.get_player_name(winner)} wins on Net Worth!")
         else:
             dones["__all__"] = False

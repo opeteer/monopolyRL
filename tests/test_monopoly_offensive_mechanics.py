@@ -13,34 +13,41 @@ Validates:
 """
 
 import numpy as np
+import torch
 
 from monopoly_marl.engine.monopoly_core import (
-    MonopolyCore, PHASE_PROPERTY_MANAGE, PHASE_ROLL, PHASE_TRADE_RESPONSE,
-    ACT_CORE_ROLL_PASS, ACT_CORE_END_MANAGE, PURCHASABLE_TILES
+    MonopolyCore, PHASE_PROPERTY_MANAGE, PHASE_ROLL, PHASE_BUY_OR_AUCTION,
+    PHASE_TRADE_RESPONSE, ACT_CORE_ROLL_PASS, ACT_CORE_END_MANAGE, PURCHASABLE_TILES
 )
+from monopoly_marl.models.actor_network import ActorNetwork
 
 
 def test_monopoly_starvation_and_completion_potential():
-    """Validates that holding 0 monopolies imposes escalating starvation penalty, and completing monopoly surges potential."""
+    """Validates round-based starvation penalty, anti-exploit Buy positivity, and monopoly surge."""
     core = MonopolyCore(seed=42)
 
-    # Early game: all 28 properties unowned
-    pot_early = core._compute_potential(0)
+    # 1. Verify buying an unowned property is ALWAYS positive (ZERO Cobra Effect!)
+    core.round_count = 15
+    pot_before_buy = core._compute_potential(0)
+    core.property_owner[6] = 0  # Oriental Ave ($100)
+    core.cash[0] -= 100
+    pot_after_buy = core._compute_potential(0)
+    assert pot_after_buy > pot_before_buy + 0.3, (
+        f"Buying unowned property MUST yield strictly positive potential delta, got {pot_after_buy - pot_before_buy}"
+    )
 
-    # Mid game: all 28 properties owned by players 1, 2, 3, player 0 has 0 monopolies
-    for idx, p in enumerate(PURCHASABLE_TILES):
-        core.property_owner[p] = (idx % 3) + 1  # Distributed among opponents
+    # 2. Verify round-based starvation at round 40 with 0 monopolies
+    core2 = MonopolyCore(seed=42)
+    pot_early = core2._compute_potential(0)
+    core2.round_count = 40
+    pot_starving = core2._compute_potential(0)
+    assert pot_starving < pot_early - 3.0, f"Expected round-based starvation penalty (~ -3.5), got {pot_starving} vs {pot_early}"
 
-    # Player 0 has 0 monopolies, and 0 unowned properties remain
-    pot_starving = core._compute_potential(0)
-    assert pot_starving < pot_early - 20.0, f"Expected deep starvation penalty, got {pot_starving} vs {pot_early}"
-
-    # Now give player 0 the Brown monopoly (Mediterranean #1 and Baltic #3)
-    core.property_owner[1] = 0
-    core.property_owner[3] = 0
-    pot_monopoly = core._compute_potential(0)
-
-    assert pot_monopoly > pot_starving + 25.0, f"Expected massive surge upon monopoly completion, got {pot_monopoly} vs {pot_starving}"
+    # 3. Completing Brown monopoly (#1 and #3) removes starvation penalty + grants monopoly bonus
+    core2.property_owner[1] = 0
+    core2.property_owner[3] = 0
+    pot_monopoly = core2._compute_potential(0)
+    assert pot_monopoly > pot_starving + 4.0, f"Expected > +4.0 surge upon monopoly completion, got {pot_monopoly} vs {pot_starving}"
 
 
 def test_property_pass_action_160():
@@ -236,6 +243,7 @@ def test_trade_target_auto_routing():
 def test_trade_acceptance_reward_surge_when_starving():
     """Validates that accepting a monopoly-completing trade yields massive PBRS reward surge vs 0 on reject."""
     core = MonopolyCore(seed=42)
+    core.round_count = 40
     for idx, p in enumerate(PURCHASABLE_TILES):
         core.property_owner[p] = idx % 3
     core.property_owner[1] = 3
@@ -256,7 +264,7 @@ def test_trade_acceptance_reward_surge_when_starving():
         "trade_req_prop": 40, "trade_req_cash": 0, "trade_response": 1,
     }
     _, rewards, _, _ = core.step({"player_3": act_accept})
-    assert rewards["player_3"] > 25.0, f"Expected massive >25.0 reward surge on accept, got {rewards['player_3']}"
+    assert rewards["player_3"] > 4.0, f"Expected > 4.0 reward surge on accept (erasing -3.5 starvation + monopoly), got {rewards['player_3']}"
 
 
 def test_management_executes_property_build_before_trade():
@@ -285,3 +293,46 @@ def test_management_executes_property_build_before_trade():
     assert core.property_houses[1] == 1
     assert core.bank_houses == 31
     assert core.phase == PHASE_PROPERTY_MANAGE
+
+
+def test_get_observations_zero_redundancy_equivalence():
+    """Validates that optimized get_observations() produces bit-for-bit identical vectors to direct getters."""
+    core = MonopolyCore(seed=123)
+    core.property_owner[1] = 0
+    core.property_owner[3] = 1
+    core.phase = PHASE_TRADE_RESPONSE
+    core.active_decision_player = 1
+    core.pending_trade = {
+        "initiator": 0, "target": 1,
+        "offer_prop": 1, "offer_cash": 50,
+        "req_prop": 3, "req_cash": 0,
+    }
+    obs_bundle = core.get_observations()
+    for p in range(4):
+        assert np.array_equal(obs_bundle["obs"][f"player_{p}"], core.get_actor_observation(p))
+    assert np.array_equal(obs_bundle["global_state"], core.get_global_state())
+
+
+def test_phase_aware_actor_log_prob_isolation():
+    """Validates that unused heads do not pollute log_prob or entropy in single-head phases."""
+    core = MonopolyCore(seed=42)
+    core.phase = PHASE_BUY_OR_AUCTION
+    core.landed_property = 6
+    core.active_decision_player = 0
+
+    actor = ActorNetwork(obs_dim=500)
+    obs_np = core.get_actor_observation(0)
+    masks = core.get_action_masks(0)
+    obs_t = torch.tensor(obs_np, dtype=torch.float32).unsqueeze(0)
+    masks_t = {k: torch.tensor(masks[k], dtype=torch.int8).unsqueeze(0) for k in masks}
+
+    with torch.no_grad():
+        actions, lp, ent = actor(obs_t, masks_t)
+        # During PHASE_BUY_OR_AUCTION, only core head is active; entropy must be strictly <= ln(2) ~ 0.69315
+        assert ent.item() <= 0.70, f"Expected single-head entropy <= ln(2), got {ent.item()}"
+
+        # Corrupting unused trade head weights should NOT change evaluate_actions output for BUY_OR_AUCTION!
+        actor.head_trade_offer_prop.weight.data.fill_(5.0)
+        lp2, ent2 = actor.evaluate_actions(obs_t, masks_t, actions)
+        assert torch.allclose(lp, lp2, atol=1e-6), "Unused trade head altered BUY_OR_AUCTION log_prob!"
+        assert torch.allclose(ent, ent2, atol=1e-6), "Unused trade head altered BUY_OR_AUCTION entropy!"

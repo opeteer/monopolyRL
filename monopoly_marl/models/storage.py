@@ -18,8 +18,8 @@ class RolloutBuffer:
         num_envs: int,
         obs_dim: int = 500,
         state_dim: int = 2032,
-        gamma: float = 0.99,
-        gae_lambda: float = 0.95,
+        gamma: float = 0.997,
+        gae_lambda: float = 0.97,
         device: torch.device = torch.device("cpu"),
     ):
         self.buffer_size = buffer_size
@@ -142,10 +142,17 @@ class RolloutBuffer:
         flat_actions = {k: self.actions[k].view(batch_size, self.num_agents) for k in self.action_keys}
         flat_masks = {k: self.action_masks[k].view(batch_size, self.num_agents, self.mask_dims[k]) for k in self.action_keys}
 
-        # Normalize advantages per agent
-        adv_mean = flat_advantages.mean(dim=0, keepdim=True)
-        adv_std = flat_advantages.std(dim=0, keepdim=True) + 1e-8
-        norm_advantages = (flat_advantages - adv_mean) / adv_std
+        # Normalize advantages strictly over active decision transitions (excludes passive agents)
+        active_bool = flat_active_masks > 0.5
+        if torch.any(active_bool):
+            active_adv = flat_advantages[active_bool]
+            adv_mean = active_adv.mean()
+            adv_std = active_adv.std().clamp(min=1e-6)
+            norm_advantages = (flat_advantages - adv_mean) / (adv_std + 1e-8)
+        else:
+            adv_mean = flat_advantages.mean()
+            adv_std = flat_advantages.std().clamp(min=1e-6)
+            norm_advantages = (flat_advantages - adv_mean) / (adv_std + 1e-8)
 
         indices = torch.randperm(batch_size, device=self.device)
 
