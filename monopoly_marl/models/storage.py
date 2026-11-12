@@ -40,7 +40,7 @@ class RolloutBuffer:
         self.mask_dims = {
             "core": 6,
             "auction": 7,
-            "property": 160,
+            "property": 161,
             "trade_target": 3,
             "trade_offer_prop": 41,
             "trade_offer_cash": 10,
