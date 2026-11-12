@@ -380,7 +380,7 @@ def test_trade_heads_receive_nonzero_gradient_and_sync_with_core():
     obs_t = torch.tensor(obs_np, dtype=torch.float32).unsqueeze(0)
     masks_t = {k: torch.tensor(masks[k], dtype=torch.int8).unsqueeze(0) for k in masks}
 
-    # Explicit trade execution path: property=160 (Pass physical mgmt) + trade_req_prop=11
+    # Explicit trade execution path 1: property=160 + offer_cash > 0 (sweetener trade -> req_cash forced 0)
     actions = {
         "core": torch.tensor([0]),
         "auction": torch.tensor([0]),
@@ -398,13 +398,22 @@ def test_trade_heads_receive_nonzero_gradient_and_sync_with_core():
     loss = -(lp + 0.01 * ent).mean()
     loss.backward()
 
-    # Core trade proposal heads MUST have strictly non-zero gradient!
+    # Offered cash > 0 enforces one-way cash: offer_prop, req_prop, offer_cash receive non-zero gradient;
+    # req_cash is deterministically masked to 0 and trade_target is auto-routed.
     assert actor.head_trade_offer_prop.weight.grad.norm().item() > 0.0
     assert actor.head_trade_req_prop.weight.grad.norm().item() > 0.0
     assert actor.head_trade_offer_cash.weight.grad.norm().item() > 0.0
-    assert actor.head_trade_req_cash.weight.grad.norm().item() > 0.0
-    # trade_target is auto-routed when req_prop < 40 so it should have zero unused gradient
+    assert actor.head_trade_req_cash.weight.grad.norm().item() == 0.0
     assert actor.head_trade_target.weight.grad.norm().item() == 0.0
+
+    # Explicit trade execution path 2: offer_cash == 0, req_cash > 0 -> head_trade_req_cash gets non-zero grad!
+    actions_req_cash = dict(actions)
+    actions_req_cash["trade_offer_cash"] = torch.tensor([0])
+    actions_req_cash["trade_req_cash"] = torch.tensor([1])
+    actor.zero_grad()
+    lp_rc, ent_rc = actor.evaluate_actions(obs_t, masks_t, actions_req_cash)
+    (-(lp_rc + 0.01 * ent_rc).mean()).backward()
+    assert actor.head_trade_req_cash.weight.grad.norm().item() > 0.0
 
     # Verify core.step() also executes the exact same trade
     act_py = {k: int(v.item()) for k, v in actions.items()}
@@ -451,5 +460,133 @@ def test_bankruptcy_even_house_liquidation_and_hotel_shortage():
     assert core2.bank_hotels == 12
     assert core2.bank_houses == 1
     assert core2.cash[0] == 850
+
+
+def test_same_turn_mortgage_and_build_thrash_blocked():
+    """Verify same-turn mortgage->unmortgage and build->sell thrashing are masked out."""
+    core = MonopolyCore(seed=42)
+    core.property_owner[1] = 0
+    core.property_owner[3] = 0
+    core.property_owner[6] = 0
+    core.cash[0] = 1500
+    core.phase = PHASE_PROPERTY_MANAGE
+    core.active_decision_player = 0
+
+    # Mortgage Oriental (#6) on turn -> manage_actions_this_turn becomes 1
+    core.step({"player_0": {
+        "core": 0, "auction": 0, "property": 86, "trade_target": 0,
+        "trade_offer_prop": 40, "trade_offer_cash": 0, "trade_req_prop": 40,
+        "trade_req_cash": 0, "trade_response": 0,
+    }})
+    assert core.property_mortgaged[6] is True
+    masks = core.get_action_masks(0)
+    assert masks["property"][126] == 0, "Cannot immediately unmortgage #6 on the exact same turn"
+
+    # Build on Baltic (#3) on same turn -> cannot sell #3 on the exact same turn
+    core.step({"player_0": {
+        "core": 0, "auction": 0, "property": 3, "trade_target": 0,
+        "trade_offer_prop": 40, "trade_offer_cash": 0, "trade_req_prop": 40,
+        "trade_req_cash": 0, "trade_response": 0,
+    }})
+    assert core.property_houses[3] == 1
+    masks2 = core.get_action_masks(0)
+    assert masks2["property"][43] == 0, "Cannot immediately sell house #3 built on the exact same turn"
+
+
+def test_autoregressive_actor_eliminates_dual_cash_beg_and_gift():
+    """Verify ActorNetwork never produces dual-cash, pure-beg, or pure-gift trades and evaluate_actions matches forward."""
+    core = MonopolyCore(seed=42)
+    core.property_owner[1] = 0
+    core.property_owner[11] = 1
+    core.cash[0] = 1000
+    core.phase = PHASE_PROPERTY_MANAGE
+    core.active_decision_player = 0
+
+    actor = ActorNetwork(obs_dim=500)
+    obs_t = torch.tensor(core.get_actor_observation(0), dtype=torch.float32).unsqueeze(0)
+    masks = core.get_action_masks(0)
+    masks_t = {k: torch.tensor(masks[k], dtype=torch.int8).unsqueeze(0) for k in masks}
+
+    for _ in range(30):
+        acts, lp_f, ent_f = actor(obs_t, masks_t, deterministic=False)
+        lp_e, ent_e = actor.evaluate_actions(obs_t, masks_t, acts)
+        assert torch.allclose(lp_f, lp_e, atol=1e-5)
+        assert torch.allclose(ent_f, ent_e, atol=1e-5)
+
+        op = int(acts["trade_offer_prop"].item())
+        rp = int(acts["trade_req_prop"].item())
+        oc = int(acts["trade_offer_cash"].item())
+        rc = int(acts["trade_req_cash"].item())
+        assert not (oc > 0 and rc > 0), f"Dual cash paradox occurred: oc={oc}, rc={rc}"
+        if op == 40 and rp < 40:
+            assert oc > 0, "Cash-for-property buy cannot offer $0 cash"
+            assert rc == 0, "Cash-for-property buy cannot request cash back"
+        if op < 40 and rp == 40:
+            assert oc == 0, "Property-for-cash sale cannot also pay cash"
+            assert rc > 0, "Property-for-cash sale cannot request $0 cash (pure gift)"
+
+
+def test_auction_jump_squeeze_capped_by_bidding_ceiling():
+    """Verify ACT_AUC_JUMP_SQUEEZE is bounded by compute_bidding_ceiling (never jumps to $1000+ on $200 RR)."""
+    from monopoly_marl.engine.monopoly_core import PHASE_AUCTION, ACT_AUC_JUMP_SQUEEZE
+
+    core = MonopolyCore(seed=42)
+    core.phase = PHASE_AUCTION
+    core.auction_property = 25  # B. & O. Railroad (list price $200)
+    core.auction_highest_bid = 50
+    core.auction_highest_bidder = 1
+    core.auction_active_bidders = [0, 1]
+    core.auction_current_bidder_idx = 0
+    core.active_decision_player = 0
+    core.cash[0] = 1500
+    core.cash[1] = 1200  # Rich opponent cash $1200
+
+    # Non-synergy ceiling on $200 RR is <= $200, whereas old squeeze_target was $1201
+    ceiling = core.compute_bidding_ceiling(0, 25)
+    assert ceiling == 200
+    masks = core.get_action_masks(0)
+    assert masks["auction"][ACT_AUC_JUMP_SQUEEZE] == 1
+
+    core.step({"player_0": {
+        "core": 0, "auction": ACT_AUC_JUMP_SQUEEZE, "property": 0, "trade_target": 0,
+        "trade_offer_prop": 40, "trade_offer_cash": 0, "trade_req_prop": 40,
+        "trade_req_cash": 0, "trade_response": 0,
+    }})
+    assert core.auction_highest_bid == 200, f"Expected squeeze capped at ceiling $200, got {core.auction_highest_bid}"
+
+
+def test_rejected_trade_cooldown_prevents_identical_spam():
+    """Verify rejecting a requested property puts (initiator, owner, req_prop) on 5-round cooldown."""
+    core = MonopolyCore(seed=42)
+    core.property_owner[1] = 0
+    core.property_owner[3] = 1
+    core.cash[0] = 1000
+    core.cash[1] = 1000
+    core.phase = PHASE_PROPERTY_MANAGE
+    core.active_decision_player = 0
+
+    # P0 requests tile 3 from P1 -> P1 rejects
+    core.step({"player_0": {
+        "core": 0, "auction": 0, "property": 160, "trade_target": 0,
+        "trade_offer_prop": 1, "trade_offer_cash": 1, "trade_req_prop": 3,
+        "trade_req_cash": 0, "trade_response": 0,
+    }})
+    assert core.phase == PHASE_TRADE_RESPONSE
+    core.step({"player_1": {
+        "core": 0, "auction": 0, "property": 160, "trade_target": 0,
+        "trade_offer_prop": 40, "trade_offer_cash": 0, "trade_req_prop": 40,
+        "trade_req_cash": 0, "trade_response": 0,
+    }})
+
+    # Immediately and for next 4 rounds, tile 3 must be masked 0 for P0
+    core.trade_proposals_this_turn = 0
+    masks = core.get_action_masks(0)
+    assert masks["trade_req_prop"][3] == 0, "Rejected req_prop #3 must be on cooldown"
+
+    # After 5 rounds pass, tile 3 unlocks again
+    core.round_count += 5
+    masks_unlocked = core.get_action_masks(0)
+    assert masks_unlocked["trade_req_prop"][3] == 1, "Cooldown should expire after 5 rounds"
+
 
 

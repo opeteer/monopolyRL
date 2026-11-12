@@ -172,7 +172,8 @@ def test_mortgage_and_interest():
     assert core.property_mortgaged[1] is True
     assert core.cash[0] == 130  # Received $30
 
-    # Unmortgage: cost is 30 * 1.10 = 33
+    # Next turn unmortgage: cost is 30 * 1.10 = 33
+    core.manage_actions_this_turn = 0
     core.phase = PHASE_PROPERTY_MANAGE
     core.active_decision_player = 0
     # Unmortgage action: 120 + 1 = 121

@@ -54,6 +54,12 @@ class ActorNetwork(nn.Module):
         self.head_trade_req_cash = nn.Linear(hidden_dim, 10)
         self.head_trade_response = nn.Linear(hidden_dim, 2)
 
+        # Autoregressive zero-init trade conditioning embeddings:
+        # req_prop -> offer_prop, and (offer_prop, req_prop) -> cash heads
+        self.emb_trade_req_for_offer = nn.Embedding(41, hidden_dim)
+        self.emb_trade_offer_prop = nn.Embedding(41, hidden_dim)
+        self.emb_trade_req_prop = nn.Embedding(41, hidden_dim)
+
         # Apply strict Orthogonal Initialization
         self.apply_orthogonal_init()
 
@@ -74,6 +80,10 @@ class ActorNetwork(nn.Module):
         init_weights(self.head_trade_req_prop, gain=head_gain)
         init_weights(self.head_trade_req_cash, gain=head_gain)
         init_weights(self.head_trade_response, gain=head_gain)
+
+        nn.init.zeros_(self.emb_trade_req_for_offer.weight)
+        nn.init.zeros_(self.emb_trade_offer_prop.weight)
+        nn.init.zeros_(self.emb_trade_req_prop.weight)
 
     def _mask_logits(self, logits: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
         """Applies binary mask, setting invalid logits to -1e8."""
@@ -135,20 +145,132 @@ class ActorNetwork(nn.Module):
         entropy = sum(ent_dict.values())
         return log_prob, entropy
 
-    def _get_distributions(self, obs: torch.Tensor, action_masks: Dict[str, torch.Tensor]) -> Dict[str, Categorical]:
-        """Runs shared trunk and constructs masked Categorical distributions for all 9 heads."""
+    @staticmethod
+    def _safe_conditional_mask(cond_mask: torch.Tensor, fallback_mask: torch.Tensor) -> torch.Tensor:
+        """Falls back to base mask if a conditional rule eliminates every option."""
+        has_any = cond_mask.sum(dim=-1, keepdim=True) > 0
+        return torch.where(has_any, cond_mask, fallback_mask)
+
+    def _select_from_dist(self, dist: Categorical, deterministic: bool) -> torch.Tensor:
+        return torch.argmax(dist.logits, dim=-1) if deterministic else dist.sample()
+
+    def _build_distributions_and_actions(
+        self,
+        obs: torch.Tensor,
+        action_masks: Dict[str, torch.Tensor],
+        given_actions: Optional[Dict[str, torch.Tensor]] = None,
+        deterministic: bool = False,
+    ) -> Tuple[Dict[str, Categorical], Dict[str, torch.Tensor]]:
+        """Builds phase-conditioned distributions and sequentially samples (or evaluates) trade heads.
+
+        Sequential trade conditioning guarantees:
+        - No identical offer_prop == req_prop
+        - Zero dual-cash paradox (never offer_cash > 0 and req_cash > 0 simultaneously)
+        - Zero empty-handed begs (offer_prop=40, req_prop<40 forces offer_cash >= $25 when affordable)
+        - Zero one-sided property giveaways (offer_prop<40, req_prop=40 forces req_cash >= $25)
+        """
         features = self.trunk(obs)
-        return {
+        device = features.device
+
+        dists = {
             "core": Categorical(logits=self._mask_logits(self.head_core(features), action_masks["core"])),
             "auction": Categorical(logits=self._mask_logits(self.head_auction(features), action_masks["auction"])),
             "property": Categorical(logits=self._mask_logits(self.head_property(features), action_masks["property"])),
             "trade_target": Categorical(logits=self._mask_logits(self.head_trade_target(features), action_masks["trade_target"])),
-            "trade_offer_prop": Categorical(logits=self._mask_logits(self.head_trade_offer_prop(features), action_masks["trade_offer_prop"])),
-            "trade_offer_cash": Categorical(logits=self._mask_logits(self.head_trade_offer_cash(features), action_masks["trade_offer_cash"])),
-            "trade_req_prop": Categorical(logits=self._mask_logits(self.head_trade_req_prop(features), action_masks["trade_req_prop"])),
-            "trade_req_cash": Categorical(logits=self._mask_logits(self.head_trade_req_cash(features), action_masks["trade_req_cash"])),
             "trade_response": Categorical(logits=self._mask_logits(self.head_trade_response(features), action_masks["trade_response"])),
         }
+
+        if given_actions is None:
+            actions_dict = {k: self._select_from_dist(d, deterministic) for k, d in dists.items()}
+        else:
+            actions_dict = dict(given_actions)
+
+        # 1. Requested property
+        dists["trade_req_prop"] = Categorical(
+            logits=self._mask_logits(self.head_trade_req_prop(features), action_masks["trade_req_prop"])
+        )
+        req_prop = (
+            self._select_from_dist(dists["trade_req_prop"], deterministic)
+            if given_actions is None else given_actions["trade_req_prop"].to(device).long()
+        )
+        actions_dict["trade_req_prop"] = req_prop
+
+        # 2. Offered property conditioned on req_prop (cannot offer == request when both < 40)
+        base_op_mask = action_masks["trade_offer_prop"].to(device)
+        cond_op_mask = base_op_mask.clone()
+        is_req_tile = req_prop < 40
+        if torch.any(is_req_tile):
+            idx_clamped = req_prop.clamp(0, 40).unsqueeze(-1)
+            one_hot_req = torch.zeros_like(cond_op_mask).scatter_(-1, idx_clamped, 1)
+            cond_op_mask = torch.where(
+                is_req_tile.unsqueeze(-1),
+                cond_op_mask * (1 - one_hot_req),
+                cond_op_mask,
+            )
+            cond_op_mask = self._safe_conditional_mask(cond_op_mask, base_op_mask)
+        feat_op = features + self.emb_trade_req_for_offer(req_prop.clamp(0, 40))
+        dists["trade_offer_prop"] = Categorical(
+            logits=self._mask_logits(self.head_trade_offer_prop(feat_op), cond_op_mask)
+        )
+        offer_prop = (
+            self._select_from_dist(dists["trade_offer_prop"], deterministic)
+            if given_actions is None else given_actions["trade_offer_prop"].to(device).long()
+        )
+        actions_dict["trade_offer_prop"] = offer_prop
+
+        # 3. Cash heads conditioned on (offer_prop, req_prop)
+        feat_cash = (
+            features
+            + self.emb_trade_offer_prop(offer_prop.clamp(0, 40))
+            + self.emb_trade_req_prop(req_prop.clamp(0, 40))
+        )
+
+        is_cash_buy = (offer_prop == 40) & (req_prop < 40)
+        is_prop_sale = (offer_prop < 40) & (req_prop == 40)
+
+        base_oc_mask = action_masks["trade_offer_cash"].to(device)
+        cond_oc_mask = base_oc_mask.clone()
+        cond_oc_mask[..., 0] = torch.where(is_cash_buy, torch.zeros_like(cond_oc_mask[..., 0]), cond_oc_mask[..., 0])
+        cond_oc_mask[..., 1:] = torch.where(
+            is_prop_sale.unsqueeze(-1),
+            torch.zeros_like(cond_oc_mask[..., 1:]),
+            cond_oc_mask[..., 1:],
+        )
+        cond_oc_mask = self._safe_conditional_mask(cond_oc_mask, base_oc_mask)
+        dists["trade_offer_cash"] = Categorical(
+            logits=self._mask_logits(self.head_trade_offer_cash(feat_cash), cond_oc_mask)
+        )
+        offer_cash = (
+            self._select_from_dist(dists["trade_offer_cash"], deterministic)
+            if given_actions is None else given_actions["trade_offer_cash"].to(device).long()
+        )
+        actions_dict["trade_offer_cash"] = offer_cash
+
+        # 4. Requested cash conditioned on (offer_prop, req_prop, offer_cash) -> strictly zero dual-cash!
+        base_rc_mask = action_masks["trade_req_cash"].to(device)
+        cond_rc_mask = base_rc_mask.clone()
+        force_zero_rc = (offer_cash > 0) | is_cash_buy
+        cond_rc_mask[..., 1:] = torch.where(
+            force_zero_rc.unsqueeze(-1),
+            torch.zeros_like(cond_rc_mask[..., 1:]),
+            cond_rc_mask[..., 1:],
+        )
+        cond_rc_mask[..., 0] = torch.where(
+            is_prop_sale,
+            torch.zeros_like(cond_rc_mask[..., 0]),
+            cond_rc_mask[..., 0],
+        )
+        cond_rc_mask = self._safe_conditional_mask(cond_rc_mask, base_rc_mask)
+        dists["trade_req_cash"] = Categorical(
+            logits=self._mask_logits(self.head_trade_req_cash(feat_cash), cond_rc_mask)
+        )
+        req_cash = (
+            self._select_from_dist(dists["trade_req_cash"], deterministic)
+            if given_actions is None else given_actions["trade_req_cash"].to(device).long()
+        )
+        actions_dict["trade_req_cash"] = req_cash
+
+        return dists, actions_dict
 
     def forward(
         self,
@@ -156,17 +278,13 @@ class ActorNetwork(nn.Module):
         action_masks: Dict[str, torch.Tensor],
         deterministic: bool = False,
     ) -> Tuple[Dict[str, torch.Tensor], torch.Tensor, torch.Tensor]:
-        """Forward pass to sample actions from all factorized heads.
+        """Forward pass to sample actions from all factorized & autoregressive trade heads.
 
         Returns (actions_dict, total_log_prob, total_entropy).
         """
-        dists = self._get_distributions(obs, action_masks)
-
-        if deterministic:
-            actions_dict = {k: torch.argmax(d.logits, dim=-1) for k, d in dists.items()}
-        else:
-            actions_dict = {k: d.sample() for k, d in dists.items()}
-
+        dists, actions_dict = self._build_distributions_and_actions(
+            obs, action_masks, given_actions=None, deterministic=deterministic
+        )
         log_prob, entropy = self._compute_phase_aware_lp_entropy(obs, action_masks, actions_dict, dists)
         return actions_dict, log_prob, entropy
 
@@ -177,5 +295,7 @@ class ActorNetwork(nn.Module):
         actions: Dict[str, torch.Tensor],
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Evaluates log probabilities and entropies for specific given actions."""
-        dists = self._get_distributions(obs, action_masks)
+        dists, _ = self._build_distributions_and_actions(
+            obs, action_masks, given_actions=actions, deterministic=False
+        )
         return self._compute_phase_aware_lp_entropy(obs, action_masks, actions, dists)

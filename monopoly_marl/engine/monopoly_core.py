@@ -197,6 +197,14 @@ class MonopolyCore:
         self.trades_accepted_count = 0
         self.houses_built_count = 0
 
+        # Same-turn thrash guards & rejected-trade cooldowns
+        self.mortgaged_this_turn: Set[int] = set()
+        self.unmortgaged_this_turn: Set[int] = set()
+        self.built_this_turn: Set[int] = set()
+        self.sold_this_turn: Set[int] = set()
+        self.rejected_req_prop_cooldown: Dict[Tuple[int, int, int], int] = {}
+        self.rejected_offer_prop_cooldown: Dict[Tuple[int, int, int], int] = {}
+
         # Event log history for UI / replay
         self.event_log: List[str] = ["Tournament game started. All players initialized with $1500."]
         self.last_card_drawn: Optional[Dict[str, Any]] = None
@@ -779,7 +787,8 @@ class MonopolyCore:
                 other_bidders = [b for b in self.auction_active_bidders if b != player_id and not self.bankrupt[b]]
                 if other_bidders:
                     max_opp_c = max(self.cash[b] for b in other_bidders)
-                    squeeze_target = max_opp_c + 1
+                    ceiling = self.compute_bidding_ceiling(player_id, self.auction_property)
+                    squeeze_target = min(max_opp_c + 1, ceiling)
                     if squeeze_target > current_bid and cash >= squeeze_target:
                         mask_auction[ACT_AUC_JUMP_SQUEEZE] = 1
 
@@ -789,6 +798,12 @@ class MonopolyCore:
             # Property head (0..160) exclusively controls physical actions & pass/trade (160).
             mask_core[ACT_CORE_ROLL_PASS] = 1
             mask_property[160] = 1  # 160: Explicit PASS / END MANAGEMENT / TRADE CHECK action
+
+            same_turn_guard = getattr(self, "manage_actions_this_turn", 0) > 0
+            mortgaged_turn = getattr(self, "mortgaged_this_turn", set()) if same_turn_guard else set()
+            unmortgaged_turn = getattr(self, "unmortgaged_this_turn", set()) if same_turn_guard else set()
+            built_turn = getattr(self, "built_this_turn", set()) if same_turn_guard else set()
+            sold_turn = getattr(self, "sold_this_turn", set()) if same_turn_guard else set()
 
             # Property Management Sub-actions:
             # [0..39]: Build House
@@ -803,7 +818,7 @@ class MonopolyCore:
                     h_cost = tile.get("house_cost", 0)
 
                     # BUILD HOUSE / HOTEL
-                    if tile["type"] == TILE_STREET and grp:
+                    if tile["type"] == TILE_STREET and grp and p not in sold_turn:
                         group_tiles = COLOR_GROUPS[grp]
                         all_owned = all(self.property_owner[t] == player_id for t in group_tiles)
                         none_mortgaged = all(not self.property_mortgaged[t] for t in group_tiles)
@@ -819,7 +834,7 @@ class MonopolyCore:
                                     mask_property[p] = 1
 
                     # SELL HOUSE / HOTEL
-                    if tile["type"] == TILE_STREET and grp and h > 0:
+                    if tile["type"] == TILE_STREET and grp and h > 0 and p not in built_turn:
                         group_tiles = COLOR_GROUPS[grp]
                         max_h = max(self.property_houses[t] for t in group_tiles)
                         if h == max_h:
@@ -831,7 +846,7 @@ class MonopolyCore:
                                     mask_property[40 + p] = 1
 
                     # MORTGAGE
-                    if not self.property_mortgaged[p]:
+                    if not self.property_mortgaged[p] and p not in unmortgaged_turn:
                         # Cannot mortgage if any tile in color group has houses
                         grp = tile.get("color")
                         has_houses = False
@@ -841,7 +856,7 @@ class MonopolyCore:
                             mask_property[80 + p] = 1
 
                     # UNMORTGAGE
-                    if self.property_mortgaged[p]:
+                    if self.property_mortgaged[p] and p not in mortgaged_turn:
                         unmtg_cost = int(tile["mortgage"] * (1.0 + UNMORTGAGE_INTEREST_RATE))
                         if self.cash[player_id] >= unmtg_cost:
                             mask_property[120 + p] = 1
@@ -855,25 +870,32 @@ class MonopolyCore:
 
                 # Offer properties: owned by player with 0 houses in group
                 mask_trade_offer_prop[40] = 1  # 40 = None
+                has_tradable_offer_prop = False
                 for p in PURCHASABLE_TILES:
                     if self.property_owner[p] == player_id:
                         grp = TILES_DATA[p].get("color")
                         if not (grp and any(self.property_houses[t] > 0 for t in COLOR_GROUPS.get(grp, []))):
                             mask_trade_offer_prop[p] = 1
+                            has_tradable_offer_prop = True
 
                 # Offer cash: brackets <= player cash
                 for b_idx, b_val in enumerate(TRADE_CASH_BRACKETS):
                     if self.cash[player_id] >= b_val:
                         mask_trade_offer_cash[b_idx] = 1
 
-                # Request properties: owned by someone else with 0 houses in group
+                # Request properties: owned by someone else with 0 houses in group (and not on rejection cooldown)
                 mask_trade_req_prop[40] = 1  # 40 = None
-                for p in PURCHASABLE_TILES:
-                    owner = self.property_owner[p]
-                    if owner != -1 and owner != player_id and not self.bankrupt[owner]:
-                        grp = TILES_DATA[p].get("color")
-                        if not (grp and any(self.property_houses[t] > 0 for t in COLOR_GROUPS.get(grp, []))):
-                            mask_trade_req_prop[p] = 1
+                can_afford_any_offer = has_tradable_offer_prop or (self.cash[player_id] >= TRADE_CASH_BRACKETS[1])
+                req_cooldowns = getattr(self, "rejected_req_prop_cooldown", {})
+                if can_afford_any_offer:
+                    for p in PURCHASABLE_TILES:
+                        owner = self.property_owner[p]
+                        if owner != -1 and owner != player_id and not self.bankrupt[owner]:
+                            if req_cooldowns.get((player_id, owner, p), -1) > self.round_count:
+                                continue
+                            grp = TILES_DATA[p].get("color")
+                            if not (grp and any(self.property_houses[t] > 0 for t in COLOR_GROUPS.get(grp, []))):
+                                mask_trade_req_prop[p] = 1
 
                 # Request cash: all brackets (target will decide if they have it)
                 mask_trade_req_cash[:] = 1
@@ -1336,19 +1358,14 @@ class MonopolyCore:
         elif auc_act == ACT_AUC_JUMP_LIST:
             if price > current_bid and cash >= price:
                 bid_inc = price - current_bid
-            else:
-                bid_inc = 10
         elif auc_act == ACT_AUC_JUMP_SQUEEZE:
             other_bidders = [b for b in self.auction_active_bidders if b != p and not self.bankrupt[b]]
             if other_bidders:
                 max_opp_c = max(self.cash[b] for b in other_bidders)
-                squeeze_target = max_opp_c + 1
+                ceiling = self.compute_bidding_ceiling(p, self.auction_property)
+                squeeze_target = min(max_opp_c + 1, ceiling)
                 if squeeze_target > current_bid and cash >= squeeze_target:
                     bid_inc = squeeze_target - current_bid
-                else:
-                    bid_inc = 50
-            else:
-                bid_inc = 10
 
         if bid_inc > 0 and cash >= current_bid + bid_inc:
             self.auction_highest_bid = current_bid + bid_inc
@@ -1391,10 +1408,18 @@ class MonopolyCore:
     # ----------------------------------------------------------------------
     # Property Management & Trading
     # ----------------------------------------------------------------------
+    def _clear_turn_manage_guards(self):
+        """Resets same-turn physical management thrash guards."""
+        self.mortgaged_this_turn.clear()
+        self.unmortgaged_this_turn.clear()
+        self.built_this_turn.clear()
+        self.sold_this_turn.clear()
+
     def _finish_manage_or_next(self, p: int, is_double: bool):
         """Finishes management phase and either executes double roll or rotates turn."""
         self.manage_actions_this_turn = 0
         self.trade_proposals_this_turn = 0
+        self._clear_turn_manage_guards()
         if is_double and not self.in_jail[p] and not self.bankrupt[p]:
             self.event_log.append(f"{self.get_player_name(p)} rolled doubles! Gets another roll.")
             self.phase = PHASE_ROLL
@@ -1408,6 +1433,7 @@ class MonopolyCore:
         self.active_decision_player = p
         self.pending_manage_double = is_double
         self.manage_actions_this_turn = 0
+        self._clear_turn_manage_guards()
 
     def _handle_management_phase(
         self, p: int, core_act: int, prop_act: int, masks: Dict[str, np.ndarray],
@@ -1431,6 +1457,7 @@ class MonopolyCore:
                         self.bank_houses -= 1
                         self.cash[p] -= h_cost
                         self.houses_built_count += 1
+                        self.built_this_turn.add(prop_act)
                         self.event_log.append(f"{self.get_player_name(p)} built a house on {tile['name']} for ${h_cost}. (Bank houses left: {self.bank_houses})")
                     elif h == 4:
                         self.property_houses[prop_act] = 5
@@ -1438,6 +1465,7 @@ class MonopolyCore:
                         self.bank_houses += 4
                         self.cash[p] -= h_cost
                         self.houses_built_count += 1
+                        self.built_this_turn.add(prop_act)
                         self.event_log.append(f"{self.get_player_name(p)} upgraded to a HOTEL on {tile['name']} for ${h_cost}! (4 houses returned to bank).")
 
             # [40..79]: Sell House / Hotel
@@ -1452,12 +1480,14 @@ class MonopolyCore:
                         self.property_houses[p_idx] -= 1
                         self.bank_houses += 1
                         self.cash[p] += refund
+                        self.sold_this_turn.add(p_idx)
                         self.event_log.append(f"{self.get_player_name(p)} sold a house on {tile['name']} for ${refund}.")
                     elif h == 5:
                         self.property_houses[p_idx] = 4
                         self.bank_hotels += 1
                         self.bank_houses -= 4
                         self.cash[p] += refund
+                        self.sold_this_turn.add(p_idx)
                         self.event_log.append(f"{self.get_player_name(p)} sold hotel on {tile['name']} for ${refund} (converted to 4 houses).")
 
             # [80..119]: Mortgage
@@ -1468,6 +1498,7 @@ class MonopolyCore:
                     mtg_val = tile["mortgage"]
                     self.property_mortgaged[p_idx] = True
                     self.cash[p] += mtg_val
+                    self.mortgaged_this_turn.add(p_idx)
                     self.event_log.append(f"{self.get_player_name(p)} mortgaged {tile['name']} for ${mtg_val}.")
 
             # [120..159]: Unmortgage
@@ -1478,6 +1509,7 @@ class MonopolyCore:
                     cost = int(tile["mortgage"] * (1.0 + UNMORTGAGE_INTEREST_RATE))
                     self.property_mortgaged[p_idx] = False
                     self.cash[p] -= cost
+                    self.unmortgaged_this_turn.add(p_idx)
                     self.event_log.append(f"{self.get_player_name(p)} unmortgaged {tile['name']} for ${cost} (incl. 10% interest).")
 
             if self.manage_actions_this_turn >= 5:
@@ -1517,23 +1549,46 @@ class MonopolyCore:
             prop_owner = self.property_owner[req_prop]
             if prop_owner == -1 or prop_owner == initiator or self.bankrupt[prop_owner]:
                 return False
+            if self.rejected_req_prop_cooldown.get((initiator, prop_owner, req_prop), -1) > self.round_count:
+                return False
             grp_req = TILES_DATA[req_prop].get("color")
             if grp_req and any(self.property_houses[t] > 0 for t in COLOR_GROUPS.get(grp_req, [])):
                 return False
             target = prop_owner
         else:
             target = other_players[target_idx % len(other_players)]
+            if 0 <= offer_prop < 40 and self.rejected_offer_prop_cooldown.get((initiator, target, offer_prop), -1) > self.round_count:
+                return False
 
         offer_cash = TRADE_CASH_BRACKETS[min(offer_cash_idx, len(TRADE_CASH_BRACKETS) - 1)]
         req_cash = TRADE_CASH_BRACKETS[min(req_cash_idx, len(TRADE_CASH_BRACKETS) - 1)]
 
-        # Validate offer
+        # Canonicalize dual-cash paradox into strict one-way net cash
+        if offer_cash > 0 and req_cash > 0:
+            if offer_cash >= req_cash:
+                offer_cash -= req_cash
+                req_cash = 0
+            else:
+                req_cash -= offer_cash
+                offer_cash = 0
+
+        # Validate offer & eliminate degenerate one-sided giveaways / empty-handed begs
         if 0 <= offer_prop < 40:
+            if offer_prop == req_prop:
+                return False
             if self.property_owner[offer_prop] != initiator:
                 return False
             grp_off = TILES_DATA[offer_prop].get("color")
             if grp_off and any(self.property_houses[t] > 0 for t in COLOR_GROUPS.get(grp_off, [])):
                 return False
+        elif offer_cash == 0:
+            # Pure beg: offering neither property nor cash
+            return False
+
+        if req_prop >= 40 and req_cash == 0:
+            # Pure gift: giving away property (and/or cash) for nothing in return
+            return False
+
         if self.cash[initiator] < offer_cash:
             return False
 
@@ -1579,6 +1634,13 @@ class MonopolyCore:
                 else:
                     self.event_log.append(f"Trade failed due to insufficient funds.")
             else:
+                trade = self.pending_trade
+                req_p = trade["req_prop"]
+                offer_p = trade["offer_prop"]
+                if 0 <= req_p < 40:
+                    self.rejected_req_prop_cooldown[(init, target, req_p)] = self.round_count + 5
+                elif 0 <= offer_p < 40:
+                    self.rejected_offer_prop_cooldown[(init, target, offer_p)] = self.round_count + 5
                 self.event_log.append(f"Trade REJECTED by {self.get_player_name(target)}.")
 
         self.pending_trade = None
@@ -1826,6 +1888,7 @@ class MonopolyCore:
         self.turn_step += 1
         self.manage_actions_this_turn = 0
         self.trade_proposals_this_turn = 0
+        self._clear_turn_manage_guards()
 
         # Advance current_player to next non-bankrupt player
         prev_player = self.current_player
