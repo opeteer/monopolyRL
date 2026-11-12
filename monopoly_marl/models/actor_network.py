@@ -108,13 +108,15 @@ class ActorNetwork(nn.Module):
                 is_trade_check = is_manage * (actions["property"] == 160).float() * trade_enabled
                 has_trade_prop = ((actions["trade_offer_prop"] < 40) | (actions["trade_req_prop"] < 40)).float()
                 is_trade_detail = is_trade_check * has_trade_prop
+                is_trade_target = is_trade_detail * (actions["trade_req_prop"] == 40).float()
 
                 log_prob = (
                     is_core * lp_dict["core"] +
                     is_auc * lp_dict["auction"] +
                     is_manage * lp_dict["property"] +
                     is_trade_check * (lp_dict["trade_offer_prop"] + lp_dict["trade_req_prop"]) +
-                    is_trade_detail * (lp_dict["trade_target"] + lp_dict["trade_offer_cash"] + lp_dict["trade_req_cash"]) +
+                    is_trade_detail * (lp_dict["trade_offer_cash"] + lp_dict["trade_req_cash"]) +
+                    is_trade_target * lp_dict["trade_target"] +
                     is_trade_resp * lp_dict["trade_response"]
                 )
                 entropy = (
@@ -122,7 +124,8 @@ class ActorNetwork(nn.Module):
                     is_auc * ent_dict["auction"] +
                     is_manage * ent_dict["property"] +
                     is_trade_check * (ent_dict["trade_offer_prop"] + ent_dict["trade_req_prop"]) +
-                    is_trade_detail * (ent_dict["trade_target"] + ent_dict["trade_offer_cash"] + ent_dict["trade_req_cash"]) +
+                    is_trade_detail * (ent_dict["trade_offer_cash"] + ent_dict["trade_req_cash"]) +
+                    is_trade_target * ent_dict["trade_target"] +
                     is_trade_resp * ent_dict["trade_response"]
                 )
                 return log_prob, entropy

@@ -785,10 +785,10 @@ class MonopolyCore:
 
         # 5. PHASE_PROPERTY_MANAGE
         elif self.phase == PHASE_PROPERTY_MANAGE:
-            # Always allowed to end turn
-            mask_core[ACT_CORE_END_MANAGE] = 1
+            # Core head is fixed to single dummy option in PHASE_PROPERTY_MANAGE;
+            # Property head (0..160) exclusively controls physical actions & pass/trade (160).
             mask_core[ACT_CORE_ROLL_PASS] = 1
-            mask_property[160] = 1  # 160: Explicit PASS / END MANAGEMENT action
+            mask_property[160] = 1  # 160: Explicit PASS / END MANAGEMENT / TRADE CHECK action
 
             # Property Management Sub-actions:
             # [0..39]: Build House
@@ -845,11 +845,6 @@ class MonopolyCore:
                         unmtg_cost = int(tile["mortgage"] * (1.0 + UNMORTGAGE_INTEREST_RATE))
                         if self.cash[player_id] >= unmtg_cost:
                             mask_property[120 + p] = 1
-
-            # If agent has any valid property management action (build, sell, unmortgage, emergency mortgage),
-            # allow ACT_CORE_ROLL_PASS (execute property action) alongside ACT_CORE_END_MANAGE
-            if np.any(mask_property):
-                mask_core[ACT_CORE_ROLL_PASS] = 1
 
             # Bilateral Trade Proposals (max 1 trade proposal per turn)
             if self.allow_trade and getattr(self, "trade_proposals_this_turn", 0) == 0:
@@ -1423,11 +1418,8 @@ class MonopolyCore:
         is_double = getattr(self, "pending_manage_double", False)
         self.manage_actions_this_turn = getattr(self, "manage_actions_this_turn", 0) + 1
 
-        # 1. Execute physical property management actions FIRST (prioritize building/selling/mortgaging)
-        is_valid_build_sell = (0 <= prop_act < 80) and bool(masks["property"][prop_act])
-        is_valid_mtg_unmtg = (80 <= prop_act < 160) and bool(masks["property"][prop_act]) and (core_act != ACT_CORE_END_MANAGE)
-
-        if is_valid_build_sell or is_valid_mtg_unmtg:
+        # 1. Execute physical property management actions FIRST (0..159) directly without core_act interference
+        if 0 <= prop_act < 160 and bool(masks["property"][prop_act]):
             # [0..39]: Build House / Hotel
             if 0 <= prop_act < 40:
                 tile = TILES_DATA[prop_act]
@@ -1738,20 +1730,49 @@ class MonopolyCore:
         if creditor == p or (creditor is not None and self.bankrupt[creditor]):
             creditor = None
 
-        # 1. Sell houses/hotels first at 50% refund to raise cash
-        for t in owned_props:
-            while self.property_houses[t] > 0 and self.cash[p] < 0:
-                h = self.property_houses[t]
-                cost = TILES_DATA[t]["house_cost"]
-                refund = int(cost * HOUSE_REFUND_RATE)
-                if h == 5:
-                    self.property_houses[t] = 4
+        # 1. Sell houses/hotels evenly first at 50% refund to raise cash (strictly obeying even-selling & bank scarcity)
+        while self.cash[p] < 0:
+            sellable = [t for t in owned_props if self.property_houses[t] > 0]
+            if not sellable:
+                break
+            # Pick highest house count tile; find its color group max
+            target_t = max(sellable, key=lambda t: self.property_houses[t])
+            grp = TILES_DATA[target_t].get("color")
+            group_tiles = COLOR_GROUPS[grp] if (grp and grp in COLOR_GROUPS) else [target_t]
+            max_h = max(self.property_houses[t] for t in group_tiles)
+            top_tiles = [t for t in group_tiles if self.property_houses[t] == max_h]
+            t_sell = top_tiles[0]
+            cost = TILES_DATA[t_sell]["house_cost"]
+            refund = int(cost * HOUSE_REFUND_RATE)
+
+            if max_h <= 4:
+                self.property_houses[t_sell] -= 1
+                self.bank_houses += 1
+                self.cash[p] += refund
+            else:
+                # max_h == 5 (Hotel)
+                if self.bank_houses >= 4:
+                    self.property_houses[t_sell] = 4
                     self.bank_hotels += 1
                     self.bank_houses -= 4
+                    self.cash[p] += refund
                 else:
-                    self.property_houses[t] -= 1
-                    self.bank_houses += 1
-                self.cash[p] += refund
+                    # Bank housing shortage: liquidate all hotels in group down to highest uniform level bank can supply
+                    cur_houses_in_grp = sum(self.property_houses[t] for t in group_tiles if self.property_houses[t] <= 4)
+                    cur_hotels_in_grp = sum(1 for t in group_tiles if self.property_houses[t] == 5)
+                    total_levels_before = sum(self.property_houses[t] for t in group_tiles)
+                    n_grp = len(group_tiles)
+                    target_h = 0
+                    for cand_h in (3, 2, 1, 0):
+                        if n_grp * cand_h <= self.bank_houses + cur_houses_in_grp:
+                            target_h = cand_h
+                            break
+                    self.bank_hotels += cur_hotels_in_grp
+                    self.bank_houses += cur_houses_in_grp - (n_grp * target_h)
+                    for t_g in group_tiles:
+                        self.property_houses[t_g] = target_h
+                    levels_sold = total_levels_before - (n_grp * target_h)
+                    self.cash[p] += levels_sold * refund
 
         # 2. Mortgage properties if still in debt
         for t in owned_props:

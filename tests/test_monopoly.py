@@ -676,7 +676,8 @@ def test_house_and_hotel_building_mechanics():
     # Step 1: Build house on tile 1 ($50)
     masks = core.get_action_masks(0)
     assert masks["core"][ACT_CORE_ROLL_PASS] == 1
-    assert masks["core"][ACT_CORE_END_MANAGE] == 1
+    assert masks["core"][ACT_CORE_END_MANAGE] == 0
+    assert masks["property"][160] == 1
     assert masks["property"][1] == 1
     assert masks["property"][3] == 1
 

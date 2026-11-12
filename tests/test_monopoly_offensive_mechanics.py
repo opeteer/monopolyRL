@@ -336,3 +336,120 @@ def test_phase_aware_actor_log_prob_isolation():
         lp2, ent2 = actor.evaluate_actions(obs_t, masks_t, actions)
         assert torch.allclose(lp, lp2, atol=1e-6), "Unused trade head altered BUY_OR_AUCTION log_prob!"
         assert torch.allclose(ent, ent2, atol=1e-6), "Unused trade head altered BUY_OR_AUCTION entropy!"
+
+
+def test_mortgage_action_executes_directly_without_trade_leak():
+    """Validates that selecting mortgage (prop 80..159) executes mortgage directly and never leaks into trade proposal."""
+    core = MonopolyCore(seed=42)
+    core.property_owner[1] = 0
+    core.property_owner[11] = 1
+    core.cash[0] = 1500
+    core.phase = PHASE_PROPERTY_MANAGE
+    core.active_decision_player = 0
+
+    act = {
+        "core": ACT_CORE_END_MANAGE,  # Even if passed, core_act cannot block mortgage or leak to trade
+        "auction": 0,
+        "property": 81,               # Mortgage Mediterranean Ave (#1, mortgage=$30)
+        "trade_target": 0,
+        "trade_offer_prop": 40,
+        "trade_offer_cash": 1,
+        "trade_req_prop": 11,
+        "trade_req_cash": 0,
+        "trade_response": 0,
+    }
+    core.step({"player_0": act})
+
+    assert core.property_mortgaged[1] is True
+    assert core.cash[0] == 1530
+    assert core.trades_proposed_count == 0, "Physical property action 81 must never fall through to trade!"
+    assert core.phase == PHASE_PROPERTY_MANAGE
+
+
+def test_trade_heads_receive_nonzero_gradient_and_sync_with_core():
+    """Validates that whenever core.step() triggers a trade proposal, all participating trade heads receive non-zero PPO gradients."""
+    core = MonopolyCore(seed=42)
+    core.property_owner[1] = 0
+    core.property_owner[11] = 1
+    core.phase = PHASE_PROPERTY_MANAGE
+    core.active_decision_player = 0
+
+    actor = ActorNetwork(obs_dim=500)
+    obs_np = core.get_actor_observation(0)
+    masks = core.get_action_masks(0)
+    obs_t = torch.tensor(obs_np, dtype=torch.float32).unsqueeze(0)
+    masks_t = {k: torch.tensor(masks[k], dtype=torch.int8).unsqueeze(0) for k in masks}
+
+    # Explicit trade execution path: property=160 (Pass physical mgmt) + trade_req_prop=11
+    actions = {
+        "core": torch.tensor([0]),
+        "auction": torch.tensor([0]),
+        "property": torch.tensor([160]),
+        "trade_target": torch.tensor([0]),
+        "trade_offer_prop": torch.tensor([1]),
+        "trade_offer_cash": torch.tensor([1]),
+        "trade_req_prop": torch.tensor([11]),
+        "trade_req_cash": torch.tensor([0]),
+        "trade_response": torch.tensor([0]),
+    }
+
+    actor.zero_grad()
+    lp, ent = actor.evaluate_actions(obs_t, masks_t, actions)
+    loss = -(lp + 0.01 * ent).mean()
+    loss.backward()
+
+    # Core trade proposal heads MUST have strictly non-zero gradient!
+    assert actor.head_trade_offer_prop.weight.grad.norm().item() > 0.0
+    assert actor.head_trade_req_prop.weight.grad.norm().item() > 0.0
+    assert actor.head_trade_offer_cash.weight.grad.norm().item() > 0.0
+    assert actor.head_trade_req_cash.weight.grad.norm().item() > 0.0
+    # trade_target is auto-routed when req_prop < 40 so it should have zero unused gradient
+    assert actor.head_trade_target.weight.grad.norm().item() == 0.0
+
+    # Verify core.step() also executes the exact same trade
+    act_py = {k: int(v.item()) for k, v in actions.items()}
+    core.step({"player_0": act_py})
+    assert core.phase == PHASE_TRADE_RESPONSE
+    assert core.trades_proposed_count == 1
+
+
+def test_bankruptcy_even_house_liquidation_and_hotel_shortage():
+    """Verify _resolve_bankruptcy liquidates houses evenly and respects bank housing scarcity."""
+    # Case A: Even-selling liquidation on Dark Blue ([2, 2] -> [1, 1])
+    core = MonopolyCore(seed=99)
+    core.reset()
+    core.property_owner[37] = 0
+    core.property_owner[39] = 0
+    core.property_houses[37] = 2
+    core.property_houses[39] = 2
+    core.bank_houses = 28
+    core.cash[0] = -150
+
+    core._resolve_bankruptcy(0)
+
+    assert core.cash[0] == 50
+    assert core.property_houses[37] == 1
+    assert core.property_houses[39] == 1
+    assert abs(core.property_houses[37] - core.property_houses[39]) <= 1
+    assert core.bank_houses == 30
+
+    # Case B: Hotel liquidation under Bank housing shortage ([5, 5] with bank_houses=1 -> [0, 0])
+    core2 = MonopolyCore(seed=100)
+    core2.reset()
+    core2.property_owner[37] = 0
+    core2.property_owner[39] = 0
+    core2.property_houses[37] = 5
+    core2.property_houses[39] = 5
+    core2.bank_hotels = 10
+    core2.bank_houses = 1
+    core2.cash[0] = -150
+
+    core2._resolve_bankruptcy(0)
+
+    assert core2.property_houses[37] == 0
+    assert core2.property_houses[39] == 0
+    assert core2.bank_hotels == 12
+    assert core2.bank_houses == 1
+    assert core2.cash[0] == 850
+
+
