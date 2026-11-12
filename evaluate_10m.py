@@ -22,7 +22,12 @@ def load_policy(path):
     actor.eval()
     return actor
 
-trained_policy = load_policy("checkpoints/main_iter_02442.pt")
+import glob
+
+latest_ckpts = sorted(glob.glob("checkpoints/main_iter_*.pt"))
+latest_ckpt = latest_ckpts[-1] if len(latest_ckpts) > 1 else "checkpoints/main_iter_00000.pt"
+print(f"Loading trained policy from: {latest_ckpt}")
+trained_policy = load_policy(latest_ckpt)
 untrained_policy = load_policy("checkpoints/main_iter_00000.pt")
 
 def evaluate_lineup(policies, num_games=5):

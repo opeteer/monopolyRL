@@ -58,6 +58,39 @@ TRADE_CASH_BRACKETS = [0, 25, 50, 100, 150, 200, 250, 300, 400, 500]
 # Default Tournament Agent Names (P0: Luke, P1: Graham, P2: Pieter, P3: Allison)
 DEFAULT_PLAYER_NAMES = ["Luke", "Graham", "Pieter", "Allison"]
 
+# Precomputed static lookup tables for high-performance zero-overhead rollout
+TILE_PRICES = tuple(float(TILES_DATA[p]["price"]) if "price" in TILES_DATA[p] else 0.0 for p in range(40))
+TILE_MORTGAGES = tuple(float(TILES_DATA[p].get("mortgage", 0.0)) for p in range(40))
+TILE_HOUSE_COSTS = tuple(float(TILES_DATA[p].get("house_cost", 0.0)) for p in range(40))
+PURCHASABLE_TILES_TUPLE = tuple(PURCHASABLE_TILES)
+COLOR_GROUPS_MONOPOLY = tuple(
+    (tuple(tiles), float(GROUP_MONOPOLY_BONUS.get(grp_name, 0.0)), grp_name not in ("RAILROAD", "UTILITY"))
+    for grp_name, tiles in COLOR_GROUPS.items()
+)
+STREET_GROUPS_SYNERGY = tuple(
+    (grp_name, tuple(tiles), float(len(tiles)))
+    for grp_name, tiles in COLOR_GROUPS.items()
+    if grp_name not in ("RAILROAD", "UTILITY")
+)
+DICE_PROB_TUPLE = tuple((d, DICE_PROBABILITIES[d]) for d in DICE_OUTCOMES)
+
+INACTIVE_MASKS_TEMPLATE = {
+    "core": np.array([1, 0, 0, 0, 0, 0], dtype=np.int8),
+    "auction": np.array([1, 0, 0, 0, 0, 0, 0], dtype=np.int8),
+    "property": np.zeros(161, dtype=np.int8),
+    "trade_target": np.array([1, 0, 0], dtype=np.int8),
+    "trade_offer_prop": np.zeros(41, dtype=np.int8),
+    "trade_offer_cash": np.zeros(10, dtype=np.int8),
+    "trade_req_prop": np.zeros(41, dtype=np.int8),
+    "trade_req_cash": np.zeros(10, dtype=np.int8),
+    "trade_response": np.array([1, 0], dtype=np.int8),
+}
+INACTIVE_MASKS_TEMPLATE["property"][160] = 1
+INACTIVE_MASKS_TEMPLATE["trade_offer_prop"][40] = 1
+INACTIVE_MASKS_TEMPLATE["trade_offer_cash"][0] = 1
+INACTIVE_MASKS_TEMPLATE["trade_req_prop"][40] = 1
+INACTIVE_MASKS_TEMPLATE["trade_req_cash"][0] = 1
+
 
 class MonopolyCore:
     """Official Tournament-Grade Monopoly Game State Machine."""
@@ -201,25 +234,20 @@ class MonopolyCore:
         # Term 2: Property equity + House/Hotel development value
         term2_prop = 0.0
         term2_house = 0.0
-        owned_props = [p for p in PURCHASABLE_TILES if self.property_owner[p] == player_id]
-        for p in owned_props:
-            tile = TILES_DATA[p]
-            v_base = float(tile["price"])
-            h_p = self.property_houses[p]
-            v_bld = float(h_p * tile.get("house_cost", 0))
-            m_p = 1.0 if self.property_mortgaged[p] else 0.0
-            v_mtg = float(tile.get("mortgage", 0))
-            term2_prop += (v_base - m_p * v_mtg)
-            term2_house += v_bld
+        for p in PURCHASABLE_TILES_TUPLE:
+            if self.property_owner[p] == player_id:
+                m_p = 1.0 if self.property_mortgaged[p] else 0.0
+                term2_prop += (TILE_PRICES[p] - m_p * TILE_MORTGAGES[p])
+                term2_house += float(self.property_houses[p] * TILE_HOUSE_COSTS[p])
         term2 = (self.w2 * term2_prop) + (self.w_house * term2_house)
 
         # Term 3: Monopoly complete groups
         term3_sum = 0.0
         street_monopolies_count = 0
-        for grp_name, tiles in COLOR_GROUPS.items():
+        for tiles, bonus, is_street in COLOR_GROUPS_MONOPOLY:
             if all(self.property_owner[t] == player_id for t in tiles):
-                term3_sum += GROUP_MONOPOLY_BONUS.get(grp_name, 0.0)
-                if grp_name not in ("RAILROAD", "UTILITY"):
+                term3_sum += bonus
+                if is_street:
                     street_monopolies_count += 1
         term3 = self.w3 * term3_sum
 
@@ -227,8 +255,7 @@ class MonopolyCore:
         pos_i = self.position[player_id]
         term4_sum = 0.0
         if not self.in_jail[player_id]:
-            for d in DICE_OUTCOMES:
-                prob = DICE_PROBABILITIES[d]
+            for d, prob in DICE_PROB_TUPLE:
                 target_tile = (pos_i + d) % 40
                 owner = self.property_owner[target_tile]
                 if owner != -1 and owner != player_id and not self.bankrupt[owner] and not self.property_mortgaged[target_tile]:
@@ -238,11 +265,9 @@ class MonopolyCore:
 
         # Term 5: Color-matching synergy quadratic potential
         term5_sum = 0.0
-        for grp_name, tiles in COLOR_GROUPS.items():
-            if grp_name in ("RAILROAD", "UTILITY"):
-                continue
+        for grp_name, tiles, n_tiles in STREET_GROUPS_SYNERGY:
             owned_count = sum(1 for t in tiles if self.property_owner[t] == player_id)
-            frac = owned_count / float(len(tiles))
+            frac = owned_count / n_tiles
             term5_sum += (frac ** 2) * 50.0
         term5 = self.w_syn * term5_sum
 
@@ -261,22 +286,17 @@ class MonopolyCore:
         - 32 dims: Fraction of color group owned (4 players x 8 street color groups)
         - 32 dims: Indicator whether player needs exactly 1 missing piece held by opponent (4 players x 8 color groups)
         """
-        street_groups = [
-            grp for grp in COLOR_GROUPS if grp not in ("RAILROAD", "UTILITY")
-        ]
         fractions = []
         needs_one = []
 
-        for grp in street_groups:
-            tiles = COLOR_GROUPS[grp]
-            n_tiles = len(tiles)
+        for grp, tiles, n_tiles in STREET_GROUPS_SYNERGY:
             owners = [self.property_owner[t] for t in tiles]
 
             for pl in range(4):
                 c = sum(1 for o in owners if o == pl)
-                fractions.append(c / float(n_tiles))
+                fractions.append(c / n_tiles)
                 # Needs one: pl has n_tiles - 1, and missing tile is held by an opponent
-                if c == n_tiles - 1:
+                if c == int(n_tiles - 1):
                     missing_owner = next(o for o in owners if o != pl)
                     if missing_owner != -1:
                         needs_one.append(1.0)
@@ -687,11 +707,15 @@ class MonopolyCore:
 
         Returns binary masks for each factorized head:
         - core: (6,)
-        - auction: (5,)
-        - property: (160,)
+        - auction: (7,)
+        - property: (161,)
         - trade: (3 + 41 + 10 + 41 + 10 + 2 = 107,)
         Invalid actions have 0, valid actions have 1.
         """
+        # Fast path for inactive players or game over (zero array allocations)
+        if player_id != self.active_decision_player or self.bankrupt[player_id] or self.phase == PHASE_GAME_OVER:
+            return {k: v.copy() for k, v in INACTIVE_MASKS_TEMPLATE.items()}
+
         mask_core = np.zeros(6, dtype=np.int8)
         mask_auction = np.zeros(7, dtype=np.int8)
         mask_property = np.zeros(161, dtype=np.int8)
@@ -703,29 +727,6 @@ class MonopolyCore:
         mask_trade_req_prop = np.zeros(41, dtype=np.int8)
         mask_trade_req_cash = np.zeros(10, dtype=np.int8)
         mask_trade_response = np.zeros(2, dtype=np.int8)
-
-        # Default fallback for inactive players or game over
-        if player_id != self.active_decision_player or self.bankrupt[player_id] or self.phase == PHASE_GAME_OVER:
-            mask_core[ACT_CORE_ROLL_PASS] = 1
-            mask_auction[ACT_AUC_FOLD] = 1
-            mask_property[160] = 1  # 160 = Explicit Pass / Done
-            mask_trade_target[0] = 1
-            mask_trade_offer_prop[40] = 1  # 40 = No property
-            mask_trade_offer_cash[0] = 1   # 0 cash
-            mask_trade_req_prop[40] = 1
-            mask_trade_req_cash[0] = 1
-            mask_trade_response[0] = 1     # Decline
-            return {
-                "core": mask_core,
-                "auction": mask_auction,
-                "property": mask_property,
-                "trade_target": mask_trade_target,
-                "trade_offer_prop": mask_trade_offer_prop,
-                "trade_offer_cash": mask_trade_offer_cash,
-                "trade_req_prop": mask_trade_req_prop,
-                "trade_req_cash": mask_trade_req_cash,
-                "trade_response": mask_trade_response,
-            }
 
         # 1. PHASE_ROLL
         if self.phase == PHASE_ROLL:
