@@ -112,11 +112,12 @@ class RolloutBuffer:
         """Computes Generalized Advantage Estimation (GAE) across all agents."""
         gae = torch.zeros((self.num_envs, self.num_agents), dtype=torch.float32, device=self.device)
         for t in reversed(range(self.buffer_size)):
+            # self.dones[t] stores whether transition t terminated; never bootstrap or leak across reset boundary
+            next_non_terminal = 1.0 - self.dones[t]
             if t == self.buffer_size - 1:
-                next_non_terminal = 1.0 - last_dones
                 next_val = last_values
+                next_non_terminal = 1.0 - last_dones
             else:
-                next_non_terminal = 1.0 - self.dones[t + 1]
                 next_val = self.values[t + 1]
 
             delta = self.rewards[t] + self.gamma * next_val * next_non_terminal - self.values[t]

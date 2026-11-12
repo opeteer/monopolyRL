@@ -102,10 +102,15 @@ class MAPPOTrainer:
                     total_policy_loss += policy_loss.item()
                     total_entropy_loss += entropy.mean().item()
 
-                # ----------------- 2. CENTRALIZED CRITIC UPDATE -----------------
+                # ----------------- 2. CENTRALIZED CRITIC UPDATE (Clipped Value Loss) -----------------
                 # Critic evaluates global_state: (batch_size, state_dim) -> (batch_size, 4)
                 predicted_values = self.critic(global_state)
-                value_loss = 0.5 * ((predicted_values - returns) ** 2).mean()
+                value_pred_clipped = old_values + torch.clamp(
+                    predicted_values - old_values, -self.clip_param, self.clip_param
+                )
+                vf_loss_unclipped = (predicted_values - returns) ** 2
+                vf_loss_clipped = (value_pred_clipped - returns) ** 2
+                value_loss = 0.5 * torch.max(vf_loss_unclipped, vf_loss_clipped).mean()
 
                 self.optimizer_critic.zero_grad()
                 value_loss.backward()

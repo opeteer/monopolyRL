@@ -101,12 +101,13 @@ class MonopolyCore:
         max_rounds: Optional[int] = None,
         gamma: float = 0.997,
         w1: float = 0.050,
-        w2: float = 0.005,
+        w2: float = 0.0060,
         w3: float = 0.008,
         w4: float = 0.0005,
         w_syn: float = 0.020,
         beta_starve: float = 3.5,
-        w_house: float = 0.015,
+        w_house: float = 0.012,
+        w_cash: float = 0.0035,
         allow_trade: bool = True,
         include_synergy_obs: bool = True,
         player_names: Optional[List[str]] = None,
@@ -118,13 +119,14 @@ class MonopolyCore:
         self.player_names = list(player_names) if player_names is not None else list(DEFAULT_PLAYER_NAMES)
 
         # Well-scaled, Anti-Exploit Offensive Arms-Race PBRS Weights
-        self.w1 = w1           # Cash log potential (0.050)
-        self.w2 = w2           # Property equity potential (0.005: buying unowned land is ALWAYS positive)
+        self.w1 = w1           # Cash log safety potential (0.050)
+        self.w2 = w2           # Property equity potential (0.0060: balanced against linear cash)
         self.w3 = w3           # Monopoly completion bonus potential (0.008: +0.96 to +7.36)
         self.w4 = w4           # Rent hazard paranoia (0.0005: low defensive paranoia)
         self.w_syn = w_syn     # Color-matching synergy quadratic potential (0.020)
         self.beta_starve = beta_starve  # Round-based monopoly starvation penalty (3.5: non-exploitable)
-        self.w_house = w_house # Building house/hotel equity multiplier (0.015: strong development reward)
+        self.w_house = w_house # Building house/hotel equity multiplier (0.012: strong development reward)
+        self.w_cash = w_cash   # Linear cash equity weight (0.0035: prices 10% mortgage burn & auction/trade cash fairly)
         self.allow_trade = allow_trade
         self.include_synergy_obs = include_synergy_obs
 
@@ -235,9 +237,9 @@ class MonopolyCore:
         if self.bankrupt[player_id]:
             return 0.0
 
-        # Term 1: w1 * ln(c_i + 1)
+        # Term 1: w1 * ln(c_i + 1) + w_cash * c_i (log liquidity safety + linear cash value)
         c_i = max(0, self.cash[player_id])
-        term1 = self.w1 * math.log(c_i + 1.0)
+        term1 = self.w1 * math.log(c_i + 1.0) + self.w_cash * float(c_i)
 
         # Term 2: Property equity + House/Hotel development value
         term2_prop = 0.0

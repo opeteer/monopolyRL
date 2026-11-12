@@ -13,6 +13,7 @@ Features:
 
 import os
 import sys
+import math
 import argparse
 import time
 import json
@@ -71,27 +72,28 @@ def parse_args():
     parser.add_argument("--checkpoint_interval", type=int, default=defaults.get("checkpoint_interval", 25), help="Iterations between checkpoints")
     parser.add_argument("--eval_interval", type=int, default=defaults.get("eval_interval", 10), help="Iterations between league evaluations")
     parser.add_argument("--checkpoint_dir", type=str, default=None, help="Custom checkpoint directory (overrides session dir if set)")
-    parser.add_argument("--entropy_coef", type=float, default=defaults.get("entropy_coef", 0.01), help="PPO entropy loss coefficient")
-    parser.add_argument("--entropy_min", type=float, default=defaults.get("entropy_min", 0.001), help="Minimum entropy coefficient when annealing")
-    parser.add_argument("--no_entropy_anneal", action="store_true", default=defaults.get("no_entropy_anneal", False), help="Disable linear entropy annealing")
+    parser.add_argument("--entropy_coef", type=float, default=defaults.get("entropy_coef", 0.004), help="PPO entropy loss coefficient")
+    parser.add_argument("--entropy_min", type=float, default=defaults.get("entropy_min", 0.0002), help="Minimum entropy coefficient when annealing")
+    parser.add_argument("--no_entropy_anneal", action="store_true", default=defaults.get("no_entropy_anneal", False), help="Disable cosine entropy annealing")
     parser.add_argument("--league_rollout_fraction", type=float, default=defaults.get("league_rollout_fraction", 0.25), help="Fraction of environments reserved for heterogeneous league rollout")
     parser.add_argument("--curriculum", action="store_true", default=defaults.get("curriculum", True), help="Enable 2-phase curriculum learning")
     parser.add_argument("--no_curriculum", action="store_false", dest="curriculum", help="Disable curriculum learning")
     parser.add_argument("--curriculum_phase_2_frac", type=float, default=defaults.get("curriculum_phase_2_frac", 0.15), help="Fraction of total iterations to unlock Phase 2 full trading")
     parser.add_argument("--gamma", type=float, default=defaults.get("gamma", 0.997), help="GAE discount factor")
     parser.add_argument("--gae_lambda", type=float, default=defaults.get("gae_lambda", 0.97), help="GAE lambda")
-    parser.add_argument("--lr_actor", type=float, default=defaults.get("lr_actor", 3e-4), help="Actor learning rate")
+    parser.add_argument("--lr_actor", type=float, default=defaults.get("lr_actor", 2.5e-4), help="Actor learning rate")
     parser.add_argument("--lr_critic", type=float, default=defaults.get("lr_critic", 5e-4), help="Critic learning rate")
     parser.add_argument("--ppo_epochs", type=int, default=defaults.get("ppo_epochs", 4), help="PPO optimization epochs per iteration")
     parser.add_argument("--num_mini_batches", type=int, default=defaults.get("num_mini_batches", 4), help="Number of mini-batches per epoch")
-    parser.add_argument("--clip_param", type=float, default=defaults.get("clip_param", 0.2), help="PPO clip parameter (default: 0.2)")
+    parser.add_argument("--clip_param", type=float, default=defaults.get("clip_param", 0.15), help="PPO clip parameter (default: 0.15)")
     parser.add_argument("--w1", type=float, default=defaults.get("w1", 0.050), help="PBRS cash log potential weight")
-    parser.add_argument("--w2", type=float, default=defaults.get("w2", 0.005), help="PBRS property equity weight")
+    parser.add_argument("--w2", type=float, default=defaults.get("w2", 0.0060), help="PBRS property equity weight")
     parser.add_argument("--w3", type=float, default=defaults.get("w3", 0.008), help="PBRS monopoly completion bonus weight")
     parser.add_argument("--w4", type=float, default=defaults.get("w4", 0.0005), help="PBRS rent hazard paranoia weight")
     parser.add_argument("--w_syn", type=float, default=defaults.get("w_syn", 0.020), help="PBRS color synergy potential weight")
     parser.add_argument("--beta_starve", type=float, default=defaults.get("beta_starve", 3.5), help="PBRS round-based monopoly starvation penalty weight")
-    parser.add_argument("--w_house", type=float, default=defaults.get("w_house", 0.015), help="PBRS house/hotel building equity weight")
+    parser.add_argument("--w_house", type=float, default=defaults.get("w_house", 0.012), help="PBRS house/hotel building equity weight")
+    parser.add_argument("--w_cash", type=float, default=defaults.get("w_cash", 0.0035), help="PBRS linear cash equity weight")
     parser.add_argument("--resume", type=str, default=None, help="Resume training: 'latest' or path to checkpoint file")
     parser.add_argument("--resume_checkpoint", type=str, default=None, help="Legacy alias for --resume")
     parser.add_argument("--device", type=str, default=defaults.get("device", "cuda" if torch.cuda.is_available() else "cpu"), help="Device")
@@ -162,6 +164,7 @@ def main():
             w_syn=args.w_syn,
             beta_starve=args.beta_starve,
             w_house=args.w_house,
+            w_cash=args.w_cash,
             allow_trade=not args.curriculum,
         )
         for i in range(args.num_envs)
@@ -317,10 +320,11 @@ def main():
             if session_mgr.interrupted:
                 break
 
-            # Dynamic entropy annealing
+            # Dynamic cosine entropy annealing (sustains exploration early, enforces crisp economic play late)
             if not args.no_entropy_anneal and args.num_iterations > 1:
-                frac = (iteration - 1) / float(args.num_iterations - 1)
-                current_ent_coef = args.entropy_coef - frac * (args.entropy_coef - args.entropy_min)
+                frac = min(1.0, max(0.0, (iteration - 1) / float(args.num_iterations - 1)))
+                cosine_decay = 0.5 * (1.0 + math.cos(math.pi * frac))
+                current_ent_coef = args.entropy_min + cosine_decay * (args.entropy_coef - args.entropy_min)
                 trainer.set_entropy_coef(current_ent_coef)
 
             # Curriculum Learning toggle

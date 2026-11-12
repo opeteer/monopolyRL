@@ -589,4 +589,55 @@ def test_rejected_trade_cooldown_prevents_identical_spam():
     assert masks_unlocked["trade_req_prop"][3] == 1, "Cooldown should expire after 5 rounds"
 
 
+def test_gae_terminal_boundary_does_not_leak_across_reset():
+    """Verify compute_gae cuts off bootstrap at dones[t] and preserves credit up to t-1."""
+    from monopoly_marl.models.storage import RolloutBuffer
+
+    gamma = 0.99
+    gae_lambda = 0.95
+    buf = RolloutBuffer(buffer_size=3, num_envs=1, gamma=gamma, gae_lambda=gae_lambda)
+    buf.rewards[:, 0, 0] = torch.tensor([0.0, 5.0, 0.0])
+    buf.dones[:, 0, 0] = torch.tensor([0.0, 1.0, 0.0])
+    buf.values[:, 0, 0] = torch.tensor([1.0, 1.0, 2.0])
+
+    buf.compute_gae(last_values=torch.tensor([[2.0, 0.0, 0.0, 0.0]]), last_dones=torch.tensor([[0.0, 0.0, 0.0, 0.0]]))
+
+    # Terminal step t=1 must NOT bootstrap next episode V(s_2)=2.0: A_1 = 5.0 - 1.0 = 4.0
+    assert abs(buf.advantages[1, 0, 0].item() - 4.0) < 1e-5
+    # Pre-terminal step t=0 must receive full discounted terminal advantage from t=1
+    expected_a0 = (0.0 + gamma * 1.0 - 1.0) + gamma * gae_lambda * 4.0
+    assert abs(buf.advantages[0, 0, 0].item() - expected_a0) < 1e-5
+
+
+def test_pbrs_cash_vs_property_fair_pricing():
+    """Verify linear w_cash properly penalizes mortgage burn & >2x auction overbids while keeping unowned buys positive."""
+    core = MonopolyCore(seed=42)
+    p0 = core._compute_potential(0)
+
+    # 1. Unowned buy at list price ($100 Oriental) remains strongly positive (> 0.30)
+    core.property_owner[6] = 0
+    core.cash[0] -= 100
+    p_buy = core._compute_potential(0)
+    assert p_buy - p0 > 0.30
+
+    # 2. Mortgage -> Unmortgage round trip ($175 mortgage -> $192 unmortgage = -$17 burned) produces clear penalty
+    core2 = MonopolyCore(seed=42)
+    core2.property_owner[37] = 0  # Park Place (mortgage=$175)
+    core2.cash[0] = 1000
+    before_cycle = core2._compute_potential(0)
+    core2.cash[0] -= int(175 * 0.10)  # Net cash lost on 10% mortgage->unmortgage round trip
+    after_cycle = core2._compute_potential(0)
+    assert after_cycle - before_cycle < -0.05
+
+    # 3. Overpaying $430 for non-monopoly $200 property (B. & O. Railroad) must be negative
+    core3 = MonopolyCore(seed=42)
+    core3.cash[0] = 1500
+    before_auc = core3._compute_potential(0)
+    core3.property_owner[25] = 0
+    core3.cash[0] -= 430
+    after_auc = core3._compute_potential(0)
+    assert after_auc - before_auc < 0.0, f"Overpaying >2x on non-monopoly deed must reduce potential, got {after_auc - before_auc}"
+
+
+
 
