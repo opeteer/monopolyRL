@@ -16,6 +16,9 @@ from typing import Dict, List, Tuple, Optional, Any, Set
 import numpy as np
 import random
 import math
+import os
+import time
+import hashlib
 
 from monopoly_marl.engine.board_data import (
     TILES_DATA, COLOR_GROUPS, TILE_TO_GROUP, GROUP_MONOPOLY_BONUS,
@@ -92,6 +95,30 @@ INACTIVE_MASKS_TEMPLATE["trade_req_prop"][40] = 1
 INACTIVE_MASKS_TEMPLATE["trade_req_cash"][0] = 1
 
 
+def generate_hardware_entropy_seed() -> int:
+    """Generates a cryptographically strong, high-entropy seed derived from real hardware fluctuations.
+
+    Entropy sources:
+    1. OS kernel cryptographic hardware entropy pool (/dev/urandom, CPU RDRAND/RDSEED, hardware interrupts, thermal noise)
+    2. Sub-nanosecond CPU cycle counter fluctuation (time.perf_counter_ns)
+    3. Monotonic system clock jitter (time.monotonic_ns)
+    4. Wall clock timing jitter (time.time_ns)
+    5. Process and runtime scheduling jitter (os.getpid)
+
+    Hashed with SHA-256 and truncated to 32-bit unsigned integer (0 <= seed < 2**32)
+    suitable for all standard PRNGs.
+    """
+    hw_bytes = os.urandom(32)
+    perf_bytes = time.perf_counter_ns().to_bytes(8, byteorder="big", signed=False)
+    mono_bytes = time.monotonic_ns().to_bytes(8, byteorder="big", signed=False)
+    time_bytes = time.time_ns().to_bytes(8, byteorder="big", signed=False)
+    pid_bytes = os.getpid().to_bytes(4, byteorder="big", signed=False)
+
+    entropy_payload = hw_bytes + perf_bytes + mono_bytes + time_bytes + pid_bytes
+    digest = hashlib.sha256(entropy_payload).digest()
+    return int.from_bytes(digest[:4], byteorder="big", signed=False)
+
+
 class MonopolyCore:
     """Official Tournament-Grade Monopoly Game State Machine."""
 
@@ -112,6 +139,9 @@ class MonopolyCore:
         include_synergy_obs: bool = True,
         player_names: Optional[List[str]] = None,
     ):
+        if seed is None:
+            seed = generate_hardware_entropy_seed()
+        self.current_seed = seed
         self.rng = random.Random(seed)
         self.np_rng = np.random.default_rng(seed)
         self.max_rounds = max_rounds  # None indicates unbounded horizon (infinite survival)
@@ -145,10 +175,12 @@ class MonopolyCore:
 
     def reset(self, seed: Optional[int] = None) -> Dict[str, Any]:
         """Resets the environment to initial tournament starting state."""
-        if seed is not None:
-            self.rng.seed(seed)
-            self.np_rng = np.random.default_rng(seed)
+        if seed is None:
+            seed = generate_hardware_entropy_seed()
 
+        self.current_seed = seed
+        self.rng.seed(seed)
+        self.np_rng = np.random.default_rng(seed)
         self.deck_manager.reset(seed)
 
         # 4 Players: 0, 1, 2, 3
@@ -855,7 +887,24 @@ class MonopolyCore:
                         if grp and tile["type"] == TILE_STREET:
                             has_houses = any(self.property_houses[t] > 0 for t in COLOR_GROUPS[grp])
                         if not has_houses:
-                            mask_property[80 + p] = 1
+                            # Liquidity-aware & strategic leverage mortgage condition:
+                            # Only permit voluntary mortgaging during management if:
+                            # 1. Player has tight cash liquidity (< $250), OR
+                            # 2. Player holds a complete street monopoly and can develop houses on it
+                            has_monopoly = any(
+                                all(self.property_owner[t] == player_id for t in tiles)
+                                for g_name, tiles in COLOR_GROUPS.items()
+                                if g_name not in ("RAILROAD", "UTILITY")
+                            )
+                            can_develop_monopoly = any(
+                                TILES_DATA[t]["type"] == TILE_STREET
+                                and self.property_owner[t] == player_id
+                                and self.property_houses[t] < 5
+                                for t in PURCHASABLE_TILES
+                            ) if has_monopoly else False
+
+                            if self.cash[player_id] < 250 or (has_monopoly and can_develop_monopoly):
+                                mask_property[80 + p] = 1
 
                     # UNMORTGAGE
                     if self.property_mortgaged[p] and p not in mortgaged_turn:
@@ -1095,7 +1144,7 @@ class MonopolyCore:
             )
 
         elif self.phase == PHASE_TRADE_RESPONSE:
-            self._handle_trade_response(p, trade_response)
+            self._handle_trade_response(p, trade_response, env_rewards)
 
         # ----------------- CHECK BANKRUPTCY & VICTORY -----------------
         for pl in range(4):
@@ -1586,6 +1635,13 @@ class MonopolyCore:
         elif offer_cash == 0:
             # Pure beg: offering neither property nor cash
             return False
+        else:
+            # Pure cash purchase: If requesting a property without offering a property in return,
+            # cash offered must be at least the property's statutory mortgage value
+            if 0 <= req_prop < 40:
+                min_cash_required = TILES_DATA[req_prop]["mortgage"]
+                if offer_cash < min_cash_required:
+                    return False
 
         if req_prop >= 40 and req_cash == 0:
             # Pure gift: giving away property (and/or cash) for nothing in return
@@ -1607,7 +1663,7 @@ class MonopolyCore:
         self.event_log.append(f"TRADE PROPOSAL: {self.get_player_name(initiator)} -> {self.get_player_name(target)}: Offer(Prop={offer_prop if offer_prop<40 else 'None'}, Cash=${offer_cash}) for Request(Prop={req_prop if req_prop<40 else 'None'}, Cash=${req_cash}).")
         return True
 
-    def _handle_trade_response(self, target: int, trade_response: int):
+    def _handle_trade_response(self, target: int, trade_response: int, env_rewards: Optional[List[float]] = None):
         """Processes acceptance or rejection of bilateral trade."""
         init = self.current_player
         if self.pending_trade:
@@ -1620,6 +1676,17 @@ class MonopolyCore:
                 req_p = trade["req_prop"]
 
                 if self.cash[target] >= req_cash and self.cash[init] >= offer_cash:
+                    # Helper to track street monopolies
+                    def _get_street_monopolies(pl: int) -> Set[str]:
+                        return {
+                            grp_name for grp_name, tiles in COLOR_GROUPS.items()
+                            if grp_name not in ("RAILROAD", "UTILITY")
+                            and all(self.property_owner[t] == pl for t in tiles)
+                        }
+
+                    init_mono_before = _get_street_monopolies(init)
+                    target_mono_before = _get_street_monopolies(target)
+
                     # Atomic transfer
                     self.cash[init] -= offer_cash
                     self.cash[target] += offer_cash
@@ -1633,8 +1700,25 @@ class MonopolyCore:
 
                     self.trades_accepted_count += 1
                     self.event_log.append(f"TRADE ACCEPTED between {self.get_player_name(init)} and {self.get_player_name(target)}!")
+
+                    # Reward shaping for successful monopoly-advancing trades
+                    init_mono_after = _get_street_monopolies(init)
+                    target_mono_after = _get_street_monopolies(target)
+
+                    init_completed_mono = len(init_mono_after) > len(init_mono_before)
+                    target_completed_mono = len(target_mono_after) > len(target_mono_before)
+
+                    if env_rewards is not None:
+                        if init_completed_mono:
+                            env_rewards[init] += 1.5
+                        if target_completed_mono:
+                            env_rewards[target] += 1.5
+                        if init_completed_mono and target_completed_mono:
+                            # Bilateral Win-Win Synergy bonus!
+                            env_rewards[init] += 1.0
+                            env_rewards[target] += 1.0
                 else:
-                    self.event_log.append(f"Trade failed due to insufficient funds.")
+                    self.event_log.append("Trade failed due to insufficient funds.")
             else:
                 trade = self.pending_trade
                 req_p = trade["req_prop"]
@@ -1644,6 +1728,10 @@ class MonopolyCore:
                 elif 0 <= offer_p < 40:
                     self.rejected_offer_prop_cooldown[(init, target, offer_p)] = self.round_count + 5
                 self.event_log.append(f"Trade REJECTED by {self.get_player_name(target)}.")
+
+                # Friction penalty on initiator for proposing a rejected trade
+                if env_rewards is not None:
+                    env_rewards[init] -= 0.15
 
         self.pending_trade = None
         is_double = getattr(self, "pending_manage_double", False)
@@ -1881,6 +1969,26 @@ class MonopolyCore:
                     src = self.goojf_sources[p].pop()
                     self.deck_manager.return_goojf(src)
 
+            # Clear pending trade if bankrupt player was involved
+            if self.pending_trade and (self.pending_trade["initiator"] == p or self.pending_trade["target"] == p):
+                self.pending_trade = None
+
+            # Remove bankrupt player from active auction bidders
+            if p in self.auction_active_bidders:
+                self.auction_active_bidders.remove(p)
+                if self.auction_highest_bidder == p:
+                    self.auction_highest_bidder = -1
+                    self.auction_highest_bid = 0
+
+            # Immediately end turn and rotate to next surviving player if bankrupt player was the active turn player
+            if self.current_player == p:
+                self.pending_manage_double = False
+                self.pending_auction_double = False
+                self.pending_is_double = False
+                self._end_turn()
+            elif self.active_decision_player == p:
+                self.active_decision_player = self.current_player
+
         self.last_creditor = None
 
     def _end_turn(self):
@@ -1891,6 +1999,11 @@ class MonopolyCore:
         self.manage_actions_this_turn = 0
         self.trade_proposals_this_turn = 0
         self._clear_turn_manage_guards()
+
+        # Check if all players are eliminated
+        if all(self.bankrupt):
+            self.phase = PHASE_GAME_OVER
+            return
 
         # Advance current_player to next non-bankrupt player
         prev_player = self.current_player

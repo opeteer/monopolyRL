@@ -151,11 +151,11 @@ def main():
     print(f"Heterogeneous League Rollout: {num_league_envs}/{args.num_envs} envs ({args.league_rollout_fraction * 100:.0f}%)")
     print(f"Curriculum 2-Phase Learning: {'Enabled (Phase 2 unlock at ' + str(int(args.curriculum_phase_2_frac * 100)) + '%)' if args.curriculum else 'Disabled'}")
 
-    # Environment Configurations
+    # Environment Configurations (Seed driven by hardware fluctuation entropy)
     env_configs = [
         dict(
             max_rounds=120,
-            seed=42 + i,
+            seed=None,
             gamma=args.gamma,
             w1=args.w1,
             w2=args.w2,
@@ -617,9 +617,9 @@ def main():
                 )
                 print(f"--> [Checkpoint Saved] {ckpt_path} (Total Steps: {total_steps_executed:,})")
 
-            # League Evaluation Match
+            # League Evaluation Match (Driven by hardware fluctuation entropy)
             if iteration % args.eval_interval == 0 and league_mgr.historical_records:
-                eval_env = MonopolyParallelEnv(max_rounds=100, seed=1000 + iteration)
+                eval_env = MonopolyParallelEnv(max_rounds=100, seed=None)
                 eval_obs, eval_infos = eval_env.reset()
                 lineup_policies, lineup_records = league_mgr.sample_match_lineup(main_actor, exploiter_actor, mode="league")
 

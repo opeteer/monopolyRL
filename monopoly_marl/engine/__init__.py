@@ -2,7 +2,7 @@
 
 from monopoly_marl.engine.board_data import TILES_DATA, COLOR_GROUPS, PURCHASABLE_TILES
 from monopoly_marl.engine.cards_data import CardDeckManager
-from monopoly_marl.engine.monopoly_core import MonopolyCore
+from monopoly_marl.engine.monopoly_core import MonopolyCore, generate_hardware_entropy_seed
 from monopoly_marl.engine.pettingzoo_wrapper import MonopolyParallelEnv
 
 __all__ = [
@@ -12,4 +12,5 @@ __all__ = [
     "CardDeckManager",
     "MonopolyCore",
     "MonopolyParallelEnv",
+    "generate_hardware_entropy_seed",
 ]

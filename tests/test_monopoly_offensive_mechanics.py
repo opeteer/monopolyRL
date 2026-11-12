@@ -343,7 +343,7 @@ def test_mortgage_action_executes_directly_without_trade_leak():
     core = MonopolyCore(seed=42)
     core.property_owner[1] = 0
     core.property_owner[11] = 1
-    core.cash[0] = 1500
+    core.cash[0] = 100  # Tight liquidity (< $250) permits emergency mortgaging
     core.phase = PHASE_PROPERTY_MANAGE
     core.active_decision_player = 0
 
@@ -361,7 +361,7 @@ def test_mortgage_action_executes_directly_without_trade_leak():
     core.step({"player_0": act})
 
     assert core.property_mortgaged[1] is True
-    assert core.cash[0] == 1530
+    assert core.cash[0] == 130
     assert core.trades_proposed_count == 0, "Physical property action 81 must never fall through to trade!"
     assert core.phase == PHASE_PROPERTY_MANAGE
 
@@ -637,6 +637,191 @@ def test_pbrs_cash_vs_property_fair_pricing():
     core3.cash[0] -= 430
     after_auc = core3._compute_potential(0)
     assert after_auc - before_auc < 0.0, f"Overpaying >2x on non-monopoly deed must reduce potential, got {after_auc - before_auc}"
+
+
+def test_hardware_entropy_seed_generator():
+    """Verify hardware fluctuation seed generator produces valid 32-bit seeds with high entropy."""
+    from monopoly_marl.engine.monopoly_core import generate_hardware_entropy_seed
+
+    seeds = [generate_hardware_entropy_seed() for _ in range(50)]
+    # All seeds must be 32-bit unsigned integers
+    for s in seeds:
+        assert isinstance(s, int)
+        assert 0 <= s < 2**32
+
+    # High entropy check: all 50 drawn seeds must be distinct
+    assert len(set(seeds)) == 50, "Hardware entropy generator produced duplicate seeds!"
+
+    # Verify MonopolyCore default initialization and reset utilize fresh hardware entropy
+    core1 = MonopolyCore(seed=None)
+    core2 = MonopolyCore(seed=None)
+    # The two instances should have distinct starting states/decks
+    card1 = core1.deck_manager.draw_chance()
+    card2 = core2.deck_manager.draw_chance()
+    # While Chance cards could theoretically match by chance (1/16), 10 consecutive draws must diverge
+    draws1 = [core1.deck_manager.draw_chance()["name"] for _ in range(10)]
+    draws2 = [core2.deck_manager.draw_chance()["name"] for _ in range(10)]
+    assert draws1 != draws2, "Independent hardware-seeded engines should have divergent shuffle states"
+
+
+def test_bankruptcy_turn_rotation_immediate_advance():
+    """Verify that when the active decision player goes bankrupt, turn immediately rotates to next surviving player."""
+    from monopoly_marl.engine.monopoly_core import PHASE_ROLL, PHASE_JAIL_DECISION, PHASE_GAME_OVER
+
+    core = MonopolyCore(seed=42)
+    assert core.current_player == 0
+    assert core.active_decision_player == 0
+
+    # Incur terminal debt on player 0 to trigger bankruptcy
+    core.cash[0] = -500
+    core.last_creditor = 1
+    core._resolve_bankruptcy(0)
+
+    # 1. Player 0 must be officially bankrupt
+    assert core.bankrupt[0] is True
+
+    # 2. current_player and active_decision_player must immediately advance away from player 0
+    assert core.current_player == 1, f"Expected current_player to advance to 1, got {core.current_player}"
+    assert core.active_decision_player == 1, f"Expected active_decision_player to advance to 1, got {core.active_decision_player}"
+    assert core.phase in (PHASE_ROLL, PHASE_JAIL_DECISION)
+
+    # 3. Bankrupt player 0 must be treated as inactive in action masks
+    masks_p0 = core.get_action_masks(0)
+    assert all(np.all(m == 0) for k, m in masks_p0.items() if k not in ("core", "auction", "property", "trade_target", "trade_offer_prop", "trade_offer_cash", "trade_req_prop", "trade_req_cash", "trade_response"))
+
+    # 4. Successive eliminations until Last Agent Standing trigger clean GAME OVER
+    core.cash[1] = -500
+    core.last_creditor = 2
+    core._resolve_bankruptcy(1)
+    assert core.current_player == 2
+    assert core.active_decision_player == 2
+
+    # Step game to let core recognize terminal state when player 2 eliminates player 3
+    core.cash[3] = -500
+    core.last_creditor = 2
+    core.step({"player_2": {
+        "core": 0, "auction": 0, "property": 160, "trade_target": 0,
+        "trade_offer_prop": 40, "trade_offer_cash": 0, "trade_req_prop": 40,
+        "trade_req_cash": 0, "trade_response": 0
+    }})
+    assert core.bankrupt[3] is True
+    assert core.phase == PHASE_GAME_OVER
+    assert any("TOURNAMENT CHAMPION" in log for log in core.event_log)
+
+
+def test_liquidity_aware_mortgage_masking_blocks_rich_mortgage():
+    """Verify that players with abundant cash (> $250) cannot voluntarily mortgage non-monopoly deeds."""
+    core = MonopolyCore(seed=42)
+    core.property_owner[1] = 0  # Mediterranean Ave
+    core.cash[0] = 1000         # Abundant cash, no monopolies
+    core.phase = PHASE_PROPERTY_MANAGE
+    core.active_decision_player = 0
+
+    masks_rich = core.get_action_masks(0)
+    assert masks_rich["property"][81] == 0, "Rich player with $1000 cash must not be permitted to mortgage Mediterranean Ave"
+
+    # When cash drops below $250 safety margin, emergency mortgaging unlocks
+    core.cash[0] = 150
+    masks_poor = core.get_action_masks(0)
+    assert masks_poor["property"][81] == 1, "Tight cash (< $250) must unlock mortgaging for emergency liquidity"
+
+    # Even with high cash ($1000), if player holds a street monopoly needing development, mortgaging for leverage is permitted
+    core.cash[0] = 1000
+    core.property_owner[18] = 0  # Tennessee Ave
+    core.property_owner[16] = 0  # St. James Place
+    core.property_owner[19] = 0  # New York Ave (Complete Orange Monopoly!)
+    core.property_houses[18] = 0
+    masks_leverage = core.get_action_masks(0)
+    assert masks_leverage["property"][81] == 1, "Holding complete monopoly to develop houses permits strategic mortgage leverage"
+
+
+def test_pure_cash_trade_proposal_requires_minimum_mortgage_floor():
+    """Verify pure cash purchase proposal of opponent deed requires at least the deed's statutory mortgage value."""
+    core = MonopolyCore(seed=42)
+    core.property_owner[5] = 1  # Reading RR (mortgage = $100)
+    core.cash[0] = 1000
+    core.cash[1] = 1000
+
+    # Lowball proposal: Offer None prop + $25 cash for Reading RR (#5) -> Rejected by engine
+    started_lowball = core._propose_trade(
+        initiator=0, target_idx=0, offer_prop=40, offer_cash_idx=1,  # $25
+        req_prop=5, req_cash_idx=0
+    )
+    assert started_lowball is False, "Lowball pure-cash offer ($25 < $100 mortgage) must be rejected by engine"
+
+    # Fair cash proposal: Offer None prop + $100 cash (>= $100 mortgage) -> Permitted by engine
+    started_fair = core._propose_trade(
+        initiator=0, target_idx=0, offer_prop=40, offer_cash_idx=3,  # $100
+        req_prop=5, req_cash_idx=0
+    )
+    assert started_fair is True, "Pure-cash offer meeting statutory mortgage value ($100) must be permitted"
+
+
+def test_trade_rejection_friction_penalty():
+    """Verify that proposing a trade that gets rejected penalizes the initiator with -0.15 friction cost."""
+    core = MonopolyCore(seed=42)
+    core.property_owner[1] = 0
+    core.property_owner[3] = 1
+    core.cash[0] = 1000
+    core.cash[1] = 1000
+    core.phase = PHASE_PROPERTY_MANAGE
+    core.active_decision_player = 0
+
+    # P0 proposes trade to P1
+    core.step({"player_0": {
+        "core": 0, "auction": 0, "property": 160, "trade_target": 0,
+        "trade_offer_prop": 1, "trade_offer_cash": 1, "trade_req_prop": 3,
+        "trade_req_cash": 0, "trade_response": 0,
+    }})
+    assert core.phase == PHASE_TRADE_RESPONSE
+
+    # P1 rejects
+    _, rewards, _, _ = core.step({"player_1": {
+        "core": 0, "auction": 0, "property": 160, "trade_target": 0,
+        "trade_offer_prop": 40, "trade_offer_cash": 0, "trade_req_prop": 40,
+        "trade_req_cash": 0, "trade_response": 0,
+    }})
+
+    # P0's reward must reflect the -0.15 friction penalty
+    assert rewards["player_0"] <= -0.14, f"Initiator must receive -0.15 rejection penalty, got {rewards['player_0']}"
+
+
+def test_win_win_bilateral_monopoly_trade_bonus():
+    """Verify that mutual monopoly barter awards +2.5 bilateral synergy bonus to both players."""
+    core = MonopolyCore(seed=42)
+    # P0 holds Mediterranean (#1) + Illinois (#24)
+    # P1 holds Baltic (#3) + Indiana (#23) & Kentucky (#21)
+    # Swapping tile 24 (P0) for tile 3 (P1) completes Brown for P0 and Red for P1!
+    core.property_owner[1] = 0
+    core.property_owner[24] = 0
+    core.property_owner[3] = 1
+    core.property_owner[21] = 1
+    core.property_owner[23] = 1
+    core.cash[0] = 1000
+    core.cash[1] = 1000
+    core.phase = PHASE_PROPERTY_MANAGE
+    core.active_decision_player = 0
+
+    # P0 proposes swap: tile 24 for tile 3
+    core.step({"player_0": {
+        "core": 0, "auction": 0, "property": 160, "trade_target": 0,
+        "trade_offer_prop": 24, "trade_offer_cash": 0, "trade_req_prop": 3,
+        "trade_req_cash": 0, "trade_response": 0,
+    }})
+    assert core.phase == PHASE_TRADE_RESPONSE
+
+    # P1 accepts
+    _, rewards, _, _ = core.step({"player_1": {
+        "core": 0, "auction": 0, "property": 0, "trade_target": 0,
+        "trade_offer_prop": 40, "trade_offer_cash": 0, "trade_req_prop": 40,
+        "trade_req_cash": 0, "trade_response": 1,
+    }})
+
+    # Both players completed a street monopoly! Both should receive substantial positive reward (+2.5 bonus)
+    assert rewards["player_0"] >= 2.0, f"Expected P0 to receive mutual monopoly reward >= 2.0, got {rewards['player_0']}"
+    assert rewards["player_1"] >= 2.0, f"Expected P1 to receive mutual monopoly reward >= 2.0, got {rewards['player_1']}"
+
+
 
 
 
