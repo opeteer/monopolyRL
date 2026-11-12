@@ -32,7 +32,8 @@ show_help() {
     echo "  --standard     : Standard 1M steps tournament training (~2-3 min)"
     echo "  --tournament   : Full 5M steps tournament competitive training (~10-15 min)"
     echo "  --overnight    : Deep 10M steps tournament master training (~25-35 min)"
-    echo "  --deep         : Grandmaster 25M steps deep league training (~1-1.5 hr)"
+    echo "  --deep         : Grandmaster 25M steps deep league training (~1-1.5 hr)
+  --grandmaster  : Ultra-deep 50M steps Grandmaster league training (~2.5 hr)"
     echo ""
     echo "Operations:"
     echo "  --auto         : Auto-detect CPU & RAM, choosing optimal workers & envs"
@@ -107,6 +108,9 @@ while [[ $# -gt 0 ]]; do
             shift ;;
         --deep)
             ARGS+=("--preset" "deep_league_25m")
+            shift ;;
+        --grandmaster|--50m)
+            ARGS+=("--preset" "grandmaster_50m")
             shift ;;
         --auto)
             ARGS+=("--auto_hardware")

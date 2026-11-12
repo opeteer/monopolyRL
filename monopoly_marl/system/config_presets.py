@@ -126,6 +126,18 @@ PRESETS: Dict[str, TrainingConfig] = {
         eval_interval=20,
         curriculum_phase_2_frac=0.12,
     ),
+    "grandmaster_50m": TrainingConfig(
+        preset_name="grandmaster_50m",
+        description="Ultra-deep 50M steps Grandmaster league tournament session (~2.5 hours)",
+        total_steps=50_000_000,
+        rollout_steps=256,
+        num_envs=80,
+        num_workers=10,
+        num_threads=6,
+        checkpoint_interval=50,
+        eval_interval=25,
+        curriculum_phase_2_frac=0.10,
+    ),
 }
 
 
