@@ -17,7 +17,7 @@ print(f"Device: {device}")
 def load_policy(path):
     ckpt = torch.load(path, map_location=device)
     sd = ckpt.get("state_dict", ckpt)
-    actor = ActorNetwork(obs_dim=399).to(device)
+    actor = ActorNetwork(obs_dim=500).to(device)
     actor.load_state_dict(sd)
     actor.eval()
     return actor

@@ -13,7 +13,7 @@ Tests 100% of official Monopoly mechanics:
 10. All 16 Chance & 16 Community Chest Cards (Advance, Cash, Repairs, Pay/Collect Each Player, Go Back 3 Spaces)
 11. Taxes (Income Tax $200, Luxury Tax $100) and Free Parking
 12. Bankruptcy, Debt Liquidation, Creditor vs Bank Transfer, and Last Agent Standing Victory
-13. Observation (399-dim) and Action Mask Non-Zero Integrity Across All Phases
+13. Observation (500-dim) and Action Mask Non-Zero Integrity Across All Phases
 """
 
 import pytest
@@ -573,12 +573,12 @@ def test_bankruptcy_settlement_and_elimination():
 # 13. OBSERVATION VECTOR & ACTION MASK NON-ZERO INTEGRITY
 # ==============================================================================
 def test_observation_and_action_mask_integrity_across_phases():
-    """Validates that observation vectors are strictly 399-dim and action masks have sum >= 1 across all phases."""
+    """Validates that observation vectors are strictly 500-dim and action masks have sum >= 1 across all phases."""
     core = MonopolyCore(seed=42)
 
     for p in range(4):
         obs = core.get_actor_observation(p)
-        assert obs.shape == (399,), f"Obs shape mismatch: {obs.shape}"
+        assert obs.shape == (500,), f"Obs shape mismatch: {obs.shape}"
         assert not np.isnan(obs).any(), "NaN found in observation"
         assert not np.isinf(obs).any(), "Inf found in observation"
 

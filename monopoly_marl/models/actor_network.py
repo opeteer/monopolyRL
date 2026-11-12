@@ -24,7 +24,7 @@ def init_weights(m: nn.Module, gain: float = np.sqrt(2)):
 class ActorNetwork(nn.Module):
     """Identical Blueprint Decentralized Multi-Head Actor Network."""
 
-    def __init__(self, obs_dim: int = 327, hidden_dim: int = 256):
+    def __init__(self, obs_dim: int = 500, hidden_dim: int = 256):
         super().__init__()
         self.obs_dim = obs_dim
         self.hidden_dim = hidden_dim

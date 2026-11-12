@@ -187,8 +187,8 @@ def test_mortgage_and_interest():
 
 def test_identical_blueprint_orthogonal_init():
     """Validates that all agents share identical neural architecture with orthogonal weights."""
-    actor1 = ActorNetwork(obs_dim=399)
-    actor2 = ActorNetwork(obs_dim=399)
+    actor1 = ActorNetwork(obs_dim=500)
+    actor2 = ActorNetwork(obs_dim=500)
 
     # Check layer shapes match
     for (n1, p1), (n2, p2) in zip(actor1.named_parameters(), actor2.named_parameters()):
@@ -196,7 +196,7 @@ def test_identical_blueprint_orthogonal_init():
         assert p1.shape == p2.shape
 
     # Check forward pass consistency
-    dummy_obs = torch.randn(2, 399)
+    dummy_obs = torch.randn(2, 500)
     dummy_masks = {
         "core": torch.ones(2, 6, dtype=torch.int8),
         "auction": torch.ones(2, 7, dtype=torch.int8),
@@ -286,8 +286,8 @@ def test_advanced_barter_synergy_and_anti_kingmaking():
     # 1. Verify Synergy Vector dimension
     syn_vec = core.get_color_synergy_vector()
     assert syn_vec.shape == (64,), f"Expected shape (64,), got {syn_vec.shape}"
-    assert core.get_actor_observation(0).shape == (399,)
-    assert core.get_global_state().shape == (1628,)
+    assert core.get_actor_observation(0).shape == (500,)
+    assert core.get_global_state().shape == (2032,)
 
     # 2. Test irrational trade: Target asked to give up tile that breaks monopoly for $0
     # Player 1 holds full Brown monopoly: [1, 3]
@@ -461,9 +461,9 @@ def test_property_transaction_features_in_buy_phase():
 
     # Verify total observation and global state dimension
     obs = core.get_actor_observation(0)
-    assert obs.shape == (399,), f"Expected 399-dim obs, got {obs.shape}"
+    assert obs.shape == (500,), f"Expected 500-dim obs, got {obs.shape}"
     global_state = core.get_global_state()
-    assert global_state.shape == (1628,), f"Expected 1628-dim global state, got {global_state.shape}"
+    assert global_state.shape == (2032,), f"Expected 2032-dim global state, got {global_state.shape}"
 
 
 def test_agent_names_and_unbounded_horizon_survival():
@@ -480,9 +480,9 @@ def test_agent_names_and_unbounded_horizon_survival():
     assert core.get_player_name(2) == "Pieter"
     assert core.get_player_name(3) == "Allison"
 
-    # Observation must have valid dimension (399,)
+    # Observation must have valid dimension (500,)
     obs = core.get_actor_observation(0)
-    assert obs.shape == (399,)
+    assert obs.shape == (500,)
 
     # Bankrupt players 1, 2, 3 one by one
     core.cash[1] = -100

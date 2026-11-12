@@ -50,9 +50,9 @@ class MonopolyParallelEnv(ParallelEnv):
         )
         self.seed_val = seed
 
-        # Observation dimension: 399 (if synergy + auction features enabled) or 327
-        self.obs_dim = 399 if include_synergy_obs else 327
-        # Centralized Critic Global State dimension: 1628 (if enabled) or 1340
+        # Observation dimension: 500 (if synergy + auction + trade features enabled) or 327
+        self.obs_dim = 500 if include_synergy_obs else 327
+        # Centralized Critic Global State dimension: 2032 (if enabled) or 1340
         self.state_dim = (4 * self.obs_dim) + 32
 
         # Define Observation Spaces for each agent

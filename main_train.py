@@ -29,13 +29,13 @@ def parse_args():
     parser.add_argument("--checkpoint_interval", type=int, default=25, help="Iterations between checkpoints")
     parser.add_argument("--eval_interval", type=int, default=10, help="Iterations between league evaluations")
     parser.add_argument("--checkpoint_dir", type=str, default="checkpoints", help="Checkpoint directory")
-    parser.add_argument("--entropy_coef", type=float, default=0.001, help="PPO entropy loss coefficient (default: 0.001)")
-    parser.add_argument("--entropy_min", type=float, default=0.0001, help="Minimum entropy coefficient when annealing (default: 0.0001)")
+    parser.add_argument("--entropy_coef", type=float, default=0.005, help="PPO entropy loss coefficient (default: 0.005)")
+    parser.add_argument("--entropy_min", type=float, default=0.0005, help="Minimum entropy coefficient when annealing (default: 0.0005)")
     parser.add_argument("--no_entropy_anneal", action="store_true", help="Disable linear entropy annealing")
     parser.add_argument("--league_rollout_fraction", type=float, default=0.25, help="Fraction of environments reserved for heterogeneous league rollout (default: 0.25)")
     parser.add_argument("--curriculum", action="store_true", default=True, help="Enable 2-phase curriculum learning (default: True)")
     parser.add_argument("--no_curriculum", action="store_false", dest="curriculum", help="Disable curriculum learning")
-    parser.add_argument("--curriculum_phase_2_frac", type=float, default=0.5, help="Fraction of total iterations to unlock Phase 2 full trading (default: 0.5)")
+    parser.add_argument("--curriculum_phase_2_frac", type=float, default=0.15, help="Fraction of total iterations to unlock Phase 2 full trading (default: 0.15)")
     parser.add_argument("--w1", type=float, default=0.010, help="PBRS cash log potential weight (default: 0.010)")
     parser.add_argument("--w2", type=float, default=0.001, help="PBRS property equity weight (default: 0.001)")
     parser.add_argument("--w3", type=float, default=0.050, help="PBRS monopoly completion bonus weight (default: 0.050, 10x surge)")
@@ -169,6 +169,13 @@ def main():
 
     start_time = time.time()
     total_steps_executed = 0
+    telemetry_window = {
+        "episodes": 0,
+        "trades_proposed": 0,
+        "trades_accepted": 0,
+        "houses_built": 0,
+        "bank_houses_end": [],
+    }
 
     # Main Training Loop
     for iteration in range(1, args.num_iterations + 1):
@@ -254,6 +261,11 @@ def main():
 
                 # Reset env if game over
                 if any(truncations.values()) or all(terminations.values()):
+                    telemetry_window["episodes"] += 1
+                    telemetry_window["trades_proposed"] += env.core.trades_proposed_count
+                    telemetry_window["trades_accepted"] += env.core.trades_accepted_count
+                    telemetry_window["houses_built"] += env.core.houses_built_count
+                    telemetry_window["bank_houses_end"].append(env.core.bank_houses)
                     o, info = env.reset()
                     current_obs_list[e_idx] = o
                     current_infos_list[e_idx] = info
@@ -297,15 +309,33 @@ def main():
 
         if iteration % 5 == 0 or iteration == 1 or iteration == args.num_iterations:
             curriculum_tag = "P1: Foundation" if is_curriculum_phase_1 else "P2: Full Trade"
+            ep_cnt = telemetry_window["episodes"]
+            if ep_cnt > 0:
+                tr_prop = telemetry_window["trades_proposed"]
+                tr_acc = telemetry_window["trades_accepted"]
+                acc_rate = (tr_acc / tr_prop * 100.0) if tr_prop > 0 else 0.0
+                h_built = telemetry_window["houses_built"] / ep_cnt
+                avg_bh = sum(telemetry_window["bank_houses_end"]) / len(telemetry_window["bank_houses_end"])
+                telemetry_str = f" | Trades(Acc/Prop): {tr_acc}/{tr_prop} ({acc_rate:.1f}%) | Houses/Ep: {h_built:.1f} | EndBankH: {avg_bh:.1f}"
+            else:
+                tr_prop = sum(e.core.trades_proposed_count for e in envs)
+                tr_acc = sum(e.core.trades_accepted_count for e in envs)
+                h_built = sum(e.core.houses_built_count for e in envs) / max(1, len(envs))
+                avg_bh = sum(e.core.bank_houses for e in envs) / max(1, len(envs))
+                telemetry_str = f" | Live Trades: {tr_acc}/{tr_prop} | Houses/Env: {h_built:.1f} | BankH: {avg_bh:.1f}"
+
             print(
                 f"[{iteration:04d}/{args.num_iterations} | {progress_pct:5.1f}% | {curriculum_tag}] "
                 f"Steps: {total_steps_executed:,}/{actual_total_steps:,} | "
-                f"Policy Loss: {train_metrics['policy_loss']:.4f} | "
-                f"Value Loss: {train_metrics['value_loss']:.4f} | "
-                f"Entropy: {train_metrics['entropy']:.3f} | "
-                f"Ent-Coef: {trainer.entropy_coef:.5f} | "
-                f"Speed: {fps:,} steps/s"
+                f"PLoss: {train_metrics['policy_loss']:.4f} | "
+                f"VLoss: {train_metrics['value_loss']:.4f} | "
+                f"Ent: {train_metrics['entropy']:.3f} ({trainer.entropy_coef:.5f}) | "
+                f"FPS: {fps:,}{telemetry_str}"
             )
+            telemetry_window = {
+                "episodes": 0, "trades_proposed": 0, "trades_accepted": 0,
+                "houses_built": 0, "bank_houses_end": [],
+            }
 
         # Checkpointing & League Updates
         if iteration % args.checkpoint_interval == 0 or iteration == args.num_iterations:

@@ -31,7 +31,7 @@ def parse_args():
     return parser.parse_args()
 
 
-def load_agent_policies(checkpoint_path: str = None, target_obs_dim: int = 399, device: torch.device = torch.device("cpu")):
+def load_agent_policies(checkpoint_path: str = None, target_obs_dim: int = 500, device: torch.device = torch.device("cpu")):
     """Loads 4 identical blueprint actor networks, optionally restored from checkpoint with weight adaptation."""
     policies = []
     state_dict = None

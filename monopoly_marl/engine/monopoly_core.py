@@ -154,10 +154,13 @@ class MonopolyCore:
         self.auction_active_bidders: List[int] = []
         self.auction_current_bidder_idx = 0
 
-        # Trade proposal state
+        # Trade proposal state & telemetry counters
         self.pending_trade: Optional[Dict[str, Any]] = None
         self.manage_actions_this_turn = 0
         self.trade_proposals_this_turn = 0
+        self.trades_proposed_count = 0
+        self.trades_accepted_count = 0
+        self.houses_built_count = 0
 
         # Event log history for UI / replay
         self.event_log: List[str] = ["Tournament game started. All players initialized with $1500."]
@@ -526,6 +529,115 @@ class MonopolyCore:
         """Alias for backward compatibility."""
         return self.get_property_transaction_features(player_id)
 
+    def get_trade_features(self, player_id: int) -> np.ndarray:
+        """Constructs 101-dim trade context vector during PHASE_TRADE_RESPONSE:
+        - 1 dim: trade_active flag
+        - 4 dims: initiator one-hot
+        - 4 dims: target one-hot
+        - 41 dims: offered property one-hot (0..39 tile, 40 = None)
+        - 41 dims: requested property one-hot (0..39 tile, 40 = None)
+        - 2 dims: [offer_cash / 1000.0, req_cash / 1000.0]
+        - 8 dims: objective strategic trade impact descriptors from player_id's perspective
+        Total = 1 + 4 + 4 + 41 + 41 + 2 + 8 = 101 dims.
+        """
+        if self.phase != PHASE_TRADE_RESPONSE or self.pending_trade is None:
+            return np.zeros(101, dtype=np.float32)
+
+        t = self.pending_trade
+        init = t["initiator"]
+        target = t["target"]
+        offer_p = t["offer_prop"]
+        req_p = t["req_prop"]
+        offer_c = float(t["offer_cash"])
+        req_c = float(t["req_cash"])
+
+        trade_active = [1.0]
+        init_oh = [0.0] * 4
+        if 0 <= init < 4:
+            init_oh[init] = 1.0
+        targ_oh = [0.0] * 4
+        if 0 <= target < 4:
+            targ_oh[target] = 1.0
+
+        off_p_oh = [0.0] * 41
+        off_p_oh[offer_p if (0 <= offer_p < 40) else 40] = 1.0
+
+        req_p_oh = [0.0] * 41
+        req_p_oh[req_p if (0 <= req_p < 40) else 40] = 1.0
+
+        cash_terms = [offer_c / 1000.0, req_c / 1000.0]
+
+        # Perspective-relative gain/give
+        if player_id == target:
+            gain_p, give_p = offer_p, req_p
+            gain_c, give_c = offer_c, req_c
+            other_p = init
+        else:
+            gain_p, give_p = req_p, offer_p
+            gain_c, give_c = req_c, offer_c
+            other_p = target
+
+        # Hypothetical ownership post-trade
+        sim_owner = list(self.property_owner)
+        if 0 <= offer_p < 40 and sim_owner[offer_p] == init:
+            sim_owner[offer_p] = target
+        if 0 <= req_p < 40 and sim_owner[req_p] == target:
+            sim_owner[req_p] = init
+
+        def _count_street_monopolies(pl: int, owners: List[int]) -> int:
+            cnt = 0
+            for grp_name, tiles in COLOR_GROUPS.items():
+                if grp_name in ("RAILROAD", "UTILITY"):
+                    continue
+                if all(owners[tile_idx] == pl for tile_idx in tiles):
+                    cnt += 1
+            return cnt
+
+        my_mono_before = _count_street_monopolies(player_id, self.property_owner)
+        my_mono_after = _count_street_monopolies(player_id, sim_owner)
+        opp_mono_before = _count_street_monopolies(other_p, self.property_owner) if 0 <= other_p < 4 else 0
+        opp_mono_after = _count_street_monopolies(other_p, sim_owner) if 0 <= other_p < 4 else 0
+
+        completes_my_monopoly = 1.0 if my_mono_after > my_mono_before else 0.0
+        completes_opp_monopoly = 1.0 if opp_mono_after > opp_mono_before else 0.0
+
+        advances_my_monopoly = 0.0
+        if 0 <= gain_p < 40:
+            grp_g = TILES_DATA[gain_p].get("color")
+            if grp_g and grp_g in COLOR_GROUPS:
+                if sum(1 for tile_idx in COLOR_GROUPS[grp_g] if self.property_owner[tile_idx] == player_id) >= 1:
+                    advances_my_monopoly = 1.0
+
+        breaks_my_pair_or_monopoly = 0.0
+        if 0 <= give_p < 40:
+            grp_gv = TILES_DATA[give_p].get("color")
+            if grp_gv and grp_gv in COLOR_GROUPS:
+                if sum(1 for tile_idx in COLOR_GROUPS[grp_gv] if self.property_owner[tile_idx] == player_id) >= 2:
+                    breaks_my_pair_or_monopoly = 1.0
+
+        escapes_starvation = 1.0 if (my_mono_before == 0 and my_mono_after >= 1) else 0.0
+        is_mutual_monopoly_trade = 1.0 if (completes_my_monopoly > 0.5 and completes_opp_monopoly > 0.5) else 0.0
+        net_cash_gain = (gain_c - give_c) / 1000.0
+        gain_val = float(TILES_DATA[gain_p].get("price", 0)) if (0 <= gain_p < 40) else 0.0
+        give_val = float(TILES_DATA[give_p].get("price", 0)) if (0 <= give_p < 40) else 0.0
+        net_equity_gain = ((gain_val + gain_c) - (give_val + give_c)) / 1000.0
+
+        strategic_impact = [
+            completes_my_monopoly,
+            completes_opp_monopoly,
+            advances_my_monopoly,
+            breaks_my_pair_or_monopoly,
+            escapes_starvation,
+            is_mutual_monopoly_trade,
+            net_cash_gain,
+            net_equity_gain,
+        ]
+
+        return np.array(
+            trade_active + init_oh + targ_oh + off_p_oh + req_p_oh + cash_terms + strategic_impact,
+            dtype=np.float32
+        )
+
     def _calculate_rent(self, tile_id: int, dice_sum: int, multiplier_override: Optional[int] = None) -> int:
         """Calculates official rent for tile given current state."""
         tile = TILES_DATA[tile_id]
@@ -887,7 +999,8 @@ class MonopolyCore:
         if self.include_synergy_obs:
             syn_vec = self.get_color_synergy_vector()
             auc_vec = self.get_auction_features(player_id)
-            obs_vec = np.concatenate([obs_vec, syn_vec, auc_vec])
+            trade_vec = self.get_trade_features(player_id)
+            obs_vec = np.concatenate([obs_vec, syn_vec, auc_vec, trade_vec])
         return obs_vec
 
     def get_global_state(self) -> np.ndarray:
@@ -1012,6 +1125,12 @@ class MonopolyCore:
             shaped_rewards[f"player_{pl}"] = float(shaped_r)
             self.prev_potentials[pl] = new_phi
 
+        total_monopolies = sum(
+            1 for grp_name, tiles in COLOR_GROUPS.items()
+            if grp_name not in ("RAILROAD", "UTILITY")
+            and self.property_owner[tiles[0]] != -1
+            and all(self.property_owner[t] == self.property_owner[tiles[0]] for t in tiles)
+        )
         observations = self.get_observations()
         infos = {
             "event_log": list(self.event_log[-5:]),
@@ -1020,6 +1139,10 @@ class MonopolyCore:
             "bank_houses": self.bank_houses,
             "bank_hotels": self.bank_hotels,
             "last_dice": self.last_dice,
+            "trades_proposed": self.trades_proposed_count,
+            "trades_accepted": self.trades_accepted_count,
+            "houses_built": self.houses_built_count,
+            "monopolies_count": total_monopolies,
         }
 
         return observations, shaped_rewards, dones, infos
@@ -1304,7 +1427,76 @@ class MonopolyCore:
         is_double = getattr(self, "pending_manage_double", False)
         self.manage_actions_this_turn = getattr(self, "manage_actions_this_turn", 0) + 1
 
-        # Check bilateral trade proposal (at most 1 trade per turn, and must involve an actual property)
+        # 1. Execute physical property management actions FIRST (prioritize building/selling/mortgaging)
+        is_valid_build_sell = (0 <= prop_act < 80) and bool(masks["property"][prop_act])
+        is_valid_mtg_unmtg = (80 <= prop_act < 160) and bool(masks["property"][prop_act]) and (core_act != ACT_CORE_END_MANAGE)
+
+        if is_valid_build_sell or is_valid_mtg_unmtg:
+            # [0..39]: Build House / Hotel
+            if 0 <= prop_act < 40:
+                tile = TILES_DATA[prop_act]
+                if tile["type"] == TILE_STREET and "house_cost" in tile:
+                    h_cost = tile["house_cost"]
+                    h = self.property_houses[prop_act]
+                    if h < 4:
+                        self.property_houses[prop_act] += 1
+                        self.bank_houses -= 1
+                        self.cash[p] -= h_cost
+                        self.houses_built_count += 1
+                        self.event_log.append(f"{self.get_player_name(p)} built a house on {tile['name']} for ${h_cost}. (Bank houses left: {self.bank_houses})")
+                    elif h == 4:
+                        self.property_houses[prop_act] = 5
+                        self.bank_hotels -= 1
+                        self.bank_houses += 4
+                        self.cash[p] -= h_cost
+                        self.houses_built_count += 1
+                        self.event_log.append(f"{self.get_player_name(p)} upgraded to a HOTEL on {tile['name']} for ${h_cost}! (4 houses returned to bank).")
+
+            # [40..79]: Sell House / Hotel
+            elif 40 <= prop_act < 80:
+                p_idx = prop_act - 40
+                tile = TILES_DATA[p_idx]
+                if tile["type"] == TILE_STREET and "house_cost" in tile:
+                    h_cost = tile["house_cost"]
+                    h = self.property_houses[p_idx]
+                    refund = int(h_cost * HOUSE_REFUND_RATE)
+                    if h <= 4:
+                        self.property_houses[p_idx] -= 1
+                        self.bank_houses += 1
+                        self.cash[p] += refund
+                        self.event_log.append(f"{self.get_player_name(p)} sold a house on {tile['name']} for ${refund}.")
+                    elif h == 5:
+                        self.property_houses[p_idx] = 4
+                        self.bank_hotels += 1
+                        self.bank_houses -= 4
+                        self.cash[p] += refund
+                        self.event_log.append(f"{self.get_player_name(p)} sold hotel on {tile['name']} for ${refund} (converted to 4 houses).")
+
+            # [80..119]: Mortgage
+            elif 80 <= prop_act < 120:
+                p_idx = prop_act - 80
+                tile = TILES_DATA[p_idx]
+                if "mortgage" in tile and p_idx in PURCHASABLE_TILES:
+                    mtg_val = tile["mortgage"]
+                    self.property_mortgaged[p_idx] = True
+                    self.cash[p] += mtg_val
+                    self.event_log.append(f"{self.get_player_name(p)} mortgaged {tile['name']} for ${mtg_val}.")
+
+            # [120..159]: Unmortgage
+            elif 120 <= prop_act < 160:
+                p_idx = prop_act - 120
+                tile = TILES_DATA[p_idx]
+                if "mortgage" in tile and p_idx in PURCHASABLE_TILES:
+                    cost = int(tile["mortgage"] * (1.0 + UNMORTGAGE_INTEREST_RATE))
+                    self.property_mortgaged[p_idx] = False
+                    self.cash[p] -= cost
+                    self.event_log.append(f"{self.get_player_name(p)} unmortgaged {tile['name']} for ${cost} (incl. 10% interest).")
+
+            if self.manage_actions_this_turn >= 5:
+                self._finish_manage_or_next(p, is_double)
+            return
+
+        # 2. Check bilateral trade proposal (when not executing physical property action; max 1 trade per turn)
         has_trade_intent = (
             self.allow_trade and
             getattr(self, "trade_proposals_this_turn", 0) == 0 and
@@ -1317,86 +1509,11 @@ class MonopolyCore:
             )
             if trade_started:
                 self.trade_proposals_this_turn = 1
+                self.trades_proposed_count += 1
                 return
 
-        # 1. End Management -> Proceed to Next Turn or Double Roll
-        # If agent explicitly passes via prop_act == 160, or core_act == ACT_CORE_END_MANAGE (and not executing valid build/sell),
-        # or reached action limit (5), or invalid property action:
-        is_build_or_sell = (0 <= prop_act < 80) and bool(masks["property"][prop_act])
-        should_end = (
-            (prop_act == 160) or
-            (core_act == ACT_CORE_END_MANAGE and not is_build_or_sell) or
-            (self.manage_actions_this_turn >= 5) or
-            (prop_act < 160 and masks["property"][prop_act] == 0)
-        )
-        if should_end:
-            self._finish_manage_or_next(p, is_double)
-            return
-
-        # 2. Property Sub-actions:
-        # [0..39]: Build House / Hotel
-        if 0 <= prop_act < 40 and masks["property"][prop_act]:
-            tile = TILES_DATA[prop_act]
-            if tile["type"] == TILE_STREET and "house_cost" in tile:
-                h_cost = tile["house_cost"]
-                h = self.property_houses[prop_act]
-                if h < 4:
-                    # Add house
-                    self.property_houses[prop_act] += 1
-                    self.bank_houses -= 1
-                    self.cash[p] -= h_cost
-                    self.event_log.append(f"{self.get_player_name(p)} built a house on {tile['name']} for ${h_cost}. (Bank houses left: {self.bank_houses})")
-                elif h == 4:
-                    # Upgrade to hotel: consumes 1 hotel, releases 4 houses to bank!
-                    self.property_houses[prop_act] = 5
-                    self.bank_hotels -= 1
-                    self.bank_houses += 4
-                    self.cash[p] -= h_cost
-                    self.event_log.append(f"{self.get_player_name(p)} upgraded to a HOTEL on {tile['name']} for ${h_cost}! (4 houses returned to bank).")
-
-        # [40..79]: Sell House / Hotel
-        elif 40 <= prop_act < 80 and masks["property"][prop_act]:
-            p_idx = prop_act - 40
-            tile = TILES_DATA[p_idx]
-            if tile["type"] == TILE_STREET and "house_cost" in tile:
-                h_cost = tile["house_cost"]
-                h = self.property_houses[p_idx]
-                refund = int(h_cost * HOUSE_REFUND_RATE)
-                if h <= 4:
-                    self.property_houses[p_idx] -= 1
-                    self.bank_houses += 1
-                    self.cash[p] += refund
-                    self.event_log.append(f"{self.get_player_name(p)} sold a house on {tile['name']} for ${refund}.")
-                elif h == 5:
-                    # Sell hotel: downgrade to 4 houses
-                    self.property_houses[p_idx] = 4
-                    self.bank_hotels += 1
-                    self.bank_houses -= 4
-                    self.cash[p] += refund
-                    self.event_log.append(f"{self.get_player_name(p)} sold hotel on {tile['name']} for ${refund} (converted to 4 houses).")
-
-        # [80..119]: Mortgage
-        elif 80 <= prop_act < 120 and masks["property"][prop_act]:
-            p_idx = prop_act - 80
-            tile = TILES_DATA[p_idx]
-            if "mortgage" in tile and p_idx in PURCHASABLE_TILES:
-                mtg_val = tile["mortgage"]
-                self.property_mortgaged[p_idx] = True
-                self.cash[p] += mtg_val
-                self.event_log.append(f"{self.get_player_name(p)} mortgaged {tile['name']} for ${mtg_val}.")
-
-        # [120..159]: Unmortgage
-        elif 120 <= prop_act < 160 and masks["property"][prop_act]:
-            p_idx = prop_act - 120
-            tile = TILES_DATA[p_idx]
-            if "mortgage" in tile and p_idx in PURCHASABLE_TILES:
-                cost = int(tile["mortgage"] * (1.0 + UNMORTGAGE_INTEREST_RATE))
-                self.property_mortgaged[p_idx] = False
-                self.cash[p] -= cost
-                self.event_log.append(f"{self.get_player_name(p)} unmortgaged {tile['name']} for ${cost} (incl. 10% interest).")
-
-        if self.manage_actions_this_turn >= 5:
-            self._finish_manage_or_next(p, is_double)
+        # 3. End Management -> Proceed to Next Turn or Double Roll
+        self._finish_manage_or_next(p, is_double)
 
     def _propose_trade(
         self, initiator: int, target_idx: int, offer_prop: int,
@@ -1406,15 +1523,29 @@ class MonopolyCore:
         other_players = [pl for pl in range(4) if pl != initiator and not self.bankrupt[pl]]
         if not other_players:
             return False
-        target = other_players[target_idx % len(other_players)]
+
+        # Auto-route target deterministically to the rightful owner of req_prop when requested
+        if 0 <= req_prop < 40:
+            prop_owner = self.property_owner[req_prop]
+            if prop_owner == -1 or prop_owner == initiator or self.bankrupt[prop_owner]:
+                return False
+            grp_req = TILES_DATA[req_prop].get("color")
+            if grp_req and any(self.property_houses[t] > 0 for t in COLOR_GROUPS.get(grp_req, [])):
+                return False
+            target = prop_owner
+        else:
+            target = other_players[target_idx % len(other_players)]
+
         offer_cash = TRADE_CASH_BRACKETS[min(offer_cash_idx, len(TRADE_CASH_BRACKETS) - 1)]
         req_cash = TRADE_CASH_BRACKETS[min(req_cash_idx, len(TRADE_CASH_BRACKETS) - 1)]
 
         # Validate offer
-        if offer_prop < 40 and self.property_owner[offer_prop] != initiator:
-            return False
-        if req_prop < 40 and self.property_owner[req_prop] != target:
-            return False
+        if 0 <= offer_prop < 40:
+            if self.property_owner[offer_prop] != initiator:
+                return False
+            grp_off = TILES_DATA[offer_prop].get("color")
+            if grp_off and any(self.property_houses[t] > 0 for t in COLOR_GROUPS.get(grp_off, [])):
+                return False
         if self.cash[initiator] < offer_cash:
             return False
 
@@ -1455,6 +1586,7 @@ class MonopolyCore:
                     if req_p < 40 and self.property_owner[req_p] == target:
                         self.property_owner[req_p] = init
 
+                    self.trades_accepted_count += 1
                     self.event_log.append(f"TRADE ACCEPTED between {self.get_player_name(init)} and {self.get_player_name(target)}!")
                 else:
                     self.event_log.append(f"Trade failed due to insufficient funds.")
