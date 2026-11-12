@@ -44,8 +44,8 @@ class ActorNetwork(nn.Module):
         self.head_core = nn.Linear(hidden_dim, 6)
         # 2. Auction Actions (7 dims: 5 discrete increments + 2 strategic jump bids)
         self.head_auction = nn.Linear(hidden_dim, 7)
-        # 3. Property Management Sub-actions (160 dims: 4 x 40)
-        self.head_property = nn.Linear(hidden_dim, 160)
+        # 3. Property Management Sub-actions (161 dims: [0..39] Build, [40..79] Sell, [80..119] Mortgage, [120..159] Unmortgage, [160] Pass)
+        self.head_property = nn.Linear(hidden_dim, 161)
         # 4. Bilateral Trade Heads
         self.head_trade_target = nn.Linear(hidden_dim, 3)
         self.head_trade_offer_prop = nn.Linear(hidden_dim, 41)

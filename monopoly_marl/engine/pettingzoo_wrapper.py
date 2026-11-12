@@ -24,11 +24,12 @@ class MonopolyParallelEnv(ParallelEnv):
         max_rounds: Optional[int] = None,
         gamma: float = 0.99,
         seed: Optional[int] = None,
-        w1: float = 0.03,
+        w1: float = 0.010,
         w2: float = 0.001,
-        w3: float = 0.005,
-        w4: float = 0.007,
-        w_syn: float = 0.005,
+        w3: float = 0.050,
+        w4: float = 0.001,
+        w_syn: float = 0.020,
+        beta_starve: float = 25.0,
         allow_trade: bool = True,
         include_synergy_obs: bool = True,
         player_names: Optional[List[str]] = None,
@@ -42,7 +43,7 @@ class MonopolyParallelEnv(ParallelEnv):
         }
         self.core = MonopolyCore(
             seed=seed, max_rounds=max_rounds, gamma=gamma,
-            w1=w1, w2=w2, w3=w3, w4=w4, w_syn=w_syn,
+            w1=w1, w2=w2, w3=w3, w4=w4, w_syn=w_syn, beta_starve=beta_starve,
             allow_trade=allow_trade,
             include_synergy_obs=include_synergy_obs,
             player_names=self.player_names,
@@ -62,7 +63,7 @@ class MonopolyParallelEnv(ParallelEnv):
                 "action_mask": spaces.Dict({
                     "core": spaces.Box(low=0, high=1, shape=(6,), dtype=np.int8),
                     "auction": spaces.Box(low=0, high=1, shape=(7,), dtype=np.int8),
-                    "property": spaces.Box(low=0, high=1, shape=(160,), dtype=np.int8),
+                    "property": spaces.Box(low=0, high=1, shape=(161,), dtype=np.int8),
                     "trade_target": spaces.Box(low=0, high=1, shape=(3,), dtype=np.int8),
                     "trade_offer_prop": spaces.Box(low=0, high=1, shape=(41,), dtype=np.int8),
                     "trade_offer_cash": spaces.Box(low=0, high=1, shape=(10,), dtype=np.int8),
@@ -79,7 +80,7 @@ class MonopolyParallelEnv(ParallelEnv):
             agent: spaces.Dict({
                 "core": spaces.Discrete(6),
                 "auction": spaces.Discrete(7),
-                "property": spaces.Discrete(160),
+                "property": spaces.Discrete(161),
                 "trade_target": spaces.Discrete(3),
                 "trade_offer_prop": spaces.Discrete(41),
                 "trade_offer_cash": spaces.Discrete(10),

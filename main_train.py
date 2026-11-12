@@ -36,10 +36,12 @@ def parse_args():
     parser.add_argument("--curriculum", action="store_true", default=True, help="Enable 2-phase curriculum learning (default: True)")
     parser.add_argument("--no_curriculum", action="store_false", dest="curriculum", help="Disable curriculum learning")
     parser.add_argument("--curriculum_phase_2_frac", type=float, default=0.5, help="Fraction of total iterations to unlock Phase 2 full trading (default: 0.5)")
-    parser.add_argument("--w1", type=float, default=0.03, help="PBRS cash log potential weight (default: 0.03)")
+    parser.add_argument("--w1", type=float, default=0.010, help="PBRS cash log potential weight (default: 0.010)")
     parser.add_argument("--w2", type=float, default=0.001, help="PBRS property equity weight (default: 0.001)")
-    parser.add_argument("--w3", type=float, default=0.005, help="PBRS monopoly completion bonus weight (default: 0.005)")
-    parser.add_argument("--w4", type=float, default=0.007, help="PBRS rent hazard / jail shelter weight (default: 0.007)")
+    parser.add_argument("--w3", type=float, default=0.050, help="PBRS monopoly completion bonus weight (default: 0.050, 10x surge)")
+    parser.add_argument("--w4", type=float, default=0.001, help="PBRS rent hazard / jail shelter weight (default: 0.001, 7x reduced)")
+    parser.add_argument("--w_syn", type=float, default=0.020, help="PBRS color synergy potential weight (default: 0.020)")
+    parser.add_argument("--beta_starve", type=float, default=25.0, help="PBRS monopoly starvation penalty weight (default: 25.0)")
     parser.add_argument("--resume_checkpoint", type=str, default=None, help="Path to checkpoint to resume actor weights from")
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu", help="Device")
     return parser.parse_args()
@@ -75,6 +77,8 @@ def main():
             w2=args.w2,
             w3=args.w3,
             w4=args.w4,
+            w_syn=args.w_syn,
+            beta_starve=args.beta_starve,
             allow_trade=not args.curriculum,
         )
         for i in range(args.num_envs)
@@ -88,7 +92,7 @@ def main():
     main_critic = CentralizedCritic(state_dim=state_dim).to(device)
     exploiter_actor = ActorNetwork(obs_dim=obs_dim).to(device)
 
-    # Resume checkpoint if provided (with seamless weight transfer if obs_dim changed)
+    # Resume checkpoint if provided (with seamless weight transfer if obs_dim or head dims changed)
     if args.resume_checkpoint and os.path.exists(args.resume_checkpoint):
         print(f"--> [Resume] Loading weights from {args.resume_checkpoint}")
         ckpt = torch.load(args.resume_checkpoint, map_location=device)
@@ -98,6 +102,8 @@ def main():
             old_in_dim = state_dict["trunk.0.weight"].shape[1]
             old_auc_dim = state_dict["head_auction.weight"].shape[0] if "head_auction.weight" in state_dict else 5
             curr_auc_dim = new_sd["head_auction.weight"].shape[0]
+            old_prop_dim = state_dict["head_property.weight"].shape[0] if "head_property.weight" in state_dict else 160
+            curr_prop_dim = new_sd["head_property.weight"].shape[0]
 
             for k in state_dict:
                 if k == "trunk.0.weight" and old_in_dim != obs_dim:
@@ -109,10 +115,16 @@ def main():
                 elif k == "head_auction.bias" and old_auc_dim != curr_auc_dim:
                     new_sd[k][:old_auc_dim] = state_dict[k]
                     new_sd[k][old_auc_dim:] = -0.1
+                elif k == "head_property.weight" and old_prop_dim != curr_prop_dim:
+                    new_sd[k][:old_prop_dim, :] = state_dict[k]
+                    new_sd[k][old_prop_dim:, :] = 0.0
+                elif k == "head_property.bias" and old_prop_dim != curr_prop_dim:
+                    new_sd[k][:old_prop_dim] = state_dict[k]
+                    new_sd[k][old_prop_dim:] = 0.0
                 elif k in new_sd and new_sd[k].shape == state_dict[k].shape:
                     new_sd[k] = state_dict[k]
             main_actor.load_state_dict(new_sd)
-            print(f"--> [Resume] Actor weights successfully adapted and restored (in: {old_in_dim}->{obs_dim}, auc: {old_auc_dim}->{curr_auc_dim}).")
+            print(f"--> [Resume] Actor weights successfully adapted and restored (in: {old_in_dim}->{obs_dim}, auc: {old_auc_dim}->{curr_auc_dim}, prop: {old_prop_dim}->{curr_prop_dim}).")
 
     # 3. Initialize Trainer & Storage
     trainer = MAPPOTrainer(

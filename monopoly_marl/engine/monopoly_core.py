@@ -67,11 +67,12 @@ class MonopolyCore:
         seed: Optional[int] = None,
         max_rounds: Optional[int] = None,
         gamma: float = 0.99,
-        w1: float = 0.03,
+        w1: float = 0.010,
         w2: float = 0.001,
-        w3: float = 0.005,
-        w4: float = 0.007,
-        w_syn: float = 0.005,
+        w3: float = 0.050,
+        w4: float = 0.001,
+        w_syn: float = 0.020,
+        beta_starve: float = 25.0,
         allow_trade: bool = True,
         include_synergy_obs: bool = True,
         player_names: Optional[List[str]] = None,
@@ -82,12 +83,13 @@ class MonopolyCore:
         self.gamma = gamma
         self.player_names = list(player_names) if player_names is not None else list(DEFAULT_PLAYER_NAMES)
 
-        # Calibrated PBRS Weights
-        self.w1 = w1   # Cash log potential (calibrated to 0.03 to balance cash vs development)
+        # Calibrated Offensive Arms-Race PBRS Weights
+        self.w1 = w1   # Cash log potential (0.010: de-emphasize hoarding cash)
         self.w2 = w2   # Property equity potential (0.001)
-        self.w3 = w3   # Monopoly completion bonus potential (calibrated to 0.005)
-        self.w4 = w4   # Rent hazard / jail shelter potential (calibrated to 0.007)
-        self.w_syn = w_syn  # Color-matching synergy quadratic potential
+        self.w3 = w3   # Monopoly completion bonus potential (0.050: 10x surge for getting monopoly)
+        self.w4 = w4   # Rent hazard paranoia (0.001: 7x reduced to eliminate trade embargo paralysis)
+        self.w_syn = w_syn  # Color-matching synergy quadratic potential (0.020: 4x pull toward full sets)
+        self.beta_starve = beta_starve  # Monopoly starvation penalty (25.0: existential fear of 0 monopolies)
         self.allow_trade = allow_trade
         self.include_synergy_obs = include_synergy_obs
 
@@ -206,12 +208,15 @@ class MonopolyCore:
 
         # Term 3: Monopoly complete groups
         term3_sum = 0.0
+        street_monopolies_count = 0
         for grp_name, tiles in COLOR_GROUPS.items():
             if all(self.property_owner[t] == player_id for t in tiles):
                 term3_sum += GROUP_MONOPOLY_BONUS.get(grp_name, 0.0)
+                if grp_name not in ("RAILROAD", "UTILITY"):
+                    street_monopolies_count += 1
         term3 = self.w3 * term3_sum
 
-        # Term 4: Expected rent risk from next roll
+        # Term 4: Expected rent risk from next roll (de-escalated to avoid paranoid trade embargo)
         pos_i = self.position[player_id]
         term4_sum = 0.0
         if not self.in_jail[player_id]:
@@ -234,7 +239,15 @@ class MonopolyCore:
             term5_sum += (frac ** 2) * 50.0
         term5 = self.w_syn * term5_sum
 
-        return float(term1 + term2 + term3 - term4 + term5)
+        # Term 6: Monopoly Starvation Penalty (Existential urgency: fear of failing to achieve monopoly)
+        # As unowned properties vanish from board, having 0 street monopolies imposes escalating quadratic penalty!
+        unowned_count = sum(1 for p in PURCHASABLE_TILES if self.property_owner[p] == -1)
+        sold_frac = (len(PURCHASABLE_TILES) - unowned_count) / float(len(PURCHASABLE_TILES))
+        term6_starve = 0.0
+        if street_monopolies_count == 0:
+            term6_starve = self.beta_starve * (sold_frac ** 2)
+
+        return float(term1 + term2 + term3 - term4 + term5 - term6_starve)
 
     def get_color_synergy_vector(self) -> np.ndarray:
         """Constructs 64-dim color-matching synergy representation:
@@ -565,7 +578,7 @@ class MonopolyCore:
         """
         mask_core = np.zeros(6, dtype=np.int8)
         mask_auction = np.zeros(7, dtype=np.int8)
-        mask_property = np.zeros(160, dtype=np.int8)
+        mask_property = np.zeros(161, dtype=np.int8)
         
         # Trade masks: target(3), offer_prop(41), offer_cash(10), req_prop(41), req_cash(10), respond(2)
         mask_trade_target = np.zeros(3, dtype=np.int8)
@@ -579,7 +592,7 @@ class MonopolyCore:
         if player_id != self.active_decision_player or self.bankrupt[player_id] or self.phase == PHASE_GAME_OVER:
             mask_core[ACT_CORE_ROLL_PASS] = 1
             mask_auction[ACT_AUC_FOLD] = 1
-            mask_property[0] = 1
+            mask_property[160] = 1  # 160 = Explicit Pass / Done
             mask_trade_target[0] = 1
             mask_trade_offer_prop[40] = 1  # 40 = No property
             mask_trade_offer_cash[0] = 1   # 0 cash
@@ -657,6 +670,8 @@ class MonopolyCore:
         elif self.phase == PHASE_PROPERTY_MANAGE:
             # Always allowed to end turn
             mask_core[ACT_CORE_END_MANAGE] = 1
+            mask_core[ACT_CORE_ROLL_PASS] = 1
+            mask_property[160] = 1  # 160: Explicit PASS / END MANAGEMENT action
 
             # Property Management Sub-actions:
             # [0..39]: Build House
@@ -775,7 +790,7 @@ class MonopolyCore:
         if not np.any(mask_auction):
             mask_auction[0] = 1
         if not np.any(mask_property):
-            mask_property[0] = 1
+            mask_property[160] = 1
         if not np.any(mask_trade_target):
             mask_trade_target[0] = 1
         if not np.any(mask_trade_offer_prop):
@@ -1305,8 +1320,16 @@ class MonopolyCore:
                 return
 
         # 1. End Management -> Proceed to Next Turn or Double Roll
-        # If agent explicitly requests END_MANAGE, or reached action limit (5), or property action is invalid:
-        if core_act == ACT_CORE_END_MANAGE or self.manage_actions_this_turn >= 5 or masks["property"][prop_act] == 0:
+        # If agent explicitly passes via prop_act == 160, or core_act == ACT_CORE_END_MANAGE (and not executing valid build/sell),
+        # or reached action limit (5), or invalid property action:
+        is_build_or_sell = (0 <= prop_act < 80) and bool(masks["property"][prop_act])
+        should_end = (
+            (prop_act == 160) or
+            (core_act == ACT_CORE_END_MANAGE and not is_build_or_sell) or
+            (self.manage_actions_this_turn >= 5) or
+            (prop_act < 160 and masks["property"][prop_act] == 0)
+        )
+        if should_end:
             self._finish_manage_or_next(p, is_double)
             return
 
@@ -1440,8 +1463,13 @@ class MonopolyCore:
 
         self.pending_trade = None
         is_double = getattr(self, "pending_manage_double", False)
-        # Advance turn cleanly after trade proposal resolution
-        self._finish_manage_or_next(init, is_double)
+        # Non-preemptive trading: Return to PHASE_PROPERTY_MANAGE for initiator
+        # If the initiator just acquired a monopoly via trade, they can immediately build houses!
+        if not self.bankrupt[init] and self.manage_actions_this_turn < 5:
+            self.phase = PHASE_PROPERTY_MANAGE
+            self.active_decision_player = init
+        else:
+            self._finish_manage_or_next(init, is_double)
 
     # ----------------------------------------------------------------------
     # Cards & Actions Handling

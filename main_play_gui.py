@@ -50,6 +50,8 @@ def load_agent_policies(checkpoint_path: str = None, target_obs_dim: int = 399, 
             new_sd = actor.state_dict()
             old_auc_dim = state_dict["head_auction.weight"].shape[0] if "head_auction.weight" in state_dict else 5
             curr_auc_dim = new_sd["head_auction.weight"].shape[0]
+            old_prop_dim = state_dict["head_property.weight"].shape[0] if "head_property.weight" in state_dict else 160
+            curr_prop_dim = new_sd["head_property.weight"].shape[0]
 
             for k in state_dict:
                 if k == "trunk.0.weight" and ckpt_obs_dim != target_obs_dim:
@@ -61,6 +63,12 @@ def load_agent_policies(checkpoint_path: str = None, target_obs_dim: int = 399, 
                 elif k == "head_auction.bias" and old_auc_dim != curr_auc_dim:
                     new_sd[k][:old_auc_dim] = state_dict[k]
                     new_sd[k][old_auc_dim:] = -0.1
+                elif k == "head_property.weight" and old_prop_dim != curr_prop_dim:
+                    new_sd[k][:old_prop_dim, :] = state_dict[k]
+                    new_sd[k][old_prop_dim:, :] = 0.0
+                elif k == "head_property.bias" and old_prop_dim != curr_prop_dim:
+                    new_sd[k][:old_prop_dim] = state_dict[k]
+                    new_sd[k][old_prop_dim:] = 0.0
                 elif k in new_sd and new_sd[k].shape == state_dict[k].shape:
                     new_sd[k] = state_dict[k]
             actor.load_state_dict(new_sd)

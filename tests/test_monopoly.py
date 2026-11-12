@@ -200,7 +200,7 @@ def test_identical_blueprint_orthogonal_init():
     dummy_masks = {
         "core": torch.ones(2, 6, dtype=torch.int8),
         "auction": torch.ones(2, 7, dtype=torch.int8),
-        "property": torch.ones(2, 160, dtype=torch.int8),
+        "property": torch.ones(2, 161, dtype=torch.int8),
         "trade_target": torch.ones(2, 3, dtype=torch.int8),
         "trade_offer_prop": torch.ones(2, 41, dtype=torch.int8),
         "trade_offer_cash": torch.ones(2, 10, dtype=torch.int8),
