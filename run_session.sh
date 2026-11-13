@@ -56,7 +56,7 @@ print_hardware_summary(hw)
 
 for w in [4, 8, hw.recommended_workers]:
     n_envs = w * 8
-    configs = [dict(max_rounds=120, seed=42+i, allow_trade=True) for i in range(n_envs)]
+    configs = [dict(max_rounds=120, seed=None, allow_trade=True) for i in range(n_envs)]
     vec = SharedMemoryMonopolyVecEnv(configs, num_workers=w)
     vec.reset()
     start = time.time()

@@ -730,6 +730,54 @@ def test_house_and_hotel_building_mechanics():
     assert rent == 250
 
 
+def test_gui_startup_paused_state():
+    """Validates that GUI dashboard initializes in paused mode with PLAY label."""
+    import os
+    os.environ["SDL_VIDEODRIVER"] = "dummy"
+    import pygame
+    pygame.init()
+
+    from monopoly_marl.engine.monopoly_core import MonopolyCore
+    from monopoly_marl.gui.renderer import MonopolyRenderer
+    from monopoly_marl.gui.dashboard import MonopolyDashboard
+
+    surface = pygame.Surface((1380, 840))
+    core = MonopolyCore(seed=42)
+
+    renderer = MonopolyRenderer(surface, board_size=800, offset_x=20, offset_y=20)
+    dashboard = MonopolyDashboard(surface, x=840, y=20, width=520, height=800)
+
+    # 1. Assert default startup state is paused
+    assert dashboard.is_paused is True
+    assert dashboard.btn_pause.label == "PLAY"
+    assert dashboard.btn_pause.is_active is True
+    assert renderer.is_paused is True
+
+    # 2. Render frame while paused
+    renderer.render(core, speed=dashboard.speed, is_paused=dashboard.is_paused)
+    dashboard.render(core)
+
+    # 3. Toggle pause to running (unpause)
+    dashboard.toggle_pause()
+    assert dashboard.is_paused is False
+    assert dashboard.btn_pause.label == "PAUSE"
+    assert dashboard.btn_pause.is_active is False
+
+    # 4. Toggle pause back to paused
+    dashboard.toggle_pause()
+    assert dashboard.is_paused is True
+    assert dashboard.btn_pause.label == "PLAY"
+    assert dashboard.btn_pause.is_active is True
+
+    # 5. Set paused explicitly
+    dashboard.set_paused(False)
+    assert dashboard.is_paused is False
+    dashboard.set_paused(True)
+    assert dashboard.is_paused is True
+    assert dashboard.btn_pause.label == "PLAY"
+
+
+
 
 
 

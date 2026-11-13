@@ -45,7 +45,7 @@ def evaluate_lineup(policies, num_games=5):
     }
 
     for g in range(num_games):
-        core = MonopolyCore(seed=1000 + g, max_rounds=150)
+        core = MonopolyCore(seed=None, max_rounds=150)
         buys = 0
         declines = 0
         auctions = 0
