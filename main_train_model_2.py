@@ -105,6 +105,7 @@ def parse_args():
     parser.add_argument("--resume_checkpoint", type=str, default=None, help="Legacy alias for --resume")
     parser.add_argument("--max_rounds", type=int, default=defaults.get("max_rounds", 80), help="Max rounds per training/eval episode (default: 80, benchmarked from external 4p Monopoly bots)")
     parser.add_argument("--fixed_first_player", action="store_false", dest="randomize_first_player", default=defaults.get("randomize_first_player", True), help="Keep Player 0 as fixed starting player instead of randomizing first seat")
+    parser.add_argument("--model_name", type=str, default="Model-2 Impala", help="Designated model name saved on completion (default: 'Model-2 Impala')")
     parser.add_argument("--device", type=str, default=defaults.get("device", "cuda" if torch.cuda.is_available() else "cpu"), help="Device")
 
     return parser.parse_args(remaining_argv)
@@ -362,6 +363,9 @@ def main():
     )
 
     league_mgr = LeagueManager(checkpoint_dir=checkpoint_dir, device=device)
+    if args.model_name and hasattr(league_mgr, "main_agent_record"):
+        league_mgr.main_agent_record.name = args.model_name
+
     if start_iteration <= 1:
         league_mgr.save_checkpoint(
             main_actor, iteration=0, role="main", critic=main_critic, exploiter=exploiter_actor
@@ -820,6 +824,31 @@ def main():
         "final_elo": league_mgr.main_agent_record.elo if hasattr(league_mgr, "main_agent_record") else 1200.0,
         "final_win_rate": league_mgr.main_agent_record.win_rate if hasattr(league_mgr, "main_agent_record") else 0.0,
     })
+
+    # Save designated named model checkpoint (e.g. Model-2 Impala)
+    if args.model_name:
+        sanitized_name = args.model_name.replace(" ", "_")
+        named_path_primary = os.path.join(checkpoint_dir, f"{sanitized_name}.pt")
+        named_path_direct = os.path.join(checkpoint_dir, f"{args.model_name}.pt")
+        named_payload = {
+            "model_name": args.model_name,
+            "iteration": iteration if 'iteration' in locals() else args.num_iterations,
+            "role": "main",
+            "state_dict": main_actor.state_dict(),
+            "critic_state_dict": main_critic.state_dict(),
+            "exploiter_state_dict": exploiter_actor.state_dict(),
+            "metadata": {
+                "model_name": args.model_name,
+                "total_steps": total_steps_executed,
+                "final_elo": league_mgr.main_agent_record.elo if hasattr(league_mgr, "main_agent_record") else 1200.0,
+                "final_win_rate": league_mgr.main_agent_record.win_rate if hasattr(league_mgr, "main_agent_record") else 0.0,
+                "timestamp": time.time(),
+            },
+        }
+        torch.save(named_payload, named_path_primary)
+        if named_path_direct != named_path_primary:
+            torch.save(named_payload, named_path_direct)
+        print(f"--> [Designated Named Model Saved] {named_path_primary}")
 
     print(f"\n=======================================================")
     print(f"=== Training Session Finished! ===")
