@@ -705,7 +705,8 @@ class MonopolyRenderer:
         icon_type = cfg.get("icon")
         l1 = cfg.get("line1", "")
         l2 = cfg.get("line2", "")
-        price_str = cfg.get("price", f"${tile['price']}" if tile.get("price", 0) > 0 else "")
+        eff_price = core.get_property_price(tile_id, int(tile.get("price", 0))) if "price" in tile else 0
+        price_str = f"${eff_price}" if eff_price > 0 else cfg.get("price", "")
 
         if 0 < tile_id < 10:  # Bottom Row
             text_y_offset = 12 if core.property_houses[tile_id] > 0 else 0
@@ -1116,7 +1117,7 @@ class MonopolyRenderer:
         p = core.active_decision_player
         p_name = core.get_player_name(p)
         tile = TILES_DATA[prop_id]
-        price = tile["price"]
+        price = core.get_property_price(prop_id, tile["price"])
 
         hud_w, hud_h = 490, 270
         hud_box = pygame.Rect(cx - hud_w // 2, cy - hud_h // 2, hud_w, hud_h)
@@ -1229,8 +1230,8 @@ class MonopolyRenderer:
             pygame.draw.line(self.surface, (200, 205, 215), (inner_rect.x + 8, ry + 2), (inner_rect.right - 8, ry + 2), 1)
             ry += 6
 
-            h_cost = tile.get("house_cost", 50)
-            mtg = tile.get("mortgage", 30)
+            h_cost = core.get_property_house_cost(tile_id, tile.get("house_cost", 50))
+            mtg = core.get_property_mortgage(tile_id, tile.get("mortgage", 30))
 
             mtg_txt = f"Mortgage Value ${mtg}"
             h_txt = f"Houses cost ${h_cost} each"
@@ -1274,7 +1275,8 @@ class MonopolyRenderer:
 
             pygame.draw.line(self.surface, (200, 205, 215), (inner_rect.x + 8, ry + 4), (inner_rect.right - 8, ry + 4), 1)
             ry += 12
-            mtg_txt = f"Mortgage Value ${tile.get('mortgage', 100)}"
+            mtg_rr = core.get_property_mortgage(tile_id, tile.get("mortgage", 100))
+            mtg_txt = f"Mortgage Value ${mtg_rr}"
             self.surface.blit(self.font_deed_footer.render(mtg_txt, True, TEXT_MUTED), (inner_rect.centerx - 45, ry))
 
             owner = core.property_owner[tile_id]
@@ -1305,7 +1307,8 @@ class MonopolyRenderer:
 
             pygame.draw.line(self.surface, (200, 205, 215), (inner_rect.x + 8, ry + 4), (inner_rect.right - 8, ry + 4), 1)
             ry += 10
-            mtg_txt = f"Mortgage Value ${tile.get('mortgage', 75)}"
+            mtg_util = core.get_property_mortgage(tile_id, tile.get("mortgage", 75))
+            mtg_txt = f"Mortgage Value ${mtg_util}"
             self.surface.blit(self.font_deed_footer.render(mtg_txt, True, TEXT_MUTED), (inner_rect.centerx - 45, ry))
 
             owner = core.property_owner[tile_id]
@@ -1458,7 +1461,8 @@ class MonopolyRenderer:
         band_col = COLOR_HEADER_MAP.get(color_grp, (70, 80, 95))
         p_badge = pygame.Rect(cx - 140, hud_box.y + 38, 280, 26)
         pygame.draw.rect(self.surface, band_col, p_badge, border_radius=4)
-        t_prop = self.font_badge.render(f"{p_name} (List: ${tile['price']})", True, (255, 255, 255))
+        eff_price = core.get_property_price(prop_id, tile["price"])
+        t_prop = self.font_badge.render(f"{p_name} (List: ${eff_price})", True, (255, 255, 255))
         self.surface.blit(t_prop, (cx - t_prop.get_width() // 2, p_badge.y + 5))
 
         b_box = pygame.Rect(cx - 130, hud_box.y + 72, 260, 52)

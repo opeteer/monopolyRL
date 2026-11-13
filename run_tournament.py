@@ -24,6 +24,7 @@ def parse_args():
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu", help="Device")
     parser.add_argument("--house_rules", type=str, default=None, help="Custom house rules (e.g. 'half_cash', 'half_starting_cash')")
     parser.add_argument("--half_cash", action="store_true", default=False, help="House rule convenience flag: start with $750 cash (half of standard $1,500)")
+    parser.add_argument("--fixed_first_player", action="store_false", dest="randomize_first_player", default=True, help="Keep Player 0 as fixed starting player instead of randomizing first seat")
     return parser.parse_args()
 
 
@@ -47,7 +48,12 @@ def run_tournament_match(args):
         active_house_rules = "half_cash" if not active_house_rules else f"{active_house_rules},half_cash"
 
     # Core environment initialized strictly with seed=None -> generate_hardware_entropy_seed()
-    core = MonopolyCore(seed=None, max_rounds=None, house_rules=active_house_rules)
+    core = MonopolyCore(
+        seed=None,
+        max_rounds=None,
+        house_rules=active_house_rules,
+        randomize_first_player=args.randomize_first_player,
+    )
     hw_seed = core.current_seed
 
     print("=" * 65)
@@ -56,6 +62,7 @@ def run_tournament_match(args):
     print(f"Active Seed (Hardware Fluctuation Entropy): {hw_seed} (0x{hw_seed:08X})")
     print(f"Policy Checkpoint : {args.checkpoint}")
     print(f"Sampling Mode     : {'Deterministic (Argmax)' if args.deterministic else 'Stochastic (Mixed-Strategy)'}")
+    print(f"First Mover       : P{core.starting_player} ({core.get_player_name(core.starting_player)}) [{'Randomized' if args.randomize_first_player else 'Fixed P0'}]")
     print(f"Tournament Rules  : Unbounded Horizon Survival (Plays until 1 sole winner)")
     print("-" * 65)
 

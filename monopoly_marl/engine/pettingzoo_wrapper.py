@@ -35,6 +35,7 @@ class MonopolyParallelEnv(ParallelEnv):
         allow_trade: bool = True,
         include_synergy_obs: bool = True,
         player_names: Optional[List[str]] = None,
+        randomize_first_player: bool = False,
     ):
         super().__init__()
         self.possible_agents = [f"player_{i}" for i in range(4)]
@@ -50,6 +51,7 @@ class MonopolyParallelEnv(ParallelEnv):
             allow_trade=allow_trade,
             include_synergy_obs=include_synergy_obs,
             player_names=self.player_names,
+            randomize_first_player=randomize_first_player,
         )
         self.seed_val = seed
 

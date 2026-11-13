@@ -3,6 +3,7 @@
 from typing import Dict, List, Optional, Union, TYPE_CHECKING
 from monopoly_marl.house_rules.base import HouseRule
 from monopoly_marl.house_rules.rules.half_starting_cash import HalfStartingCashRule
+from monopoly_marl.house_rules.rules.property_cost_inflation import PropertyCostInflation25Rule
 
 if TYPE_CHECKING:
     from monopoly_marl.engine.monopoly_core import MonopolyCore
@@ -13,6 +14,11 @@ BUILTIN_RULES_FACTORY = {
     "half_starting_cash": HalfStartingCashRule,
     "half_cash": HalfStartingCashRule,
     "austerity": HalfStartingCashRule,
+    "property_cost_plus_25": PropertyCostInflation25Rule,
+    "property_inflation_25": PropertyCostInflation25Rule,
+    "inflation_25": PropertyCostInflation25Rule,
+    "plus_25_cost": PropertyCostInflation25Rule,
+    "property_up_25": PropertyCostInflation25Rule,
 }
 
 
@@ -53,6 +59,29 @@ class HouseRulesManager:
         for rule in self.active_rules:
             cash = rule.modify_starting_cash(cash)
         return cash
+
+    def get_property_price(self, tile_id: int, default_price: int) -> int:
+        """Calculates effective property purchase price after applying active modifiers."""
+        price = default_price
+        for rule in self.active_rules:
+            price = rule.modify_property_price(tile_id, price)
+        return price
+
+    def get_house_cost(self, tile_id: int, default_house_cost: int) -> int:
+        """Calculates effective house/hotel build cost after applying active modifiers."""
+        cost = default_house_cost
+        for rule in self.active_rules:
+            cost = rule.modify_house_cost(tile_id, cost)
+        return cost
+
+    def get_mortgage_value(
+        self, tile_id: int, default_mortgage: int, modified_price: Optional[int] = None
+    ) -> int:
+        """Calculates effective mortgage value after applying active modifiers."""
+        mtg = default_mortgage
+        for rule in self.active_rules:
+            mtg = rule.modify_mortgage_value(tile_id, mtg, modified_price=modified_price)
+        return mtg
 
     def apply_game_init(self, core: "MonopolyCore"):
         """Dispatches game initialization hooks to all active house rules."""

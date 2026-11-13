@@ -777,6 +777,146 @@ def test_gui_startup_paused_state():
     assert dashboard.btn_pause.label == "PLAY"
 
 
+def test_creditor_reset_prevents_cross_turn_and_chairman_inheritance():
+    """Validates last_creditor clears across turns and on multi-player Chairman obligations."""
+    from monopoly_marl.engine.monopoly_core import MonopolyCore
+
+    core = MonopolyCore(seed=42)
+    # Simulate Player 0 paying rent to Player 2 on an earlier turn, then ending turn
+    core.last_creditor = 2
+    core._end_turn()
+    assert core.last_creditor is None
+
+    # Simulate stale creditor somehow set before Player 1 draws Elected Chairman of the Board
+    core.last_creditor = 2
+    core.current_player = 1
+    core.active_decision_player = 1
+    core.cash[1] = 30
+    core.property_owner[37] = 1  # Park Place owned (already mortgaged) by Player 1
+    core.property_mortgaged[37] = True
+    core._execute_card_action(
+        1,
+        {"id": 13, "name": "Elected Chairman of the Board", "action": "pay_each_player", "amount": 50},
+        is_double=False,
+    )
+    assert core.last_creditor is None
+    assert core.cash[1] < 0
+    core._resolve_bankruptcy(1)
+    assert core.bankrupt[1] is True
+    # Must revert to Bank (-1), NOT leak to unrelated Player 2
+    assert core.property_owner[37] == -1
+
+    # Whereas Birthday collection ("collect_from_each_player") legitimately sets active player as creditor
+    core2 = MonopolyCore(seed=42)
+    core2.current_player = 0
+    core2.active_decision_player = 0
+    core2.cash[3] = 5
+    core2.property_owner[39] = 3
+    core2.property_mortgaged[39] = True
+    core2._execute_card_action(
+        0,
+        {"id": 108, "name": "It is Your Birthday", "action": "collect_from_each_player", "amount": 10},
+        is_double=False,
+    )
+    assert core2.last_creditor == 0
+    assert core2.cash[3] < 0
+    core2._resolve_bankruptcy(3)
+    assert core2.bankrupt[3] is True
+    assert core2.property_owner[39] == 0
+
+
+def test_auction_bidding_order_rotates_from_current_player():
+    """Validates auction turn order rotates from current_player rather than fixing [0,1,2,3]."""
+    from monopoly_marl.engine.monopoly_core import MonopolyCore
+
+    core = MonopolyCore(seed=42)
+    core.current_player = 2
+    core._start_auction(property_id=39, is_double_pending=False)
+    assert core.auction_active_bidders == [2, 3, 0, 1]
+    assert core.active_decision_player == 2
+
+    core.bankrupt[3] = True
+    core.current_player = 1
+    core._start_auction(property_id=24, is_double_pending=False)
+    assert core.auction_active_bidders == [1, 2, 0]
+    assert core.active_decision_player == 1
+
+
+def test_randomize_first_player_round_counting():
+    """Validates fair randomized starting seat and modulo round_count progression."""
+    from monopoly_marl.engine.monopoly_core import MonopolyCore
+
+    seats_seen = set()
+    for s in range(30):
+        c = MonopolyCore(seed=100 + s, randomize_first_player=True)
+        seats_seen.add(c.starting_player)
+        assert c.current_player == c.starting_player
+        assert c.active_decision_player == c.starting_player
+    assert len(seats_seen) == 4
+
+    # Verify round_count increments only after full cycle back to starting_player
+    c = MonopolyCore(seed=101, randomize_first_player=True)
+    # Force starting_player = 2 to test wrap-around deterministically
+    c.starting_player = 2
+    c.current_player = 2
+    c.round_count = 0
+    c._end_turn()  # 2 -> 3
+    assert c.current_player == 3 and c.round_count == 0
+    c._end_turn()  # 3 -> 0
+    assert c.current_player == 0 and c.round_count == 0
+    c._end_turn()  # 0 -> 1
+    assert c.current_player == 1 and c.round_count == 0
+    c._end_turn()  # 1 -> 2 (completed full cycle!)
+    assert c.current_player == 2 and c.round_count == 1
+
+
+def test_cli_tournament_defaults_to_randomize_first_player(monkeypatch):
+    """Validates run_tournament CLI defaults to randomized first seat with --fixed_first_player opt-out."""
+    import sys
+    import run_tournament
+
+    monkeypatch.setattr(sys, "argv", ["run_tournament.py"])
+    args_default = run_tournament.parse_args()
+    assert args_default.randomize_first_player is True
+
+    monkeypatch.setattr(sys, "argv", ["run_tournament.py", "--fixed_first_player"])
+    args_fixed = run_tournament.parse_args()
+    assert args_fixed.randomize_first_player is False
+
+
+def test_training_pipeline_randomize_first_player_support(monkeypatch):
+    """Validates MonopolyParallelEnv forwarding and main_train CLI randomize_first_player default/opt-out."""
+    import sys
+    import main_train
+    from monopoly_marl.engine.pettingzoo_wrapper import MonopolyParallelEnv
+
+    # MonopolyParallelEnv keeps backward-compatible False default, and supports True
+    env_default = MonopolyParallelEnv(seed=42)
+    _, infos_default = env_default.reset(seed=42)
+    assert infos_default["player_0"]["active_player"] == 0
+
+    env_rand = MonopolyParallelEnv(seed=42, randomize_first_player=True)
+    seats_seen = set()
+    for s in range(30):
+        _, infos = env_rand.reset(seed=200 + s)
+        active = infos["player_0"]["active_player"]
+        assert active == env_rand.core.starting_player
+        seats_seen.add(active)
+    assert len(seats_seen) == 4
+
+    # main_train defaults to randomize_first_player=True unless --fixed_first_player is specified
+    monkeypatch.setattr(sys, "argv", ["main_train.py"])
+    train_args_default = main_train.parse_args()
+    assert train_args_default.randomize_first_player is True
+
+    monkeypatch.setattr(sys, "argv", ["main_train.py", "--fixed_first_player"])
+    train_args_fixed = main_train.parse_args()
+    assert train_args_fixed.randomize_first_player is False
+
+
+
+
+
 
 
 

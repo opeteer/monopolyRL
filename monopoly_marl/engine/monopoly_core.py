@@ -139,6 +139,7 @@ class MonopolyCore:
         include_synergy_obs: bool = True,
         player_names: Optional[List[str]] = None,
         house_rules: Optional[Any] = None,
+        randomize_first_player: bool = False,
     ):
         if seed is None:
             seed = generate_hardware_entropy_seed()
@@ -147,6 +148,7 @@ class MonopolyCore:
         self.np_rng = np.random.default_rng(seed)
         self.max_rounds = max_rounds  # None indicates unbounded horizon (infinite survival)
         self.gamma = gamma
+        self.randomize_first_player = bool(randomize_first_player)
         self.player_names = list(player_names) if player_names is not None else list(DEFAULT_PLAYER_NAMES)
 
         # Modular Custom House Rules System
@@ -178,7 +180,63 @@ class MonopolyCore:
             return self.player_names[player_id]
         return f"Player {player_id}"
 
-    def reset(self, seed: Optional[int] = None) -> Dict[str, Any]:
+    def _init_effective_tile_costs(self):
+        """Precomputes per-tile effective purchase prices, house costs, and mortgages."""
+        prices = [0] * 40
+        house_costs = [0] * 40
+        mortgages = [0] * 40
+        prices_f = [0.0] * 40
+        house_costs_f = [0.0] * 40
+        mortgages_f = [0.0] * 40
+
+        for tid in range(40):
+            tile = TILES_DATA[tid]
+            eff_p = None
+            if "price" in tile:
+                eff_p = self.house_rules.get_property_price(tid, int(tile["price"]))
+                prices[tid] = eff_p
+                prices_f[tid] = float(eff_p)
+
+            if "house_cost" in tile:
+                eff_hc = self.house_rules.get_house_cost(tid, int(tile["house_cost"]))
+                house_costs[tid] = eff_hc
+                house_costs_f[tid] = float(eff_hc)
+
+            if "mortgage" in tile:
+                eff_m = self.house_rules.get_mortgage_value(
+                    tid, int(tile["mortgage"]), modified_price=eff_p
+                )
+                mortgages[tid] = eff_m
+                mortgages_f[tid] = float(eff_m)
+
+        self.tile_prices = tuple(prices)
+        self.tile_house_costs = tuple(house_costs)
+        self.tile_mortgages = tuple(mortgages)
+        self._tile_prices_f = tuple(prices_f)
+        self._tile_house_costs_f = tuple(house_costs_f)
+        self._tile_mortgages_f = tuple(mortgages_f)
+
+    def get_property_price(self, tile_id: int, default: int = 0) -> int:
+        """Returns effective purchase price of tile_id after active House Rules."""
+        if tile_id is not None and 0 <= tile_id < 40 and self.tile_prices[tile_id] > 0:
+            return self.tile_prices[tile_id]
+        return default
+
+    def get_property_house_cost(self, tile_id: int, default: int = 0) -> int:
+        """Returns effective house/hotel build cost of tile_id after active House Rules."""
+        if tile_id is not None and 0 <= tile_id < 40 and self.tile_house_costs[tile_id] > 0:
+            return self.tile_house_costs[tile_id]
+        return default
+
+    def get_property_mortgage(self, tile_id: int, default: int = 0) -> int:
+        """Returns effective mortgage value of tile_id after active House Rules."""
+        if tile_id is not None and 0 <= tile_id < 40 and self.tile_mortgages[tile_id] > 0:
+            return self.tile_mortgages[tile_id]
+        return default
+
+    def reset(
+        self, seed: Optional[int] = None, randomize_first_player: Optional[bool] = None
+    ) -> Dict[str, Any]:
         """Resets the environment to initial tournament starting state."""
         if seed is None:
             seed = generate_hardware_entropy_seed()
@@ -187,6 +245,7 @@ class MonopolyCore:
         self.rng.seed(seed)
         self.np_rng = np.random.default_rng(seed)
         self.deck_manager.reset(seed)
+        self._init_effective_tile_costs()
 
         # 4 Players: 0, 1, 2, 3 (Cash determined by official rules or custom House Rules)
         starting_cash = self.house_rules.get_starting_cash(default_cash=1500)
@@ -211,8 +270,11 @@ class MonopolyCore:
         self.property_mortgaged = [False] * 40
 
         # Turn & State Machine Trackers
-        self.current_player = 0
-        self.active_decision_player = 0
+        use_rand_first = self.randomize_first_player if randomize_first_player is None else bool(randomize_first_player)
+        self.starting_player = int(self.rng.randint(0, 3)) if use_rand_first else 0
+        self.current_player = self.starting_player
+        self.active_decision_player = self.starting_player
+        self.last_creditor: Optional[int] = None
         self.round_count = 0
         self.turn_step = 0
         self.consecutive_doubles = 0
@@ -253,6 +315,8 @@ class MonopolyCore:
             self.house_rules.apply_game_init(self)
         else:
             self.event_log: List[str] = ["Tournament game started. All players initialized with $1500."]
+        if self.starting_player != 0:
+            self.event_log.append(f"First turn assigned to {self.get_player_name(self.starting_player)}.")
         self.last_card_drawn: Optional[Dict[str, Any]] = None
 
         # Precompute initial potentials for PBRS
@@ -291,8 +355,8 @@ class MonopolyCore:
         for p in PURCHASABLE_TILES_TUPLE:
             if self.property_owner[p] == player_id:
                 m_p = 1.0 if self.property_mortgaged[p] else 0.0
-                term2_prop += (TILE_PRICES[p] - m_p * TILE_MORTGAGES[p])
-                term2_house += float(self.property_houses[p] * TILE_HOUSE_COSTS[p])
+                term2_prop += (self._tile_prices_f[p] - m_p * self._tile_mortgages_f[p])
+                term2_house += float(self.property_houses[p] * self._tile_house_costs_f[p])
         term2 = (self.w2 * term2_prop) + (self.w_house * term2_house)
 
         # Term 3: Monopoly complete groups
@@ -462,8 +526,8 @@ class MonopolyCore:
         if cash <= 1:
             return 0
 
-        price = tile.get("price", 100)
-        mortgage = tile.get("mortgage", price // 2)
+        price = self.get_property_price(tile_id, tile.get("price", 100))
+        mortgage = self.get_property_mortgage(tile_id, price // 2)
         grp = tile.get("color")
 
         # 1. Environmental Factor A: Proximity to deadly opponent properties (Hazard Threat)
@@ -542,7 +606,7 @@ class MonopolyCore:
             return np.zeros(8, dtype=np.float32)
 
         tile = TILES_DATA[target_prop]
-        price = float(tile.get("price", 100))
+        price = float(self.get_property_price(target_prop, tile.get("price", 100)))
         grp = tile.get("color")
 
         # 1. Monopoly for me
@@ -696,8 +760,8 @@ class MonopolyCore:
         escapes_starvation = 1.0 if (my_mono_before == 0 and my_mono_after >= 1) else 0.0
         is_mutual_monopoly_trade = 1.0 if (completes_my_monopoly > 0.5 and completes_opp_monopoly > 0.5) else 0.0
         net_cash_gain = (gain_c - give_c) / 1000.0
-        gain_val = float(TILES_DATA[gain_p].get("price", 0)) if (0 <= gain_p < 40) else 0.0
-        give_val = float(TILES_DATA[give_p].get("price", 0)) if (0 <= give_p < 40) else 0.0
+        gain_val = float(self.get_property_price(gain_p, 0)) if (0 <= gain_p < 40) else 0.0
+        give_val = float(self.get_property_price(give_p, 0)) if (0 <= give_p < 40) else 0.0
         net_equity_gain = ((gain_val + gain_c) - (give_val + give_c)) / 1000.0
 
         strategic_impact = [
@@ -800,7 +864,7 @@ class MonopolyCore:
         # 3. PHASE_BUY_OR_AUCTION
         elif self.phase == PHASE_BUY_OR_AUCTION:
             tile_id = self.landed_property
-            price = TILES_DATA[tile_id]["price"] if tile_id is not None and 0 <= tile_id < len(TILES_DATA) else 999999
+            price = self.get_property_price(tile_id, 999999) if tile_id is not None else 999999
             cash = self.cash[player_id]
 
             # Official Monopoly Rule: Direct purchase is legal whenever player has enough cash
@@ -826,7 +890,7 @@ class MonopolyCore:
 
                 # Jump Bids (allowed if bidder has cash)
                 tile = TILES_DATA[self.auction_property]
-                price = tile.get("price", 100)
+                price = self.get_property_price(self.auction_property, tile.get("price", 100))
                 if price > current_bid and cash >= price:
                     mask_auction[ACT_AUC_JUMP_LIST] = 1
 
@@ -861,7 +925,7 @@ class MonopolyCore:
                 if self.property_owner[p] == player_id:
                     grp = tile.get("color")
                     h = self.property_houses[p]
-                    h_cost = tile.get("house_cost", 0)
+                    h_cost = self.get_property_house_cost(p, 0)
 
                     # BUILD HOUSE / HOTEL
                     if tile["type"] == TILE_STREET and grp and p not in sold_turn:
@@ -920,7 +984,7 @@ class MonopolyCore:
 
                     # UNMORTGAGE
                     if self.property_mortgaged[p] and p not in mortgaged_turn:
-                        unmtg_cost = int(tile["mortgage"] * (1.0 + UNMORTGAGE_INTEREST_RATE))
+                        unmtg_cost = int(self.get_property_mortgage(p, tile.get("mortgage", 0)) * (1.0 + UNMORTGAGE_INTEREST_RATE))
                         if self.cash[player_id] >= unmtg_cost:
                             mask_property[120 + p] = 1
 
@@ -1264,6 +1328,7 @@ class MonopolyCore:
         """Handles player in jail: roll doubles, pay $50, or use GOOJF card."""
         if core_act == ACT_CORE_PAY_JAIL_50 and masks["core"][ACT_CORE_PAY_JAIL_50]:
             self.cash[p] -= 50
+            self.last_creditor = None
             self.in_jail[p] = False
             self.jail_turns[p] = 0
             self.event_log.append(f"{self.get_player_name(p)} paid $50 fine to get out of Jail.")
@@ -1305,6 +1370,7 @@ class MonopolyCore:
                 if self.jail_turns[p] >= 3:
                     # Turn 3 failed double: must pay $50 fine and move!
                     self.cash[p] -= 50
+                    self.last_creditor = None
                     self.in_jail[p] = False
                     self.jail_turns[p] = 0
                     self.event_log.append(f"{self.get_player_name(p)} served 3 turns in Jail. Paid $50 mandatory fine and moves {d1 + d2} spaces.")
@@ -1376,7 +1442,7 @@ class MonopolyCore:
             return
 
         tile = TILES_DATA[tile_id]
-        price = tile["price"]
+        price = self.get_property_price(tile_id, tile["price"])
 
         if core_act == ACT_CORE_BUY_DIRECT and self.cash[p] >= price:
             self.cash[p] -= price
@@ -1397,7 +1463,12 @@ class MonopolyCore:
         self.auction_property = property_id
         self.auction_highest_bid = 0
         self.auction_highest_bidder = -1
-        self.auction_active_bidders = [pl for pl in range(4) if not self.bankrupt[pl]]
+        start_p = self.current_player
+        self.auction_active_bidders = [
+            (start_p + off) % 4
+            for off in range(4)
+            if not self.bankrupt[(start_p + off) % 4]
+        ]
         self.auction_current_bidder_idx = 0
         self.pending_auction_double = is_double_pending
         self.phase = PHASE_AUCTION
@@ -1408,7 +1479,7 @@ class MonopolyCore:
         current_bid = self.auction_highest_bid
         cash = self.cash[p]
         tile = TILES_DATA[self.auction_property]
-        price = tile.get("price", 100)
+        price = self.get_property_price(self.auction_property, tile.get("price", 100))
 
         bid_inc = 0
         if auc_act == ACT_AUC_BID_1:
@@ -1514,7 +1585,7 @@ class MonopolyCore:
             if 0 <= prop_act < 40:
                 tile = TILES_DATA[prop_act]
                 if tile["type"] == TILE_STREET and "house_cost" in tile:
-                    h_cost = tile["house_cost"]
+                    h_cost = self.get_property_house_cost(prop_act, tile["house_cost"])
                     h = self.property_houses[prop_act]
                     if h < 4:
                         self.property_houses[prop_act] += 1
@@ -1537,7 +1608,7 @@ class MonopolyCore:
                 p_idx = prop_act - 40
                 tile = TILES_DATA[p_idx]
                 if tile["type"] == TILE_STREET and "house_cost" in tile:
-                    h_cost = tile["house_cost"]
+                    h_cost = self.get_property_house_cost(p_idx, tile["house_cost"])
                     h = self.property_houses[p_idx]
                     refund = int(h_cost * HOUSE_REFUND_RATE)
                     if h <= 4:
@@ -1559,7 +1630,7 @@ class MonopolyCore:
                 p_idx = prop_act - 80
                 tile = TILES_DATA[p_idx]
                 if "mortgage" in tile and p_idx in PURCHASABLE_TILES:
-                    mtg_val = tile["mortgage"]
+                    mtg_val = self.get_property_mortgage(p_idx, tile["mortgage"])
                     self.property_mortgaged[p_idx] = True
                     self.cash[p] += mtg_val
                     self.mortgaged_this_turn.add(p_idx)
@@ -1570,7 +1641,7 @@ class MonopolyCore:
                 p_idx = prop_act - 120
                 tile = TILES_DATA[p_idx]
                 if "mortgage" in tile and p_idx in PURCHASABLE_TILES:
-                    cost = int(tile["mortgage"] * (1.0 + UNMORTGAGE_INTEREST_RATE))
+                    cost = int(self.get_property_mortgage(p_idx, tile["mortgage"]) * (1.0 + UNMORTGAGE_INTEREST_RATE))
                     self.property_mortgaged[p_idx] = False
                     self.cash[p] -= cost
                     self.unmortgaged_this_turn.add(p_idx)
@@ -1593,7 +1664,7 @@ class MonopolyCore:
             # but the cash head chose a bracket below the deed's statutory mortgage floor,
             # snap offer_cash_idx to a competitive legal bracket the agent can afford.
             if trade_offer_prop >= 40 and 0 <= trade_req_prop < 40:
-                min_cash = TILES_DATA[trade_req_prop]["mortgage"]
+                min_cash = self.get_property_mortgage(trade_req_prop, TILES_DATA[trade_req_prop]["mortgage"])
                 cur_cash = TRADE_CASH_BRACKETS[min(trade_offer_cash_idx, len(TRADE_CASH_BRACKETS) - 1)]
                 if cur_cash < min_cash:
                     target_cash = 500 if self.cash[p] >= 500 else (250 if self.cash[p] >= 250 else min_cash)
@@ -1667,13 +1738,13 @@ class MonopolyCore:
             # Pure cash purchase: If requesting a property without offering a property in return,
             # cash offered must be at least the property's statutory mortgage value
             if 0 <= req_prop < 40:
-                min_cash_required = TILES_DATA[req_prop]["mortgage"]
+                min_cash_required = self.get_property_mortgage(req_prop, TILES_DATA[req_prop]["mortgage"])
                 if offer_cash < min_cash_required:
                     return False
 
         # Pure cash property sale: ensure requested cash meets at least statutory mortgage value
         if 0 <= offer_prop < 40 and req_prop >= 40:
-            min_cash_required = TILES_DATA[offer_prop]["mortgage"]
+            min_cash_required = self.get_property_mortgage(offer_prop, TILES_DATA[offer_prop]["mortgage"])
             if req_cash < min_cash_required:
                 valid_brackets = [b for b in TRADE_CASH_BRACKETS if b >= min_cash_required]
                 if valid_brackets:
@@ -1864,6 +1935,7 @@ class MonopolyCore:
         elif action == "pay_bank":
             amount = card["amount"]
             self.cash[p] -= amount
+            self.last_creditor = None
             self._proceed_to_manage_or_next(p, is_double)
 
         elif action == "goojf":
@@ -1890,6 +1962,7 @@ class MonopolyCore:
             total_hotels = sum(1 for t in owned if self.property_houses[t] == 5)
             repairs = total_houses * h_cost + total_hotels * hotel_cost
             self.cash[p] -= repairs
+            self.last_creditor = None
             self.event_log.append(f"{self.get_player_name(p)} paid ${repairs} in property repairs.")
             self._proceed_to_manage_or_next(p, is_double)
 
@@ -1899,6 +1972,7 @@ class MonopolyCore:
                 if pl != p and not self.bankrupt[pl]:
                     self.cash[p] -= amt
                     self.cash[pl] += amt
+            self.last_creditor = None
             self._proceed_to_manage_or_next(p, is_double)
 
         elif action == "collect_from_each_player":
@@ -1907,6 +1981,7 @@ class MonopolyCore:
                 if pl != p and not self.bankrupt[pl]:
                     self.cash[pl] -= amt
                     self.cash[p] += amt
+            self.last_creditor = p
             self._proceed_to_manage_or_next(p, is_double)
 
         else:
@@ -1941,7 +2016,7 @@ class MonopolyCore:
             max_h = max(self.property_houses[t] for t in group_tiles)
             top_tiles = [t for t in group_tiles if self.property_houses[t] == max_h]
             t_sell = top_tiles[0]
-            cost = TILES_DATA[t_sell]["house_cost"]
+            cost = self.get_property_house_cost(t_sell, TILES_DATA[t_sell]["house_cost"])
             refund = int(cost * HOUSE_REFUND_RATE)
 
             if max_h <= 4:
@@ -1976,7 +2051,7 @@ class MonopolyCore:
         # 2. Mortgage properties if still in debt
         for t in owned_props:
             if not self.property_mortgaged[t] and self.cash[p] < 0:
-                mtg = TILES_DATA[t]["mortgage"]
+                mtg = self.get_property_mortgage(t, TILES_DATA[t]["mortgage"])
                 self.property_mortgaged[t] = True
                 self.cash[p] += mtg
 
@@ -2042,6 +2117,7 @@ class MonopolyCore:
         """Rotates to next active player."""
         self.consecutive_doubles = 0
         self.landed_property = None
+        self.last_creditor = None
         self.turn_step += 1
         self.manage_actions_this_turn = 0
         self.trade_proposals_this_turn = 0
@@ -2059,7 +2135,8 @@ class MonopolyCore:
             if not self.bankrupt[self.current_player]:
                 break
 
-        if self.current_player <= prev_player:
+        start_p = getattr(self, "starting_player", 0)
+        if ((self.current_player - start_p) % 4) <= ((prev_player - start_p) % 4):
             self.round_count += 1
 
         # If next player is in jail, prompt jail decision; otherwise roll phase
@@ -2079,10 +2156,10 @@ class MonopolyCore:
             if self.property_owner[p] == pl:
                 tile = TILES_DATA[p]
                 if not self.property_mortgaged[p]:
-                    nw += tile["price"]
+                    nw += self.get_property_price(p, tile["price"])
                 else:
-                    nw += tile["mortgage"]
+                    nw += self.get_property_mortgage(p, tile["mortgage"])
                 h = self.property_houses[p]
                 if h > 0:
-                    nw += h * tile.get("house_cost", 0)
+                    nw += h * self.get_property_house_cost(p, tile.get("house_cost", 0))
         return nw

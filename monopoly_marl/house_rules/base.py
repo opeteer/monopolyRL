@@ -36,6 +36,20 @@ class HouseRule(ABC):
         """Hook to modify player starting cash upon match initialization."""
         return default_cash
 
+    def modify_property_price(self, tile_id: int, default_price: int) -> int:
+        """Hook to modify the nominal purchase price of a property tile."""
+        return default_price
+
+    def modify_house_cost(self, tile_id: int, default_house_cost: int) -> int:
+        """Hook to modify the cost to build a house or hotel on a street tile."""
+        return default_house_cost
+
+    def modify_mortgage_value(
+        self, tile_id: int, default_mortgage: int, modified_price: Optional[int] = None
+    ) -> int:
+        """Hook to modify the statutory mortgage value of a property tile."""
+        return default_mortgage
+
     def on_game_init(self, core: "MonopolyCore"):
         """Hook called when game state machine resets or initializes."""
         pass

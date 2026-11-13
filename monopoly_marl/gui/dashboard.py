@@ -84,7 +84,7 @@ class DashboardButton:
 class MonopolyDashboard:
     """Right-Hand Side Dashboard Panel with rich agent tracking and controls."""
 
-    def __init__(self, surface: pygame.Surface, x: int = 840, y: int = 20, width: int = 520, height: int = 800, initially_paused: bool = True):
+    def __init__(self, surface: pygame.Surface, x: int = 840, y: int = 20, width: int = 520, height: int = 800, initially_paused: bool = True, agent_labels: Optional[List[str]] = None):
         self.surface = surface
         self.rect = pygame.Rect(x, y, width, height)
 
@@ -101,6 +101,7 @@ class MonopolyDashboard:
 
         # Interactive states: start in paused state by default
         self.is_paused = initially_paused
+        self.agent_labels: List[str] = list(agent_labels) if agent_labels else []
         self.speed = 2  # 1, 2, 5, 20, 100
         self.speed_options = [1, 2, 5, 20, 100]
         self.show_help = False
@@ -182,7 +183,13 @@ class MonopolyDashboard:
         h_surf = self.font_header.render("TOURNAMENT RL AGENTS LEAGUE", True, TEXT_WHITE)
         self.surface.blit(h_surf, (self.rect.x + 20, self.rect.y + 14))
 
-        sub_h = self.font_stat.render("MAPPO CTDE League • Unbounded Horizon Survival", True, TEXT_MUTED)
+        if getattr(core, "house_rules", None) and core.house_rules.active_rules:
+            sub_txt = f"House Rule: {core.house_rules.get_rule_summary()}"
+            sub_col = (250, 204, 21)
+        else:
+            sub_txt = "MAPPO CTDE League • Unbounded Horizon Survival"
+            sub_col = TEXT_MUTED
+        sub_h = self.font_stat.render(sub_txt, True, sub_col)
         self.surface.blit(sub_h, (self.rect.x + 20, self.rect.y + 32))
 
         # Compute Net Worth Rankings (#1 to #4)
@@ -241,6 +248,15 @@ class MonopolyDashboard:
             r_rect = pygame.Rect(pill_rect.right + 6, y + 6, 24, 20)
             pygame.draw.rect(self.surface, rank_col, r_rect, border_radius=3)
             self.surface.blit(r_txt, (r_rect.centerx - r_txt.get_width() // 2, r_rect.centery - r_txt.get_height() // 2))
+
+        # Model / Policy Badge (e.g. 50M vs 100M)
+        if hasattr(self, "agent_labels") and self.agent_labels and p < len(self.agent_labels) and self.agent_labels[p]:
+            lbl = self.agent_labels[p]
+            lbl_surf = self.font_badge.render(lbl, True, (255, 255, 255))
+            lbl_bg = (142, 68, 173) if ("100M" in lbl or "100" in lbl) else (41, 128, 185)
+            lbl_rect = pygame.Rect(x + w - lbl_surf.get_width() - 14, y + 6, lbl_surf.get_width() + 10, 20)
+            pygame.draw.rect(self.surface, lbl_bg, lbl_rect, border_radius=4)
+            self.surface.blit(lbl_surf, (lbl_rect.centerx - lbl_surf.get_width() // 2, lbl_rect.centery - lbl_surf.get_height() // 2))
 
         # Status Badges
         if core.bankrupt[p]:

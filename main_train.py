@@ -96,6 +96,7 @@ def parse_args():
     parser.add_argument("--w_cash", type=float, default=defaults.get("w_cash", 0.0035), help="PBRS linear cash equity weight")
     parser.add_argument("--resume", type=str, default=None, help="Resume training: 'latest' or path to checkpoint file")
     parser.add_argument("--resume_checkpoint", type=str, default=None, help="Legacy alias for --resume")
+    parser.add_argument("--fixed_first_player", action="store_false", dest="randomize_first_player", default=defaults.get("randomize_first_player", True), help="Keep Player 0 as fixed starting player instead of randomizing first seat")
     parser.add_argument("--device", type=str, default=defaults.get("device", "cuda" if torch.cuda.is_available() else "cpu"), help="Device")
 
     return parser.parse_args(remaining_argv)
@@ -158,6 +159,7 @@ def main():
     num_league_envs = max(0, int(args.num_envs * args.league_rollout_fraction))
     print(f"Heterogeneous League Rollout: {num_league_envs}/{args.num_envs} envs ({args.league_rollout_fraction * 100:.0f}%)")
     print(f"Curriculum 2-Phase Learning: {'Enabled (Phase 2 unlock at ' + str(int(args.curriculum_phase_2_frac * 100)) + '%)' if args.curriculum else 'Disabled'}")
+    print(f"First Mover Seat: {'Randomized [0..3]' if args.randomize_first_player else 'Fixed (Player 0)'}")
 
     # Environment Configurations (Seed driven by hardware fluctuation entropy)
     env_configs = [
@@ -174,6 +176,7 @@ def main():
             w_house=args.w_house,
             w_cash=args.w_cash,
             allow_trade=not args.curriculum,
+            randomize_first_player=args.randomize_first_player,
         )
         for i in range(args.num_envs)
     ]
@@ -630,7 +633,11 @@ def main():
 
             # League Evaluation Match (Driven by hardware fluctuation entropy)
             if iteration % args.eval_interval == 0 and league_mgr.historical_records:
-                eval_env = MonopolyParallelEnv(max_rounds=100, seed=None)
+                eval_env = MonopolyParallelEnv(
+                    max_rounds=100,
+                    seed=None,
+                    randomize_first_player=args.randomize_first_player,
+                )
                 eval_obs, eval_infos = eval_env.reset()
                 lineup_policies, lineup_records = league_mgr.sample_match_lineup(main_actor, exploiter_actor, mode="league")
 
