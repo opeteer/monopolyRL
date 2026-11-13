@@ -66,6 +66,38 @@ class LeagueManager:
         self.exploiter_record = LeagueAgentRecord("MainExploiter", "exploiter", elo=1200.0)
         self.historical_records: List[LeagueAgentRecord] = []
 
+        # Load existing league state if present
+        summary_path = os.path.join(checkpoint_dir, "league_summary.json")
+        if os.path.exists(summary_path):
+            try:
+                with open(summary_path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                if "main_agent" in data:
+                    self.main_agent_record.elo = data["main_agent"].get("elo", 1200.0)
+                    self.main_agent_record.matches_played = data["main_agent"].get("matches_played", 0)
+                    self.main_agent_record.wins = data["main_agent"].get("wins", 0)
+                if "exploiter" in data:
+                    self.exploiter_record.elo = data["exploiter"].get("elo", 1200.0)
+                    self.exploiter_record.matches_played = data["exploiter"].get("matches_played", 0)
+                    self.exploiter_record.wins = data["exploiter"].get("wins", 0)
+                if "historical_pool" in data:
+                    for h_data in data["historical_pool"]:
+                        ckpt_path = h_data.get("checkpoint_path")
+                        if ckpt_path and os.path.exists(ckpt_path):
+                            rec = LeagueAgentRecord(
+                                name=h_data.get("name", "Historical"),
+                                role="historical",
+                                elo=h_data.get("elo", 1200.0),
+                                checkpoint_path=ckpt_path,
+                            )
+                            rec.matches_played = h_data.get("matches_played", 0)
+                            rec.wins = h_data.get("wins", 0)
+                            self.historical_records.append(rec)
+                    if len(self.historical_records) > self.max_historical_pool:
+                        self.historical_records = self.historical_records[-self.max_historical_pool:]
+            except Exception as e:
+                print(f"[LeagueManager] Notice: failed to load existing summary ({e}); starting fresh league state.")
+
         # Cached policy instances
         self.cached_historical_policies: Dict[str, ActorNetwork] = {}
 

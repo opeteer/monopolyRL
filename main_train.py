@@ -112,7 +112,15 @@ def find_latest_global_checkpoint() -> Optional[str]:
         candidates.extend(glob.glob(pat))
     if not candidates:
         return None
-    candidates.sort(key=lambda x: os.path.getmtime(x))
+
+    def extract_iteration(p: str) -> int:
+        try:
+            base = os.path.basename(p)
+            return int(base.split("_iter_")[1].split(".pt")[0])
+        except Exception:
+            return 0
+
+    candidates.sort(key=lambda x: (extract_iteration(x), os.path.getmtime(x)))
     return candidates[-1]
 
 
@@ -244,6 +252,8 @@ def main():
             total_steps_executed = meta["total_steps"]
         print(f"--> [Resume] Successfully restored. Resuming from iteration {start_iteration} (Total Steps: {total_steps_executed:,})")
 
+    initial_total_steps = total_steps_executed
+
     # Trainer & Buffer
     trainer = MAPPOTrainer(
         actor=main_actor,
@@ -268,7 +278,8 @@ def main():
     )
 
     league_mgr = LeagueManager(checkpoint_dir=checkpoint_dir, device=device)
-    league_mgr.save_checkpoint(main_actor, iteration=0, role="main")
+    if start_iteration <= 1:
+        league_mgr.save_checkpoint(main_actor, iteration=0, role="main")
 
     env_indices_t = torch.arange(args.num_envs, device=device)
     actions_per_env = {
@@ -548,7 +559,7 @@ def main():
 
             # Telemetry & Logging
             elapsed = time.time() - start_time
-            fps = int(total_steps_executed / elapsed)
+            fps = int((total_steps_executed - initial_total_steps) / max(0.001, elapsed))
             progress_pct = (iteration / args.num_iterations) * 100.0
 
             log_entry = {
@@ -678,10 +689,12 @@ def main():
             vec_env.close()
 
     total_time = time.time() - start_time
-    avg_speed = int(total_steps_executed / max(0.001, total_time))
+    session_steps = total_steps_executed - initial_total_steps
+    avg_speed = int(session_steps / max(0.001, total_time))
 
     summary_file = session_mgr.save_summary({
         "total_steps": total_steps_executed,
+        "session_steps": session_steps,
         "average_fps": avg_speed,
         "final_elo": league_mgr.main_agent_record.elo if hasattr(league_mgr, "main_agent_record") else 1200.0,
         "final_win_rate": league_mgr.main_agent_record.win_rate if hasattr(league_mgr, "main_agent_record") else 0.0,
@@ -689,7 +702,7 @@ def main():
 
     print(f"\n=======================================================")
     print(f"=== Training Session Finished! ===")
-    print(f"Total Steps: {total_steps_executed:,} | Elapsed: {total_time:.2f}s ({total_time/60:.1f} min)")
+    print(f"Total Steps: {total_steps_executed:,} (Session: {session_steps:,}) | Elapsed: {total_time:.2f}s ({total_time/60:.1f} min)")
     print(f"Average Speed: {avg_speed:,} steps/sec")
     print(f"Session Summary: {summary_file}")
     print(f"Checkpoints and Metrics in: {checkpoint_dir}/")
