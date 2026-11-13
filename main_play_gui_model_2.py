@@ -14,8 +14,9 @@ import pygame
 import torch
 import numpy as np
 
-from model_2.engine.monopoly_core import MonopolyCore
+from model_2.engine.monopoly_core import MonopolyCore, TRADE_CASH_BRACKETS as MODEL2_TRADE_CASH_BRACKETS
 from model_2.models.actor_network import ActorNetwork
+from monopoly_marl.engine.monopoly_core import TRADE_CASH_BRACKETS as MODEL1_TRADE_CASH_BRACKETS
 from monopoly_marl.models.actor_network import ActorNetwork as Model1ActorNetwork
 from model_2.gui.renderer import MonopolyRenderer, BG_COLOR
 from model_2.gui.dashboard import MonopolyDashboard
@@ -292,6 +293,22 @@ def main():
                 }
 
                 policy = policies[p_act]
+                m1_cash_adapt = (
+                    isinstance(policy, Model1ActorNetwork)
+                    and len(masks["trade_offer_cash"]) != len(MODEL1_TRADE_CASH_BRACKETS)
+                )
+                if m1_cash_adapt:
+                    trade_active_mask = int(np.sum(masks["trade_req_cash"]) > 1)
+                    if trade_active_mask:
+                        m1_offer = np.array([1 if core.cash[p_act] >= b else 0 for b in MODEL1_TRADE_CASH_BRACKETS], dtype=np.int8)
+                        m1_req = np.ones(len(MODEL1_TRADE_CASH_BRACKETS), dtype=np.int8)
+                    else:
+                        m1_offer = np.zeros(len(MODEL1_TRADE_CASH_BRACKETS), dtype=np.int8)
+                        m1_offer[0] = 1
+                        m1_req = m1_offer.copy()
+                    masks_t["trade_offer_cash"] = torch.tensor(m1_offer, dtype=torch.int8, device=device).unsqueeze(0)
+                    masks_t["trade_req_cash"] = torch.tensor(m1_req, dtype=torch.int8, device=device).unsqueeze(0)
+
                 with torch.no_grad():
                     if isinstance(policy, ActorNetwork):
                         actions_dict, _, _ = policy(
@@ -302,6 +319,14 @@ def main():
 
                 # Convert to integer actions
                 act = {k: int(actions_dict[k].item()) for k in action_keys}
+                if m1_cash_adapt:
+                    for key in ("trade_offer_cash", "trade_req_cash"):
+                        m1_val = MODEL1_TRADE_CASH_BRACKETS[act[key]]
+                        valid_indices = [i for i, flag in enumerate(masks[key]) if flag > 0]
+                        act[key] = min(
+                            valid_indices,
+                            key=lambda i: (abs(MODEL2_TRADE_CASH_BRACKETS[i] - m1_val), MODEL2_TRADE_CASH_BRACKETS[i]),
+                        )
 
                 # Step state machine
                 core.step({f"player_{p_act}": act})

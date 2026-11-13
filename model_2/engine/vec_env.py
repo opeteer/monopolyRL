@@ -14,6 +14,7 @@ from multiprocessing import shared_memory
 from typing import List, Dict, Any, Tuple, Optional
 import numpy as np
 
+from model_2.engine.monopoly_core import TRADE_CASH_DIM
 from model_2.engine.pettingzoo_wrapper import MonopolyParallelEnv
 
 ACTION_KEYS = [
@@ -28,9 +29,9 @@ MASK_DIMS = {
     "property": 161,
     "trade_target": 3,
     "trade_offer_prop": 41,
-    "trade_offer_cash": 10,
+    "trade_offer_cash": TRADE_CASH_DIM,
     "trade_req_prop": 41,
-    "trade_req_cash": 10,
+    "trade_req_cash": TRADE_CASH_DIM,
     "trade_response": 2,
 }
 

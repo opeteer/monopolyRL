@@ -43,6 +43,7 @@ class TrainingConfig:
     w_cash: float = 0.0045
     w_opp_mono: float = 0.90
     w_lead: float = 0.60
+    max_rounds: int = 80
     randomize_first_player: bool = True
     use_shm: bool = True
     device: str = "cpu"

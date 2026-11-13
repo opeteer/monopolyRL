@@ -8,6 +8,8 @@ from typing import Dict, Generator, Tuple, Any, Optional
 import numpy as np
 import torch
 
+from model_2.engine.monopoly_core import TRADE_CASH_DIM
+
 
 class RolloutBuffer:
     """Multi-Agent GAE Rollout Buffer supporting CTDE."""
@@ -43,9 +45,9 @@ class RolloutBuffer:
             "property": 161,
             "trade_target": 3,
             "trade_offer_prop": 41,
-            "trade_offer_cash": 10,
+            "trade_offer_cash": TRADE_CASH_DIM,
             "trade_req_prop": 41,
-            "trade_req_cash": 10,
+            "trade_req_cash": TRADE_CASH_DIM,
             "trade_response": 2,
         }
 
@@ -68,6 +70,7 @@ class RolloutBuffer:
         self.values = torch.zeros((buffer_size, num_envs, self.num_agents), dtype=torch.float32, device=device)
         self.log_probs = torch.zeros((buffer_size, num_envs, self.num_agents), dtype=torch.float32, device=device)
         self.active_masks = torch.ones((buffer_size, num_envs, self.num_agents), dtype=torch.float32, device=device)
+        self.exploiter_masks = torch.zeros((buffer_size, num_envs, self.num_agents), dtype=torch.float32, device=device)
 
         # Computed GAE targets
         self.advantages = torch.zeros((buffer_size, num_envs, self.num_agents), dtype=torch.float32, device=device)
@@ -87,6 +90,7 @@ class RolloutBuffer:
         values: torch.Tensor,
         log_probs: torch.Tensor,
         active_masks: Optional[torch.Tensor] = None,
+        exploiter_masks: Optional[torch.Tensor] = None,
     ):
         """Inserts a single environment transition into buffer."""
         self.obs[self.step] = obs
@@ -103,6 +107,10 @@ class RolloutBuffer:
             self.active_masks[self.step] = active_masks
         else:
             self.active_masks[self.step] = 1.0
+        if exploiter_masks is not None:
+            self.exploiter_masks[self.step] = exploiter_masks
+        else:
+            self.exploiter_masks[self.step].zero_()
 
         self.step = (self.step + 1) % self.buffer_size
         if self.step == 0:
@@ -125,6 +133,23 @@ class RolloutBuffer:
             self.advantages[t] = gae
             self.returns[t] = gae + self.values[t]
 
+    @staticmethod
+    def _normalize_masked_advantages(flat_advantages: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        """Normalizes advantages strictly over valid mask transitions without NaN on <=1 sample."""
+        mask_bool = mask > 0.5
+        if torch.any(mask_bool):
+            vals = flat_advantages[mask_bool]
+            if vals.numel() <= 1:
+                return torch.zeros_like(flat_advantages) if vals.numel() == 0 else (flat_advantages - vals.mean()).clamp(-10.0, 10.0)
+            adv_mean = vals.mean()
+            adv_std = vals.std(unbiased=False).clamp(min=1e-6)
+            return (flat_advantages - adv_mean) / (adv_std + 1e-8)
+        if flat_advantages.numel() <= 1:
+            return torch.zeros_like(flat_advantages)
+        adv_mean = flat_advantages.mean()
+        adv_std = flat_advantages.std(unbiased=False).clamp(min=1e-6)
+        return (flat_advantages - adv_mean) / (adv_std + 1e-8)
+
     def get_generator(self, num_mini_batches: int) -> Generator[Dict[str, Any], None, None]:
         """Yields randomized mini-batches for PPO updates."""
         # Flatten (buffer_size, num_envs) -> batch_size
@@ -139,21 +164,18 @@ class RolloutBuffer:
         flat_advantages = self.advantages.view(batch_size, self.num_agents)
         flat_returns = self.returns.view(batch_size, self.num_agents)
         flat_active_masks = self.active_masks.view(batch_size, self.num_agents)
+        flat_exploiter_masks = self.exploiter_masks.view(batch_size, self.num_agents)
 
         flat_actions = {k: self.actions[k].view(batch_size, self.num_agents) for k in self.action_keys}
         flat_masks = {k: self.action_masks[k].view(batch_size, self.num_agents, self.mask_dims[k]) for k in self.action_keys}
 
-        # Normalize advantages strictly over active decision transitions (excludes passive agents)
-        active_bool = flat_active_masks > 0.5
-        if torch.any(active_bool):
-            active_adv = flat_advantages[active_bool]
-            adv_mean = active_adv.mean()
-            adv_std = active_adv.std().clamp(min=1e-6)
-            norm_advantages = (flat_advantages - adv_mean) / (adv_std + 1e-8)
-        else:
-            adv_mean = flat_advantages.mean()
-            adv_std = flat_advantages.std().clamp(min=1e-6)
-            norm_advantages = (flat_advantages - adv_mean) / (adv_std + 1e-8)
+        # Normalize advantages over full batch per policy pool (excludes passive/other-policy agents)
+        norm_advantages = self._normalize_masked_advantages(flat_advantages, flat_active_masks)
+        norm_exp_advantages = (
+            self._normalize_masked_advantages(flat_advantages, flat_exploiter_masks)
+            if torch.any(flat_exploiter_masks > 0.5)
+            else flat_advantages
+        )
 
         indices = torch.randperm(batch_size, device=self.device)
 
@@ -168,6 +190,8 @@ class RolloutBuffer:
                 "values": flat_values[mb_idx],
                 "log_probs": flat_log_probs[mb_idx],
                 "advantages": norm_advantages[mb_idx],
+                "exploiter_advantages": norm_exp_advantages[mb_idx],
                 "returns": flat_returns[mb_idx],
                 "active_masks": flat_active_masks[mb_idx],
+                "exploiter_masks": flat_exploiter_masks[mb_idx],
             }

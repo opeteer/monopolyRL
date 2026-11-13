@@ -11,7 +11,12 @@ import gymnasium as gym
 from gymnasium import spaces
 from pettingzoo import ParallelEnv
 
-from model_2.engine.monopoly_core import MonopolyCore, TRADE_CASH_BRACKETS, DEFAULT_PLAYER_NAMES
+from model_2.engine.monopoly_core import (
+    MonopolyCore,
+    TRADE_CASH_BRACKETS,
+    TRADE_CASH_DIM,
+    DEFAULT_PLAYER_NAMES,
+)
 
 
 class MonopolyParallelEnv(ParallelEnv):
@@ -73,9 +78,9 @@ class MonopolyParallelEnv(ParallelEnv):
                     "property": spaces.Box(low=0, high=1, shape=(161,), dtype=np.int8),
                     "trade_target": spaces.Box(low=0, high=1, shape=(3,), dtype=np.int8),
                     "trade_offer_prop": spaces.Box(low=0, high=1, shape=(41,), dtype=np.int8),
-                    "trade_offer_cash": spaces.Box(low=0, high=1, shape=(10,), dtype=np.int8),
+                    "trade_offer_cash": spaces.Box(low=0, high=1, shape=(TRADE_CASH_DIM,), dtype=np.int8),
                     "trade_req_prop": spaces.Box(low=0, high=1, shape=(41,), dtype=np.int8),
-                    "trade_req_cash": spaces.Box(low=0, high=1, shape=(10,), dtype=np.int8),
+                    "trade_req_cash": spaces.Box(low=0, high=1, shape=(TRADE_CASH_DIM,), dtype=np.int8),
                     "trade_response": spaces.Box(low=0, high=1, shape=(2,), dtype=np.int8),
                 })
             })
@@ -90,9 +95,9 @@ class MonopolyParallelEnv(ParallelEnv):
                 "property": spaces.Discrete(161),
                 "trade_target": spaces.Discrete(3),
                 "trade_offer_prop": spaces.Discrete(41),
-                "trade_offer_cash": spaces.Discrete(10),
+                "trade_offer_cash": spaces.Discrete(TRADE_CASH_DIM),
                 "trade_req_prop": spaces.Discrete(41),
-                "trade_req_cash": spaces.Discrete(10),
+                "trade_req_cash": spaces.Discrete(TRADE_CASH_DIM),
                 "trade_response": spaces.Discrete(2),
             })
             for agent in self.possible_agents

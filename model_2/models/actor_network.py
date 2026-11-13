@@ -13,6 +13,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.distributions.categorical import Categorical
 
+from model_2.engine.monopoly_core import TRADE_CASH_DIM
+
 
 def init_weights(m: nn.Module, gain: float = np.sqrt(2)):
     """Applies uniform Orthogonal Initialization with specified gain."""
@@ -25,10 +27,11 @@ def init_weights(m: nn.Module, gain: float = np.sqrt(2)):
 class ActorNetwork(nn.Module):
     """Model-2 Residual Multi-Head Actor Network with SiLU + Dedicated Trade Response Pathway."""
 
-    def __init__(self, obs_dim: int = 500, hidden_dim: int = 384):
+    def __init__(self, obs_dim: int = 500, hidden_dim: int = 384, trade_cash_dim: int = TRADE_CASH_DIM):
         super().__init__()
         self.obs_dim = obs_dim
         self.hidden_dim = hidden_dim
+        self.trade_cash_dim = trade_cash_dim
 
         # Shared input projection trunk (SiLU + LayerNorm)
         self.trunk = nn.Sequential(
@@ -66,16 +69,20 @@ class ActorNetwork(nn.Module):
         # 4. Bilateral Trade Heads
         self.head_trade_target = nn.Linear(hidden_dim, 3)
         self.head_trade_offer_prop = nn.Linear(hidden_dim, 41)
-        self.head_trade_offer_cash = nn.Linear(hidden_dim, 10)
+        self.head_trade_offer_cash = nn.Linear(hidden_dim, trade_cash_dim)
         self.head_trade_req_prop = nn.Linear(hidden_dim, 41)
-        self.head_trade_req_cash = nn.Linear(hidden_dim, 10)
+        self.head_trade_req_cash = nn.Linear(hidden_dim, trade_cash_dim)
         self.head_trade_response = nn.Linear(hidden_dim // 2, 2)
 
         # Autoregressive zero-init trade conditioning embeddings:
-        # req_prop -> offer_prop, and (offer_prop, req_prop) -> cash heads
+        # req_prop -> trade_target -> offer_prop -> offer_cash -> req_cash
         self.emb_trade_req_for_offer = nn.Embedding(41, hidden_dim)
         self.emb_trade_offer_prop = nn.Embedding(41, hidden_dim)
         self.emb_trade_req_prop = nn.Embedding(41, hidden_dim)
+        self.emb_trade_req_for_target = nn.Embedding(41, hidden_dim)
+        self.emb_trade_target_for_offer = nn.Embedding(3, hidden_dim)
+        self.emb_trade_target_for_cash = nn.Embedding(3, hidden_dim)
+        self.emb_trade_offer_cash_for_req = nn.Embedding(trade_cash_dim, hidden_dim)
 
         # Apply strict Orthogonal Initialization
         self.apply_orthogonal_init()
@@ -104,6 +111,10 @@ class ActorNetwork(nn.Module):
         nn.init.zeros_(self.emb_trade_req_for_offer.weight)
         nn.init.zeros_(self.emb_trade_offer_prop.weight)
         nn.init.zeros_(self.emb_trade_req_prop.weight)
+        nn.init.zeros_(self.emb_trade_req_for_target.weight)
+        nn.init.zeros_(self.emb_trade_target_for_offer.weight)
+        nn.init.zeros_(self.emb_trade_target_for_cash.weight)
+        nn.init.zeros_(self.emb_trade_offer_cash_for_req.weight)
 
     def _encode_features(self, obs: torch.Tensor) -> torch.Tensor:
         h = self.trunk(obs)
@@ -192,8 +203,8 @@ class ActorNetwork(nn.Module):
         Sequential trade conditioning guarantees:
         - No identical offer_prop == req_prop
         - Zero dual-cash paradox (never offer_cash > 0 and req_cash > 0 simultaneously)
-        - Zero empty-handed begs (offer_prop=40, req_prop<40 forces offer_cash >= $25 when affordable)
-        - Zero one-sided property giveaways (offer_prop<40, req_prop=40 forces req_cash >= $25)
+        - Zero empty-handed begs (offer_prop=40, req_prop<40 forces offer_cash > $0 when affordable)
+        - Zero one-sided property giveaways (offer_prop<40, req_prop=40 forces req_cash > $0)
         """
         features = self._encode_features(obs)
         resp_features = self.trade_resp_branch(features)
@@ -204,7 +215,6 @@ class ActorNetwork(nn.Module):
             "core": Categorical(logits=self._mask_logits(self.head_core(features), action_masks["core"], temp)),
             "auction": Categorical(logits=self._mask_logits(self.head_auction(features), action_masks["auction"], temp)),
             "property": Categorical(logits=self._mask_logits(self.head_property(features), action_masks["property"], temp)),
-            "trade_target": Categorical(logits=self._mask_logits(self.head_trade_target(features), action_masks["trade_target"], temp)),
             "trade_response": Categorical(logits=self._mask_logits(self.head_trade_response(resp_features), action_masks["trade_response"], temp)),
         }
 
@@ -223,7 +233,20 @@ class ActorNetwork(nn.Module):
         )
         actions_dict["trade_req_prop"] = req_prop
 
-        # 2. Offered property conditioned on req_prop (cannot offer == request when both < 40)
+        # 1b. Trade target conditioned on req_prop (active when req_prop == 40)
+        feat_target = features + self.emb_trade_req_for_target(req_prop.clamp(0, 40))
+        dists["trade_target"] = Categorical(
+            logits=self._mask_logits(self.head_trade_target(feat_target), action_masks["trade_target"], temp)
+        )
+        trade_target = (
+            self._select_from_dist(dists["trade_target"], deterministic)
+            if given_actions is None else given_actions["trade_target"].to(device).long()
+        )
+        actions_dict["trade_target"] = trade_target
+        is_no_req = (req_prop == 40).float().unsqueeze(-1)
+        target_clamped = trade_target.clamp(0, 2)
+
+        # 2. Offered property conditioned on (req_prop, trade_target when req_prop == 40)
         base_op_mask = action_masks["trade_offer_prop"].to(device)
         cond_op_mask = base_op_mask.clone()
         is_req_tile = req_prop < 40
@@ -236,7 +259,11 @@ class ActorNetwork(nn.Module):
                 cond_op_mask,
             )
             cond_op_mask = self._safe_conditional_mask(cond_op_mask, base_op_mask)
-        feat_op = features + self.emb_trade_req_for_offer(req_prop.clamp(0, 40))
+        feat_op = (
+            features
+            + self.emb_trade_req_for_offer(req_prop.clamp(0, 40))
+            + is_no_req * self.emb_trade_target_for_offer(target_clamped)
+        )
         dists["trade_offer_prop"] = Categorical(
             logits=self._mask_logits(self.head_trade_offer_prop(feat_op), cond_op_mask, temp)
         )
@@ -246,11 +273,12 @@ class ActorNetwork(nn.Module):
         )
         actions_dict["trade_offer_prop"] = offer_prop
 
-        # 3. Cash heads conditioned on (offer_prop, req_prop)
+        # 3. Offer cash conditioned on (offer_prop, req_prop, trade_target when req_prop == 40)
         feat_cash = (
             features
             + self.emb_trade_offer_prop(offer_prop.clamp(0, 40))
             + self.emb_trade_req_prop(req_prop.clamp(0, 40))
+            + is_no_req * self.emb_trade_target_for_cash(target_clamped)
         )
 
         is_cash_buy = (offer_prop == 40) & (req_prop < 40)
@@ -274,7 +302,7 @@ class ActorNetwork(nn.Module):
         )
         actions_dict["trade_offer_cash"] = offer_cash
 
-        # 4. Requested cash conditioned on (offer_prop, req_prop, offer_cash) -> strictly zero dual-cash!
+        # 4. Requested cash conditioned on (offer_prop, req_prop, target, offer_cash) -> strictly zero dual-cash!
         base_rc_mask = action_masks["trade_req_cash"].to(device)
         cond_rc_mask = base_rc_mask.clone()
         force_zero_rc = (offer_cash > 0) | is_cash_buy
@@ -289,8 +317,9 @@ class ActorNetwork(nn.Module):
             cond_rc_mask[..., 0],
         )
         cond_rc_mask = self._safe_conditional_mask(cond_rc_mask, base_rc_mask)
+        feat_rc = feat_cash + self.emb_trade_offer_cash_for_req(offer_cash.clamp(0, self.trade_cash_dim - 1))
         dists["trade_req_cash"] = Categorical(
-            logits=self._mask_logits(self.head_trade_req_cash(feat_cash), cond_rc_mask, temp)
+            logits=self._mask_logits(self.head_trade_req_cash(feat_rc), cond_rc_mask, temp)
         )
         req_cash = (
             self._select_from_dist(dists["trade_req_cash"], deterministic)

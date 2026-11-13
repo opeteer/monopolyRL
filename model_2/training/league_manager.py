@@ -107,17 +107,25 @@ class LeagueManager:
         iteration: int,
         role: str = "main",
         metadata: Optional[Dict[str, Any]] = None,
+        critic: Optional[torch.nn.Module] = None,
+        exploiter: Optional[ActorNetwork] = None,
     ) -> str:
-        """Saves a policy checkpoint and registers it into historical league pool."""
+        """Saves a policy checkpoint (and optional critic/exploiter states) and updates historical league pool."""
         filename = f"{role}_iter_{iteration:05d}.pt"
         path = os.path.join(self.checkpoint_dir, filename)
 
-        torch.save({
+        payload: Dict[str, Any] = {
             "iteration": iteration,
             "role": role,
             "state_dict": policy.state_dict(),
             "metadata": metadata or {},
-        }, path)
+        }
+        if critic is not None:
+            payload["critic_state_dict"] = critic.state_dict()
+        if exploiter is not None:
+            payload["exploiter_state_dict"] = exploiter.state_dict()
+
+        torch.save(payload, path)
 
         if role == "main":
             # Add to historical pool

@@ -89,6 +89,7 @@ def parse_args():
     parser.add_argument("--ppo_epochs", type=int, default=defaults.get("ppo_epochs", 4), help="PPO optimization epochs per iteration")
     parser.add_argument("--num_mini_batches", type=int, default=defaults.get("num_mini_batches", 8), help="Number of mini-batches per epoch")
     parser.add_argument("--clip_param", type=float, default=defaults.get("clip_param", 0.12), help="PPO clip parameter (default: 0.12)")
+    parser.add_argument("--value_clip_param", type=float, default=defaults.get("value_clip_param", 2.0), help="PPO value clip range decoupled from policy clip (default: 2.0)")
     parser.add_argument("--target_kl", type=float, default=defaults.get("target_kl", 0.020), help="PPO KL-divergence early-stopping threshold")
     parser.add_argument("--w1", type=float, default=defaults.get("w1", 0.035), help="PBRS cash log potential weight")
     parser.add_argument("--w2", type=float, default=defaults.get("w2", 0.0045), help="PBRS property equity weight")
@@ -102,6 +103,7 @@ def parse_args():
     parser.add_argument("--w_lead", type=float, default=defaults.get("w_lead", 0.60), help="PBRS relative net-worth lead preservation weight")
     parser.add_argument("--resume", type=str, default=None, help="Resume training: 'latest' or path to checkpoint file")
     parser.add_argument("--resume_checkpoint", type=str, default=None, help="Legacy alias for --resume")
+    parser.add_argument("--max_rounds", type=int, default=defaults.get("max_rounds", 80), help="Max rounds per training/eval episode (default: 80, benchmarked from external 4p Monopoly bots)")
     parser.add_argument("--fixed_first_player", action="store_false", dest="randomize_first_player", default=defaults.get("randomize_first_player", True), help="Keep Player 0 as fixed starting player instead of randomizing first seat")
     parser.add_argument("--device", type=str, default=defaults.get("device", "cuda" if torch.cuda.is_available() else "cpu"), help="Device")
 
@@ -129,6 +131,58 @@ def find_latest_global_checkpoint() -> Optional[str]:
 
     candidates.sort(key=lambda x: (extract_iteration(x), os.path.getmtime(x)))
     return candidates[-1]
+
+
+def _apply_league_opponents(
+    env_indices_t: torch.Tensor,
+    act_p: torch.Tensor,
+    obs_batch: torch.Tensor,
+    masks_batch: Dict[str, torch.Tensor],
+    action_keys: list,
+    actions_per_env: Dict[str, torch.Tensor],
+    log_probs_per_env: torch.Tensor,
+    active_masks_step: torch.Tensor,
+    exploiter_masks_step: torch.Tensor,
+    hist_policy: Optional[ActorNetwork],
+    hist_end: int,
+    num_league_envs: int,
+    exploiter_actor: ActorNetwork,
+    obs_dim: int,
+):
+    """Routes league env seats [2, 3] to frozen historical policy or live exploiter actor cleanly."""
+    exploiter_masks_step.zero_()
+    if num_league_envs <= 0:
+        return
+
+    if hist_policy is not None and hist_end > 0:
+        hist_mask = (env_indices_t < hist_end) & (act_p >= 2)
+        hist_idx = hist_mask.nonzero(as_tuple=True)[0]
+        if hist_idx.numel() > 0:
+            hist_p = act_p[hist_idx]
+            opp_obs = obs_batch[hist_idx, hist_p]
+            if hasattr(hist_policy, "obs_dim") and hist_policy.obs_dim < obs_dim:
+                opp_obs = opp_obs[:, :hist_policy.obs_dim]
+            opp_masks = {k: masks_batch[k][hist_idx, hist_p] for k in action_keys}
+            opp_acts, opp_lps, _ = hist_policy(opp_obs, opp_masks)
+            for k in action_keys:
+                actions_per_env[k][hist_idx, hist_p] = opp_acts[k]
+            log_probs_per_env[hist_idx, hist_p] = opp_lps
+            active_masks_step[hist_idx, hist_p] = 0.0
+
+    exp_start = hist_end if hist_policy is not None else 0
+    if exp_start < num_league_envs:
+        exp_mask = (env_indices_t >= exp_start) & (env_indices_t < num_league_envs) & (act_p >= 2)
+        exp_idx = exp_mask.nonzero(as_tuple=True)[0]
+        if exp_idx.numel() > 0:
+            exp_p = act_p[exp_idx]
+            exp_obs = obs_batch[exp_idx, exp_p]
+            exp_masks = {k: masks_batch[k][exp_idx, exp_p] for k in action_keys}
+            exp_acts, exp_lps, _ = exploiter_actor(exp_obs, exp_masks)
+            for k in action_keys:
+                actions_per_env[k][exp_idx, exp_p] = exp_acts[k]
+            log_probs_per_env[exp_idx, exp_p] = exp_lps
+            active_masks_step[exp_idx, exp_p] = 0.0
+            exploiter_masks_step[exp_idx, exp_p] = 1.0
 
 
 def main():
@@ -165,12 +219,12 @@ def main():
     num_league_envs = max(0, int(args.num_envs * args.league_rollout_fraction))
     print(f"Heterogeneous League Rollout: {num_league_envs}/{args.num_envs} envs ({args.league_rollout_fraction * 100:.0f}%)")
     print(f"Curriculum 2-Phase Learning: {'Enabled (Phase 2 unlock at ' + str(int(args.curriculum_phase_2_frac * 100)) + '%)' if args.curriculum else 'Disabled'}")
-    print(f"First Mover Seat: {'Randomized [0..3]' if args.randomize_first_player else 'Fixed (Player 0)'}")
+    print(f"First Mover Seat: {'Randomized [0..3]' if args.randomize_first_player else 'Fixed (Player 0)'} | Max Rounds: {args.max_rounds}")
 
     # Environment Configurations (Seed driven by hardware fluctuation entropy)
     env_configs = [
         dict(
-            max_rounds=120,
+            max_rounds=args.max_rounds,
             seed=None,
             gamma=args.gamma,
             w1=args.w1,
@@ -214,6 +268,7 @@ def main():
     main_actor = ActorNetwork(obs_dim=obs_dim).to(device)
     main_critic = CentralizedCritic(state_dim=state_dim).to(device)
     exploiter_actor = ActorNetwork(obs_dim=obs_dim).to(device)
+    exploiter_actor.load_state_dict(main_actor.state_dict())
 
     # Resume handling
     resume_target = args.resume or args.resume_checkpoint
@@ -255,6 +310,19 @@ def main():
                     new_sd[k] = state_dict[k]
             main_actor.load_state_dict(new_sd)
 
+        if "critic_state_dict" in ckpt:
+            try:
+                main_critic.load_state_dict(ckpt["critic_state_dict"], strict=False)
+            except Exception:
+                pass
+        if "exploiter_state_dict" in ckpt:
+            try:
+                exploiter_actor.load_state_dict(ckpt["exploiter_state_dict"], strict=False)
+            except Exception:
+                exploiter_actor.load_state_dict(main_actor.state_dict())
+        else:
+            exploiter_actor.load_state_dict(main_actor.state_dict())
+
         # Restore iteration offset if present
         meta = ckpt.get("metadata", {})
         if "iteration" in meta:
@@ -272,11 +340,15 @@ def main():
         lr_actor=args.lr_actor,
         lr_critic=args.lr_critic,
         clip_param=args.clip_param,
+        value_clip_param=args.value_clip_param,
         ppo_epochs=args.ppo_epochs,
         num_mini_batches=args.num_mini_batches,
         entropy_coef=args.entropy_coef,
         target_kl=args.target_kl,
         device=device,
+    )
+    exploiter_optimizer = torch.optim.AdamW(
+        exploiter_actor.parameters(), lr=args.lr_actor, eps=1e-5, weight_decay=1e-5
     )
 
     buffer = RolloutBuffer(
@@ -291,7 +363,9 @@ def main():
 
     league_mgr = LeagueManager(checkpoint_dir=checkpoint_dir, device=device)
     if start_iteration <= 1:
-        league_mgr.save_checkpoint(main_actor, iteration=0, role="main")
+        league_mgr.save_checkpoint(
+            main_actor, iteration=0, role="main", critic=main_critic, exploiter=exploiter_actor
+        )
 
     env_indices_t = torch.arange(args.num_envs, device=device)
     actions_per_env = {
@@ -300,6 +374,7 @@ def main():
     }
     log_probs_per_env = torch.zeros((args.num_envs, 4), dtype=torch.float32, device=device)
     active_masks_step = torch.zeros((args.num_envs, 4), dtype=torch.float32, device=device)
+    exploiter_masks_step = torch.zeros((args.num_envs, 4), dtype=torch.float32, device=device)
 
     # Fallback preallocated numpy arrays for non-SHM mode
     batch_obs_np = np.zeros((args.num_envs, 4, obs_dim), dtype=np.float32)
@@ -355,6 +430,8 @@ def main():
                     current_lr_actor = args.lr_actor_min + cosine_decay * (args.lr_actor - args.lr_actor_min)
                     current_lr_critic = args.lr_critic_min + cosine_decay * (args.lr_critic - args.lr_critic_min)
                     trainer.set_lr(current_lr_actor, current_lr_critic)
+                    for pg in exploiter_optimizer.param_groups:
+                        pg["lr"] = float(current_lr_actor)
 
             # Curriculum Learning toggle
             is_curriculum_phase_1 = args.curriculum and (iteration <= int(args.curriculum_phase_2_frac * args.num_iterations))
@@ -365,8 +442,19 @@ def main():
                 for env in envs:
                     env.set_allow_trade(allow_trade)
 
+            # Sample one consistent historical opponent per iteration (avoids mid-turn policy flicker)
+            iter_hist_policy = league_mgr.get_random_historical_policy() if (num_league_envs > 0 and league_mgr.historical_records) else None
+            if num_league_envs >= 2:
+                num_exp_envs = num_league_envs // 2
+            elif num_league_envs == 1:
+                num_exp_envs = 1 if (iteration % 2 == 0 or iter_hist_policy is None) else 0
+            else:
+                num_exp_envs = 0
+            hist_end = num_league_envs - num_exp_envs
+
             main_actor.train()
             main_critic.train()
+            exploiter_actor.train()
 
             # Rollout collection loop
             for step in range(args.rollout_steps):
@@ -394,23 +482,12 @@ def main():
                         active_masks_step.zero_()
                         active_masks_step[env_indices_t, act_p] = 1.0
 
-                        # Heterogeneous League Rollout
-                        if num_league_envs > 0 and league_mgr.historical_records:
-                            hist_policy = league_mgr.get_random_historical_policy()
-                            if hist_policy is not None:
-                                hist_env_mask = (env_indices_t < num_league_envs) & (act_p >= 2)
-                                hist_idx = hist_env_mask.nonzero(as_tuple=True)[0]
-                                if hist_idx.numel() > 0:
-                                    hist_p = act_p[hist_idx]
-                                    opp_obs = shm_obs[hist_idx, hist_p]
-                                    if hasattr(hist_policy, "obs_dim") and hist_policy.obs_dim < obs_dim:
-                                        opp_obs = opp_obs[:, :hist_policy.obs_dim]
-                                    opp_masks = {k: shm_masks[k][hist_idx, hist_p] for k in buffer.action_keys}
-                                    opp_acts, opp_lps, _ = hist_policy(opp_obs, opp_masks)
-                                    for k in buffer.action_keys:
-                                        actions_per_env[k][hist_idx, hist_p] = opp_acts[k]
-                                    log_probs_per_env[hist_idx, hist_p] = opp_lps
-                                    active_masks_step[hist_idx, hist_p] = 0.0
+                        # Heterogeneous League & Exploiter Rollout
+                        _apply_league_opponents(
+                            env_indices_t, act_p, shm_obs, shm_masks, buffer.action_keys,
+                            actions_per_env, log_probs_per_env, active_masks_step, exploiter_masks_step,
+                            iter_hist_policy, hist_end, num_league_envs, exploiter_actor, obs_dim,
+                        )
 
                         # Direct write to shared action buffers
                         for k in buffer.action_keys:
@@ -427,6 +504,7 @@ def main():
                         values=values,
                         log_probs=log_probs_per_env,
                         active_masks=active_masks_step,
+                        exploiter_masks=exploiter_masks_step,
                     )
 
                     # Step parallel environments
@@ -479,22 +557,11 @@ def main():
                         active_masks_step.zero_()
                         active_masks_step[env_indices_t, act_p_t] = 1.0
 
-                        if num_league_envs > 0 and league_mgr.historical_records:
-                            hist_policy = league_mgr.get_random_historical_policy()
-                            if hist_policy is not None:
-                                hist_env_mask = (env_indices_t < num_league_envs) & (act_p_t >= 2)
-                                hist_idx = hist_env_mask.nonzero(as_tuple=True)[0]
-                                if hist_idx.numel() > 0:
-                                    hist_p = act_p_t[hist_idx]
-                                    opp_obs = batch_obs[hist_idx, hist_p]
-                                    if hasattr(hist_policy, "obs_dim") and hist_policy.obs_dim < obs_dim:
-                                        opp_obs = opp_obs[:, :hist_policy.obs_dim]
-                                    opp_masks = {k: batch_masks[k][hist_idx, hist_p] for k in buffer.action_keys}
-                                    opp_acts, opp_lps, _ = hist_policy(opp_obs, opp_masks)
-                                    for k in buffer.action_keys:
-                                        actions_per_env[k][hist_idx, hist_p] = opp_acts[k]
-                                    log_probs_per_env[hist_idx, hist_p] = opp_lps
-                                    active_masks_step[hist_idx, hist_p] = 0.0
+                        _apply_league_opponents(
+                            env_indices_t, act_p_t, batch_obs, batch_masks, buffer.action_keys,
+                            actions_per_env, log_probs_per_env, active_masks_step, exploiter_masks_step,
+                            iter_hist_policy, hist_end, num_league_envs, exploiter_actor, obs_dim,
+                        )
 
                     a_cpu = {k: actions_per_env[k].cpu().numpy() for k in buffer.action_keys}
                     all_env_actions = [
@@ -554,6 +621,7 @@ def main():
                         values=values,
                         log_probs=log_probs_per_env,
                         active_masks=active_masks_step,
+                        exploiter_masks=exploiter_masks_step,
                     )
 
             total_steps_executed += steps_per_iter
@@ -572,8 +640,14 @@ def main():
 
             buffer.compute_gae(last_values, last_dones)
 
-            # MAPPO gradient update
-            train_metrics = trainer.train_step(buffer)
+            # MAPPO gradient update (Main + Centralized Critic + League Exploiter)
+            train_metrics = trainer.train_step(
+                buffer,
+                exploiter_actor=exploiter_actor if num_exp_envs > 0 else None,
+                exploiter_optimizer=exploiter_optimizer if num_exp_envs > 0 else None,
+            )
+            if num_exp_envs == 0:
+                exploiter_actor.load_state_dict(main_actor.state_dict())
 
             # Telemetry & Logging
             elapsed = time.time() - start_time
@@ -646,13 +720,15 @@ def main():
                     iteration=iteration,
                     role="main",
                     metadata={"train_metrics": train_metrics, "iteration": iteration, "total_steps": total_steps_executed},
+                    critic=main_critic,
+                    exploiter=exploiter_actor,
                 )
                 print(f"--> [Checkpoint Saved] {ckpt_path} (Total Steps: {total_steps_executed:,})")
 
             # League Evaluation Match (Driven by hardware fluctuation entropy)
             if iteration % args.eval_interval == 0 and league_mgr.historical_records:
                 eval_env = MonopolyParallelEnv(
-                    max_rounds=100,
+                    max_rounds=args.max_rounds,
                     seed=None,
                     gamma=args.gamma,
                     w1=args.w1,
@@ -672,7 +748,7 @@ def main():
 
                 done_eval = False
                 step_count = 0
-                while not done_eval and step_count < 150:
+                while not done_eval and step_count < 4000:
                     step_count += 1
                     actions = {}
                     for p_idx in range(4):
@@ -700,10 +776,18 @@ def main():
                     ranks[p_idx] = rank_pos + 1
 
                 league_mgr.update_match_results(lineup_records, ranks, net_worths)
+                if (
+                    iteration % 50 == 0
+                    and league_mgr.exploiter_record.matches_played >= 5
+                    and league_mgr.exploiter_record.win_rate < 0.15
+                ):
+                    exploiter_actor.load_state_dict(main_actor.state_dict())
+                    exploiter_optimizer.state.clear()
                 league_mgr.save_league_summary()
                 print(
-                    f"--> [League Match] Ranks: {ranks} | "
+                    f"--> [League Match] Ranks: {ranks} | Steps: {step_count} | "
                     f"Main Elo: {league_mgr.main_agent_record.elo:.1f} | "
+                    f"Exp Elo: {league_mgr.exploiter_record.elo:.1f} | "
                     f"Win Rate: {league_mgr.main_agent_record.win_rate * 100:.1f}%"
                 )
 
@@ -717,6 +801,7 @@ def main():
             torch.save({
                 "state_dict": main_actor.state_dict(),
                 "critic_state_dict": main_critic.state_dict(),
+                "exploiter_state_dict": exploiter_actor.state_dict(),
                 "metadata": {"total_steps": total_steps_executed, "iteration": iteration if 'iteration' in locals() else 0},
             }, intr_path)
             print(f"--> [Interrupted Checkpoint Saved] {intr_path}")
