@@ -84,7 +84,7 @@ class DashboardButton:
 class MonopolyDashboard:
     """Right-Hand Side Dashboard Panel with rich agent tracking and controls."""
 
-    def __init__(self, surface: pygame.Surface, x: int = 840, y: int = 20, width: int = 520, height: int = 800):
+    def __init__(self, surface: pygame.Surface, x: int = 840, y: int = 20, width: int = 520, height: int = 800, initially_paused: bool = True):
         self.surface = surface
         self.rect = pygame.Rect(x, y, width, height)
 
@@ -99,8 +99,8 @@ class MonopolyDashboard:
         self.font_help_title = pygame.font.SysFont("Arial", 14, bold=True)
         self.font_help_body = pygame.font.SysFont("Arial", 11)
 
-        # Interactive states
-        self.is_paused = False
+        # Interactive states: start in paused state by default
+        self.is_paused = initially_paused
         self.speed = 2  # 1, 2, 5, 20, 100
         self.speed_options = [1, 2, 5, 20, 100]
         self.show_help = False
@@ -117,7 +117,13 @@ class MonopolyDashboard:
         bh = 32
         gap = 10
 
-        self.btn_pause = DashboardButton(pygame.Rect(bx, by, bw, bh), "PAUSE", "toggle_pause")
+        self.btn_pause = DashboardButton(
+            pygame.Rect(bx, by, bw, bh),
+            "PLAY" if self.is_paused else "PAUSE",
+            "toggle_pause",
+            accent_color=(39, 174, 96) if self.is_paused else None
+        )
+        self.btn_pause.is_active = self.is_paused
         self.btn_step = DashboardButton(pygame.Rect(bx + bw + gap, by, bw, bh), "STEP", "step")
         self.btn_reset = DashboardButton(pygame.Rect(bx + 2 * (bw + gap), by, bw, bh), "RESET", "reset", accent_color=(192, 57, 43))
         self.btn_screen = DashboardButton(pygame.Rect(bx + 3 * (bw + gap), by, 110, bh), "SCREENSHOT", "screenshot", accent_color=(39, 174, 96))
@@ -137,15 +143,24 @@ class MonopolyDashboard:
         self.btn_help = DashboardButton(pygame.Rect(sx + 8, sy, 78, 26), "HELP (?)", "toggle_help", accent_color=(142, 68, 173))
         self.buttons.append(self.btn_help)
 
+    def set_paused(self, paused: bool):
+        """Sets the pause state and synchronizes pause/play button UI."""
+        self.is_paused = paused
+        self.btn_pause.label = "PLAY" if self.is_paused else "PAUSE"
+        self.btn_pause.is_active = self.is_paused
+        self.btn_pause.accent_color = (39, 174, 96) if self.is_paused else None
+
+    def toggle_pause(self):
+        """Toggles the pause state."""
+        self.set_paused(not self.is_paused)
+
     def handle_event(self, event: pygame.event.Event) -> Optional[str]:
         """Handles mouse interactions and returns triggered action string."""
         for btn in self.buttons:
             action = btn.handle_event(event)
             if action:
                 if action == "toggle_pause":
-                    self.is_paused = not self.is_paused
-                    self.btn_pause.label = "PLAY" if self.is_paused else "PAUSE"
-                    self.btn_pause.is_active = self.is_paused
+                    self.toggle_pause()
                 elif action == "toggle_help":
                     self.show_help = not self.show_help
                     self.btn_help.is_active = self.show_help

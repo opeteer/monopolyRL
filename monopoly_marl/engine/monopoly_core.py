@@ -138,6 +138,7 @@ class MonopolyCore:
         allow_trade: bool = True,
         include_synergy_obs: bool = True,
         player_names: Optional[List[str]] = None,
+        house_rules: Optional[Any] = None,
     ):
         if seed is None:
             seed = generate_hardware_entropy_seed()
@@ -147,6 +148,10 @@ class MonopolyCore:
         self.max_rounds = max_rounds  # None indicates unbounded horizon (infinite survival)
         self.gamma = gamma
         self.player_names = list(player_names) if player_names is not None else list(DEFAULT_PLAYER_NAMES)
+
+        # Modular Custom House Rules System
+        from monopoly_marl.house_rules.manager import HouseRulesManager
+        self.house_rules = HouseRulesManager.from_config(house_rules)
 
         # Well-scaled, Anti-Exploit Offensive Arms-Race PBRS Weights
         self.w1 = w1           # Cash log safety potential (0.050)
@@ -183,8 +188,9 @@ class MonopolyCore:
         self.np_rng = np.random.default_rng(seed)
         self.deck_manager.reset(seed)
 
-        # 4 Players: 0, 1, 2, 3
-        self.cash = [1500, 1500, 1500, 1500]
+        # 4 Players: 0, 1, 2, 3 (Cash determined by official rules or custom House Rules)
+        starting_cash = self.house_rules.get_starting_cash(default_cash=1500)
+        self.cash = [starting_cash, starting_cash, starting_cash, starting_cash]
         self.position = [0, 0, 0, 0]
         self.in_jail = [False, False, False, False]
         self.jail_turns = [0, 0, 0, 0]
@@ -240,7 +246,13 @@ class MonopolyCore:
         self.rejected_offer_prop_cooldown: Dict[Tuple[int, int, int], int] = {}
 
         # Event log history for UI / replay
-        self.event_log: List[str] = ["Tournament game started. All players initialized with $1500."]
+        if self.house_rules.active_rules:
+            self.event_log: List[str] = [
+                f"Tournament game started with House Rules: {self.house_rules.get_rule_summary()}. All players initialized with ${starting_cash}."
+            ]
+            self.house_rules.apply_game_init(self)
+        else:
+            self.event_log: List[str] = ["Tournament game started. All players initialized with $1500."]
         self.last_card_drawn: Optional[Dict[str, Any]] = None
 
         # Precompute initial potentials for PBRS
@@ -1242,8 +1254,9 @@ class MonopolyCore:
 
         # Check Passing GO
         if new_pos < old_pos:
-            self.cash[p] += 200
-            self.event_log.append(f"{self.get_player_name(p)} passed GO and collected $200.")
+            salary = self.house_rules.apply_pass_go_salary(p, 200)
+            self.cash[p] += salary
+            self.event_log.append(f"{self.get_player_name(p)} passed GO and collected ${salary}.")
 
         self._handle_landing(p, new_pos, dice_sum, is_double)
 
@@ -1575,6 +1588,21 @@ class MonopolyCore:
         )
 
         if has_trade_intent:
+            # Synchronize uncoordinated categorical action heads:
+            # If agent intends a pure-cash purchase of opponent deed (trade_offer_prop == 40, trade_req_prop < 40)
+            # but the cash head chose a bracket below the deed's statutory mortgage floor,
+            # snap offer_cash_idx to a competitive legal bracket the agent can afford.
+            if trade_offer_prop >= 40 and 0 <= trade_req_prop < 40:
+                min_cash = TILES_DATA[trade_req_prop]["mortgage"]
+                cur_cash = TRADE_CASH_BRACKETS[min(trade_offer_cash_idx, len(TRADE_CASH_BRACKETS) - 1)]
+                if cur_cash < min_cash:
+                    target_cash = 500 if self.cash[p] >= 500 else (250 if self.cash[p] >= 250 else min_cash)
+                    legal_brackets = [idx for idx, b in enumerate(TRADE_CASH_BRACKETS) if b >= target_cash and self.cash[p] >= b]
+                    if not legal_brackets:
+                        legal_brackets = [idx for idx, b in enumerate(TRADE_CASH_BRACKETS) if b >= min_cash and self.cash[p] >= b]
+                    if legal_brackets:
+                        trade_offer_cash_idx = legal_brackets[0]
+
             trade_started = self._propose_trade(
                 p, trade_target_idx, trade_offer_prop, trade_offer_cash_idx, trade_req_prop, trade_req_cash_idx
             )
@@ -1643,6 +1671,14 @@ class MonopolyCore:
                 if offer_cash < min_cash_required:
                     return False
 
+        # Pure cash property sale: ensure requested cash meets at least statutory mortgage value
+        if 0 <= offer_prop < 40 and req_prop >= 40:
+            min_cash_required = TILES_DATA[offer_prop]["mortgage"]
+            if req_cash < min_cash_required:
+                valid_brackets = [b for b in TRADE_CASH_BRACKETS if b >= min_cash_required]
+                if valid_brackets:
+                    req_cash = valid_brackets[0]
+
         if req_prop >= 40 and req_cash == 0:
             # Pure gift: giving away property (and/or cash) for nothing in return
             return False
@@ -1701,6 +1737,14 @@ class MonopolyCore:
                     self.trades_accepted_count += 1
                     self.event_log.append(f"TRADE ACCEPTED between {self.get_player_name(init)} and {self.get_player_name(target)}!")
 
+                    # Anti-churning cooldown: Prevent immediately ping-ponging the exact same property back
+                    if 0 <= req_p < 40:
+                        self.rejected_req_prop_cooldown[(target, init, req_p)] = self.round_count + 8
+                        self.rejected_req_prop_cooldown[(init, target, req_p)] = self.round_count + 8
+                    if 0 <= offer_p < 40:
+                        self.rejected_offer_prop_cooldown[(target, init, offer_p)] = self.round_count + 8
+                        self.rejected_offer_prop_cooldown[(init, target, offer_p)] = self.round_count + 8
+
                     # Reward shaping for successful monopoly-advancing trades
                     init_mono_after = _get_street_monopolies(init)
                     target_mono_after = _get_street_monopolies(target)
@@ -1755,8 +1799,9 @@ class MonopolyCore:
             old_pos = self.position[p]
             self.position[p] = target
             if card.get("collect_pass_go", False) and target < old_pos:
-                self.cash[p] += 200
-                self.event_log.append(f"{self.get_player_name(p)} passed GO and collected $200.")
+                salary = self.house_rules.apply_pass_go_salary(p, 200)
+                self.cash[p] += salary
+                self.event_log.append(f"{self.get_player_name(p)} passed GO and collected ${salary}.")
             self._handle_landing(p, target, dice_sum=self.last_dice[0] + self.last_dice[1], is_double=is_double)
 
         elif action == "advance_nearest_utility":
@@ -1764,7 +1809,9 @@ class MonopolyCore:
             curr = self.position[p]
             target = 12 if curr < 12 or curr >= 28 else 28
             if target < curr:
-                self.cash[p] += 200
+                salary = self.house_rules.apply_pass_go_salary(p, 200)
+                self.cash[p] += salary
+                self.event_log.append(f"{self.get_player_name(p)} passed GO and collected ${salary}.")
             self.position[p] = target
             owner = self.property_owner[target]
             if owner == -1:

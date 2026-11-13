@@ -27,7 +27,11 @@ def parse_args():
     parser.add_argument("--deterministic", action="store_true", default=False, help="Use strict argmax deterministic actions (default: False / stochastic mixed-strategy)")
     parser.add_argument("--stochastic", dest="deterministic", action="store_false", help="Use stochastic policy sampling (default)")
     parser.add_argument("--seed", type=int, default=None, help="Random seed")
+    parser.add_argument("--auto_quit_delay", type=float, default=None, help="Seconds to show victory screen before auto-quitting (None to stay open)")
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu", help="Device")
+    parser.add_argument("--house_rules", type=str, default=None, help="Custom house rules (e.g. 'half_cash', 'half_starting_cash')")
+    parser.add_argument("--half_cash", action="store_true", default=False, help="House rule convenience flag: start with $750 cash (half of standard $1,500)")
+    parser.add_argument("--auto_play", action="store_true", default=False, help="Start playing immediately without waiting for manual unpause")
     return parser.parse_args()
 
 
@@ -92,8 +96,13 @@ def main():
     pygame.display.set_caption("Tournament MARL Monopoly (MAPPO CTDE + League Training)")
     clock = pygame.time.Clock()
 
+    # Assemble custom house rules if specified
+    active_house_rules = args.house_rules
+    if args.half_cash:
+        active_house_rules = "half_cash" if not active_house_rules else f"{active_house_rules},half_cash"
+
     # Core Environment
-    core = MonopolyCore(seed=args.seed, max_rounds=args.max_rounds)
+    core = MonopolyCore(seed=args.seed, max_rounds=args.max_rounds, house_rules=active_house_rules)
 
     # Renderer & Dashboard
     renderer = MonopolyRenderer(screen, board_size=800, offset_x=20, offset_y=20)
@@ -102,6 +111,8 @@ def main():
     for b in dashboard.buttons:
         if b.action_id.startswith("speed_"):
             b.is_active = (b.action_id == f"speed_{dashboard.speed}")
+    if args.auto_play:
+        dashboard.set_paused(False)
 
     # Load 4 Identical Blueprint Autonomous Agents
     target_obs_dim = core.get_actor_observation(0).shape[0]
@@ -117,12 +128,17 @@ def main():
     step_requested = False
     last_step_time = time.time()
     game_over_captured = False
+    victory_time = None
     last_bankrupt_count = 0
+    last_logged_ev_idx = 0
 
     print("=== Pygame MARL Monopoly GUI Running ===")
+    print(f"Active Match Seed (Hardware Fluctuation Entropy): {core.current_seed}")
     print(f"Agents: {', '.join(core.player_names)} (P0..P3)")
     print("Rule: Unbounded Horizon Survival (Winner: Last Agent Standing)")
     print("Controls: Space: Pause/Play | S: Step | R: Reset | 1-5: Speed | C: Screenshot | Esc: Quit")
+    print("Initial State: PAUSED (Game starts in paused mode; press PLAY or Space to begin)")
+    core.event_log.append("Game initialized in PAUSED state. Press PLAY or Space to begin.")
 
     while running:
         current_time = time.time()
@@ -137,15 +153,16 @@ def main():
                     running = False
                     break
                 elif event.key == pygame.K_SPACE:
-                    dashboard.is_paused = not dashboard.is_paused
-                    dashboard.btn_pause.label = "PLAY" if dashboard.is_paused else "PAUSE"
-                    dashboard.btn_pause.is_active = dashboard.is_paused
+                    dashboard.toggle_pause()
                 elif event.key == pygame.K_s:
                     step_requested = True
                 elif event.key == pygame.K_r:
                     core.reset(seed=args.seed)
+                    renderer.reset(core)
+                    dashboard.set_paused(True)
                     game_over_captured = False
                     last_bankrupt_count = 0
+                    print(f"[RESET] New Match Seed (Hardware Fluctuation Entropy): {core.current_seed}")
                 elif event.key == pygame.K_1:
                     dashboard.speed = 1
                 elif event.key == pygame.K_2:
@@ -177,8 +194,11 @@ def main():
                 step_requested = True
             elif action == "reset":
                 core.reset(seed=args.seed)
+                renderer.reset(core)
+                dashboard.set_paused(True)
                 game_over_captured = False
                 last_bankrupt_count = 0
+                print(f"[RESET] New Match Seed (Hardware Fluctuation Entropy): {core.current_seed}")
             elif action == "screenshot":
                 os.makedirs("screenshots", exist_ok=True)
                 s_path = f"screenshots/monopoly_gui_{int(time.time())}.png"
@@ -186,9 +206,10 @@ def main():
                 print(f"Screenshot saved to: {s_path}")
                 core.event_log.append(f"Screenshot saved: {os.path.basename(s_path)}")
 
-        # Decide whether to step simulation
+        # Decide whether to step simulation (smooth pacing allows hop animation to complete at speeds <= 5)
         step_interval = 1.0 / max(1, dashboard.speed * 2)
-        should_step = (not dashboard.is_paused and (current_time - last_step_time >= step_interval)) or step_requested
+        is_anim = renderer.is_animating() if dashboard.speed <= 5 else False
+        should_step = (not dashboard.is_paused and (current_time - last_step_time >= step_interval) and not is_anim) or step_requested
 
         if should_step:
             step_requested = False
@@ -217,6 +238,12 @@ def main():
                 # Step state machine
                 core.step({f"player_{p_act}": act})
 
+                while last_logged_ev_idx < len(core.event_log):
+                    ev = core.event_log[last_logged_ev_idx]
+                    last_logged_ev_idx += 1
+                    if any(k in ev for k in ["TRADE ACCEPTED", "HOTEL", "IS BANKRUPT"]):
+                        print(f"[R{core.round_count:<3} S{core.turn_step:<4}] {ev}")
+
                 # Check for new bankruptcies
                 curr_bankrupt_count = sum(1 for b in core.bankrupt if b)
                 if curr_bankrupt_count > last_bankrupt_count:
@@ -229,12 +256,13 @@ def main():
         screen.fill(BG_COLOR)
 
         # Render Board & Dashboard
-        renderer.render(core)
+        renderer.render(core, speed=dashboard.speed, is_paused=dashboard.is_paused)
         dashboard.render(core)
 
         # Check Tournament Game Over (Last Agent Standing)
         if core.phase == 6 and not game_over_captured:
             game_over_captured = True
+            victory_time = current_time
             active = [pl for pl in range(4) if not core.bankrupt[pl]]
             winner_name = core.get_player_name(active[0]) if len(active) == 1 else "Unknown"
             winner_nw = core.get_player_net_worth(active[0]) if len(active) == 1 else 0
@@ -249,6 +277,17 @@ def main():
             pygame.image.save(screen, v_path)
             print(f"Victory screenshot captured: {v_path}")
             core.event_log.append(f"Auto-saved: {os.path.basename(v_path)}")
+
+            with open("tournament_gui_match.log", "w") as f_log:
+                f_log.write(f"=== TOURNAMENT GUI MATCH LOG (Seed: {core.current_seed}) ===\n")
+                for ev_line in core.event_log:
+                    f_log.write(ev_line + "\n")
+            print(f"Full game event log saved to: tournament_gui_match.log ({len(core.event_log)} events)")
+
+        if game_over_captured and args.auto_quit_delay is not None and victory_time is not None:
+            if current_time - victory_time >= args.auto_quit_delay:
+                print(f"Auto-closing GUI tournament after {args.auto_quit_delay}s victory display.")
+                running = False
 
         pygame.display.flip()
         clock.tick(60)

@@ -99,11 +99,14 @@ class MonopolyParallelEnv(ParallelEnv):
         self.core.set_allow_trade(allow)
 
     def reset(self, seed: Optional[int] = None, options: Optional[Dict[str, Any]] = None) -> Tuple[Dict[str, Any], Dict[str, Any]]:
-        """Resets the environment and returns (observations, infos)."""
+        """Resets the environment and returns (observations, infos).
+        When seed is None, MonopolyCore automatically invokes generate_hardware_entropy_seed()
+        for genuine hardware fluctuation entropy on every reset.
+        """
         if seed is not None:
             self.seed_val = seed
         self.agents = list(self.possible_agents)
-        core_obs = self.core.reset(self.seed_val)
+        core_obs = self.core.reset(seed)
 
         observations = {}
         infos = {}
