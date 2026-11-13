@@ -2,156 +2,156 @@
   "main_agent": {
     "name": "MainAgent",
     "role": "main",
-    "elo": 1515.6,
-    "matches_played": 448,
-    "wins": 154,
-    "win_rate": 0.344,
+    "elo": 1397.1,
+    "matches_played": 390,
+    "wins": 133,
+    "win_rate": 0.341,
     "checkpoint_path": null
   },
   "exploiter": {
     "name": "MainExploiter",
     "role": "exploiter",
-    "elo": 1018.0,
-    "matches_played": 224,
+    "elo": 1111.6,
+    "matches_played": 195,
     "wins": 8,
-    "win_rate": 0.036,
+    "win_rate": 0.041,
     "checkpoint_path": null
   },
   "historical_pool": [
     {
-      "name": "Historical_04950",
+      "name": "Historical_04200",
       "role": "historical",
-      "elo": 1400.9,
+      "elo": 1373.0,
+      "matches_played": 1,
+      "wins": 0,
+      "win_rate": 0.0,
+      "checkpoint_path": "checkpoints/main_iter_04200.pt"
+    },
+    {
+      "name": "Historical_04250",
+      "role": "historical",
+      "elo": 1413.0,
+      "matches_played": 1,
+      "wins": 1,
+      "win_rate": 1.0,
+      "checkpoint_path": "checkpoints/main_iter_04250.pt"
+    },
+    {
+      "name": "Historical_04300",
+      "role": "historical",
+      "elo": 1409.1,
+      "matches_played": 1,
+      "wins": 1,
+      "win_rate": 1.0,
+      "checkpoint_path": "checkpoints/main_iter_04300.pt"
+    },
+    {
+      "name": "Historical_04350",
+      "role": "historical",
+      "elo": 1396.2,
       "matches_played": 2,
       "wins": 0,
       "win_rate": 0.0,
-      "checkpoint_path": "checkpoints/main_iter_04950.pt"
+      "checkpoint_path": "checkpoints/main_iter_04350.pt"
     },
     {
-      "name": "Historical_05000",
+      "name": "Historical_04400",
       "role": "historical",
-      "elo": 1432.4,
+      "elo": 1391.2,
+      "matches_played": 1,
+      "wins": 0,
+      "win_rate": 0.0,
+      "checkpoint_path": "checkpoints/main_iter_04400.pt"
+    },
+    {
+      "name": "Historical_04450",
+      "role": "historical",
+      "elo": 1396.4,
       "matches_played": 0,
       "wins": 0,
       "win_rate": 0.0,
-      "checkpoint_path": "checkpoints/main_iter_05000.pt"
+      "checkpoint_path": "checkpoints/main_iter_04450.pt"
     },
     {
-      "name": "Historical_05050",
+      "name": "Historical_04500",
       "role": "historical",
-      "elo": 1468.7,
-      "matches_played": 1,
-      "wins": 1,
-      "win_rate": 1.0,
-      "checkpoint_path": "checkpoints/main_iter_05050.pt"
+      "elo": 1394.2,
+      "matches_played": 0,
+      "wins": 0,
+      "win_rate": 0.0,
+      "checkpoint_path": "checkpoints/main_iter_04500.pt"
     },
     {
-      "name": "Historical_05100",
+      "name": "Historical_04550",
       "role": "historical",
-      "elo": 1434.9,
-      "matches_played": 4,
-      "wins": 1,
-      "win_rate": 0.25,
-      "checkpoint_path": "checkpoints/main_iter_05100.pt"
-    },
-    {
-      "name": "Historical_05150",
-      "role": "historical",
-      "elo": 1457.2,
-      "matches_played": 1,
-      "wins": 1,
-      "win_rate": 1.0,
-      "checkpoint_path": "checkpoints/main_iter_05150.pt"
-    },
-    {
-      "name": "Historical_05200",
-      "role": "historical",
-      "elo": 1490.3,
+      "elo": 1404.6,
       "matches_played": 2,
-      "wins": 2,
-      "win_rate": 1.0,
-      "checkpoint_path": "checkpoints/main_iter_05200.pt"
+      "wins": 0,
+      "win_rate": 0.0,
+      "checkpoint_path": "checkpoints/main_iter_04550.pt"
     },
     {
-      "name": "Historical_05250",
+      "name": "Historical_04600",
       "role": "historical",
-      "elo": 1459.6,
+      "elo": 1427.8,
       "matches_played": 0,
       "wins": 0,
       "win_rate": 0.0,
-      "checkpoint_path": "checkpoints/main_iter_05250.pt"
+      "checkpoint_path": "checkpoints/main_iter_04600.pt"
     },
     {
-      "name": "Historical_05300",
+      "name": "Historical_04650",
       "role": "historical",
-      "elo": 1443.3,
+      "elo": 1431.8,
       "matches_played": 0,
       "wins": 0,
       "win_rate": 0.0,
-      "checkpoint_path": "checkpoints/main_iter_05300.pt"
+      "checkpoint_path": "checkpoints/main_iter_04650.pt"
     },
     {
-      "name": "Historical_05350",
+      "name": "Historical_04700",
       "role": "historical",
-      "elo": 1438.1,
-      "matches_played": 1,
-      "wins": 0,
-      "win_rate": 0.0,
-      "checkpoint_path": "checkpoints/main_iter_05350.pt"
-    },
-    {
-      "name": "Historical_05400",
-      "role": "historical",
-      "elo": 1468.9,
+      "elo": 1455.7,
       "matches_played": 0,
       "wins": 0,
       "win_rate": 0.0,
-      "checkpoint_path": "checkpoints/main_iter_05400.pt"
+      "checkpoint_path": "checkpoints/main_iter_04700.pt"
     },
     {
-      "name": "Historical_05450",
+      "name": "Historical_04750",
       "role": "historical",
-      "elo": 1488.2,
+      "elo": 1448.6,
+      "matches_played": 2,
+      "wins": 1,
+      "win_rate": 0.5,
+      "checkpoint_path": "checkpoints/main_iter_04750.pt"
+    },
+    {
+      "name": "Historical_04800",
+      "role": "historical",
+      "elo": 1450.8,
       "matches_played": 0,
       "wins": 0,
       "win_rate": 0.0,
-      "checkpoint_path": "checkpoints/main_iter_05450.pt"
+      "checkpoint_path": "checkpoints/main_iter_04800.pt"
     },
     {
-      "name": "Historical_05500",
+      "name": "Historical_04850",
       "role": "historical",
-      "elo": 1488.5,
-      "matches_played": 1,
-      "wins": 0,
-      "win_rate": 0.0,
-      "checkpoint_path": "checkpoints/main_iter_05500.pt"
-    },
-    {
-      "name": "Historical_05550",
-      "role": "historical",
-      "elo": 1507.2,
+      "elo": 1401.4,
       "matches_played": 0,
       "wins": 0,
       "win_rate": 0.0,
-      "checkpoint_path": "checkpoints/main_iter_05550.pt"
+      "checkpoint_path": "checkpoints/main_iter_04850.pt"
     },
     {
-      "name": "Historical_05600",
+      "name": "Historical_04882",
       "role": "historical",
-      "elo": 1515.3,
+      "elo": 1397.1,
       "matches_played": 0,
       "wins": 0,
       "win_rate": 0.0,
-      "checkpoint_path": "checkpoints/main_iter_05600.pt"
-    },
-    {
-      "name": "Historical_05615",
-      "role": "historical",
-      "elo": 1515.6,
-      "matches_played": 0,
-      "wins": 0,
-      "win_rate": 0.0,
-      "checkpoint_path": "checkpoints/main_iter_05615.pt"
+      "checkpoint_path": "checkpoints/main_iter_04882.pt"
     }
   ]
 }
