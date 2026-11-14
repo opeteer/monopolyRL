@@ -1,0 +1,157 @@
+{
+  "main_agent": {
+    "name": "Model-2 Impala",
+    "role": "main",
+    "elo": 809.9,
+    "matches_played": 302,
+    "wins": 75,
+    "win_rate": 0.248,
+    "checkpoint_path": null
+  },
+  "exploiter": {
+    "name": "MainExploiter",
+    "role": "exploiter",
+    "elo": 949.8,
+    "matches_played": 151,
+    "wins": 32,
+    "win_rate": 0.212,
+    "checkpoint_path": null
+  },
+  "historical_pool": [
+    {
+      "name": "Historical_03100",
+      "role": "historical",
+      "elo": 1010.8,
+      "matches_played": 3,
+      "wins": 3,
+      "win_rate": 1.0,
+      "checkpoint_path": "checkpoints_model_2/main_iter_03100.pt"
+    },
+    {
+      "name": "Historical_03150",
+      "role": "historical",
+      "elo": 941.9,
+      "matches_played": 1,
+      "wins": 0,
+      "win_rate": 0.0,
+      "checkpoint_path": "checkpoints_model_2/main_iter_03150.pt"
+    },
+    {
+      "name": "Historical_03200",
+      "role": "historical",
+      "elo": 978.5,
+      "matches_played": 3,
+      "wins": 1,
+      "win_rate": 0.333,
+      "checkpoint_path": "checkpoints_model_2/main_iter_03200.pt"
+    },
+    {
+      "name": "Historical_03250",
+      "role": "historical",
+      "elo": 920.6,
+      "matches_played": 0,
+      "wins": 0,
+      "win_rate": 0.0,
+      "checkpoint_path": "checkpoints_model_2/main_iter_03250.pt"
+    },
+    {
+      "name": "Historical_03300",
+      "role": "historical",
+      "elo": 904.8,
+      "matches_played": 1,
+      "wins": 1,
+      "win_rate": 1.0,
+      "checkpoint_path": "checkpoints_model_2/main_iter_03300.pt"
+    },
+    {
+      "name": "Historical_03350",
+      "role": "historical",
+      "elo": 879.4,
+      "matches_played": 0,
+      "wins": 0,
+      "win_rate": 0.0,
+      "checkpoint_path": "checkpoints_model_2/main_iter_03350.pt"
+    },
+    {
+      "name": "Historical_03400",
+      "role": "historical",
+      "elo": 895.3,
+      "matches_played": 1,
+      "wins": 1,
+      "win_rate": 1.0,
+      "checkpoint_path": "checkpoints_model_2/main_iter_03400.pt"
+    },
+    {
+      "name": "Historical_03450",
+      "role": "historical",
+      "elo": 867.7,
+      "matches_played": 1,
+      "wins": 0,
+      "win_rate": 0.0,
+      "checkpoint_path": "checkpoints_model_2/main_iter_03450.pt"
+    },
+    {
+      "name": "Historical_03500",
+      "role": "historical",
+      "elo": 891.3,
+      "matches_played": 3,
+      "wins": 2,
+      "win_rate": 0.667,
+      "checkpoint_path": "checkpoints_model_2/main_iter_03500.pt"
+    },
+    {
+      "name": "Historical_03550",
+      "role": "historical",
+      "elo": 848.3,
+      "matches_played": 1,
+      "wins": 0,
+      "win_rate": 0.0,
+      "checkpoint_path": "checkpoints_model_2/main_iter_03550.pt"
+    },
+    {
+      "name": "Historical_03600",
+      "role": "historical",
+      "elo": 868.1,
+      "matches_played": 1,
+      "wins": 0,
+      "win_rate": 0.0,
+      "checkpoint_path": "checkpoints_model_2/main_iter_03600.pt"
+    },
+    {
+      "name": "Historical_03650",
+      "role": "historical",
+      "elo": 847.8,
+      "matches_played": 0,
+      "wins": 0,
+      "win_rate": 0.0,
+      "checkpoint_path": "checkpoints_model_2/main_iter_03650.pt"
+    },
+    {
+      "name": "Historical_03700",
+      "role": "historical",
+      "elo": 853.6,
+      "matches_played": 0,
+      "wins": 0,
+      "win_rate": 0.0,
+      "checkpoint_path": "checkpoints_model_2/main_iter_03700.pt"
+    },
+    {
+      "name": "Historical_03750",
+      "role": "historical",
+      "elo": 840.4,
+      "matches_played": 0,
+      "wins": 0,
+      "win_rate": 0.0,
+      "checkpoint_path": "checkpoints_model_2/main_iter_03750.pt"
+    },
+    {
+      "name": "Historical_03784",
+      "role": "historical",
+      "elo": 809.9,
+      "matches_played": 0,
+      "wins": 0,
+      "win_rate": 0.0,
+      "checkpoint_path": "checkpoints_model_2/main_iter_03784.pt"
+    }
+  ]
+}
