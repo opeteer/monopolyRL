@@ -182,6 +182,59 @@ class ActorNetwork(nn.Module):
         return log_prob, entropy
 
     @staticmethod
+    def _valid_uniform_kl(logits: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        """Computes D_KL(Uniform(valid) || pi_valid) >= 0; 0 when <=1 action is valid."""
+        m = (mask > 0).to(logits.dtype).to(logits.device)
+        cnt = m.sum(dim=-1, keepdim=True)
+        has_choice = (cnt.squeeze(-1) > 1.5).to(logits.dtype)
+        safe_cnt = cnt.clamp(min=1.0)
+        masked_logits = torch.where(m > 0.5, logits, torch.tensor(-1e8, dtype=logits.dtype, device=logits.device))
+        log_probs = F.log_softmax(masked_logits, dim=-1)
+        mean_neg_logp = -((log_probs * m).sum(dim=-1) / safe_cnt.squeeze(-1))
+        uni_kl = (mean_neg_logp - torch.log(safe_cnt.squeeze(-1))).clamp(min=0.0)
+        return uni_kl * has_choice
+
+    @staticmethod
+    def _valid_logit_l2(logits: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        """Computes mean squared deviation of valid logits from their valid mean."""
+        m = (mask > 0).to(logits.dtype).to(logits.device)
+        cnt = m.sum(dim=-1, keepdim=True)
+        has_choice = (cnt.squeeze(-1) > 1.5).to(logits.dtype)
+        safe_cnt = cnt.clamp(min=1.0)
+        mean_z = (logits * m).sum(dim=-1, keepdim=True) / safe_cnt
+        var_z = (((logits - mean_z) ** 2) * m).sum(dim=-1) / safe_cnt.squeeze(-1)
+        return var_z * has_choice
+
+    def _compute_exploration_regularizers(
+        self,
+        obs: torch.Tensor,
+        action_masks: Dict[str, torch.Tensor],
+        dists: Dict[str, Categorical],
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Computes Uniform-KL barrier & zero-mean logit L2 regularization for rare/critical phases."""
+        batch_zero = torch.zeros(obs.shape[:-1], dtype=obs.dtype, device=obs.device)
+        if obs.shape[-1] < 327:
+            return batch_zero, batch_zero
+        u = obs[..., 307:314]
+        valid_onehot = ((u.sum(dim=-1) - 1.0).abs() < 1e-4) & ((u == 1.0).sum(dim=-1) == 1)
+        if not torch.all(valid_onehot):
+            return batch_zero, batch_zero
+
+        is_buy = u[..., 1]
+        is_auc = u[..., 2]
+        is_trade_resp = u[..., 5]
+
+        auc_uni_kl = self._valid_uniform_kl(dists["auction"].logits, action_masks["auction"])
+        tr_uni_kl = self._valid_uniform_kl(dists["trade_response"].logits, action_masks["trade_response"])
+        uniform_kl = is_auc * auc_uni_kl + 0.25 * is_trade_resp * tr_uni_kl
+
+        auc_l2 = self._valid_logit_l2(dists["auction"].logits, action_masks["auction"])
+        tr_l2 = self._valid_logit_l2(dists["trade_response"].logits, action_masks["trade_response"])
+        buy_l2 = self._valid_logit_l2(dists["core"].logits, action_masks["core"])
+        logit_l2 = is_auc * auc_l2 + 0.50 * is_trade_resp * tr_l2 + 0.25 * is_buy * buy_l2
+        return uniform_kl, logit_l2
+
+    @staticmethod
     def _safe_conditional_mask(cond_mask: torch.Tensor, fallback_mask: torch.Tensor) -> torch.Tensor:
         """Falls back to base mask if a conditional rule eliminates every option."""
         has_any = cond_mask.sum(dim=-1, keepdim=True) > 0
@@ -357,3 +410,17 @@ class ActorNetwork(nn.Module):
             obs, action_masks, given_actions=actions, deterministic=False, temperature=1.0
         )
         return self._compute_phase_aware_lp_entropy(obs, action_masks, actions, dists)
+
+    def evaluate_actions_with_reg(
+        self,
+        obs: torch.Tensor,
+        action_masks: Dict[str, torch.Tensor],
+        actions: Dict[str, torch.Tensor],
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Evaluates log_prob, entropy, uniform-KL barrier, and logit L2 regularization."""
+        dists, _ = self._build_distributions_and_actions(
+            obs, action_masks, given_actions=actions, deterministic=False, temperature=1.0
+        )
+        log_prob, entropy = self._compute_phase_aware_lp_entropy(obs, action_masks, actions, dists)
+        uniform_kl, logit_l2 = self._compute_exploration_regularizers(obs, action_masks, dists)
+        return log_prob, entropy, uniform_kl, logit_l2

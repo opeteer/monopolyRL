@@ -160,8 +160,8 @@ def test_model_2_pbrs_mortgage_burn_and_anti_kingmaking_terms():
     """Verifies PBRS discourages flush mortgaging, kills $500 arbitrage, and activates Term 7 & 8."""
     core = MonopolyCore(seed=42)
     assert abs(core.w_cash - core.w2) < 1e-9
-    assert core.w_opp_mono == 1.15
-    assert core.w_lead == 0.60
+    assert core.w_opp_mono == 0.85
+    assert core.w_lead == 0.65
 
     # Mortgaging Penn RR ($100 mortgage) when already holding $5,000 must drop PBRS potential
     core.property_owner[15] = 0
@@ -391,7 +391,8 @@ def test_model_2_networks_trainer_and_league_compatibility():
 
     # Presets sanity
     cfg_default = TrainingConfig()
-    assert cfg_default.gamma == 0.9985
+    assert cfg_default.gamma == 0.9980
+    assert cfg_default.gae_lambda == 0.955
     assert cfg_default.num_mini_batches == 8
     cfg_100m = get_preset("grandmaster_100m")
     assert cfg_100m is not None and cfg_100m.total_steps == 100_000_000
@@ -604,17 +605,20 @@ def test_model_2_anti_stalemate_timeout_payoff_and_monopoly_dominance_over_cash(
         c_built.property_houses[tid] = 3
     assert c_built._compute_potential(0) > phi_mono_r0 + 8.0
 
-    # 2. Term 6 keeps deepening past round 40 up to round 80 (outpacing +$200 Pass GO cash), then caps cleanly
+    # 2. Term 6 keeps deepening past round 40 up to round 100 (outpacing +$200 Pass GO cash), then caps cleanly
     c_hoard = MonopolyCore(seed=202, randomize_first_player=False)
     c_hoard.cash = [1500, 1500, 1500, 1500]
     c_hoard.round_count = 40
     phi_r40 = c_hoard._compute_potential(0)
     c_hoard.round_count = 80
-    c_hoard.cash[0] = 2700  # Even +$1,200 Pass GO cash (+5.4 Term 1) cannot offset -10.5 extra starvation
+    c_hoard.cash[0] = 2700  # Even +$1,200 Pass GO cash cannot offset extra starvation
     phi_r80 = c_hoard._compute_potential(0)
     assert phi_r80 < phi_r40 - 4.0
+    c_hoard.round_count = 100
+    phi_r100 = c_hoard._compute_potential(0)
+    assert phi_r100 < phi_r80 - 4.0
     c_hoard.round_count = 120
-    assert np.isclose(c_hoard._compute_potential(0), phi_r80)
+    assert np.isclose(c_hoard._compute_potential(0), phi_r100)
 
     # 3. Anti-stalemate timeout: sole Net Worth leader gets +1.0 (not +4.0/+10.0), others get -10.0
     c_to = MonopolyCore(seed=203, max_rounds=10, randomize_first_player=False)
@@ -664,7 +668,7 @@ def test_model_2_anti_stalemate_timeout_payoff_and_monopoly_dominance_over_cash(
 def test_model_2_fine_tune_pbrs_thrash_fix_and_value_scaled_threat():
     """Verifies low-cash unmortgage thrashing arbitrage is eliminated and Term 7 scales by group value."""
     core = MonopolyCore(seed=303)
-    assert core.w_syn == 0.028
+    assert core.w_syn == 0.030
 
     # Tight low cash ($250): unmortgaging Park Place (#37, mort $175 -> cost $192) must NOT yield positive arbitrage
     core.property_owner[37] = 0
@@ -690,6 +694,68 @@ def test_model_2_fine_tune_pbrs_thrash_fix_and_value_scaled_threat():
     drop_blue = phi_db0 - c_blue._compute_potential(0)
 
     assert drop_blue > drop_brown + 0.5
+
+
+def test_model_2_dead_logit_revival_decision_mask_and_pfsp():
+    """Verifies Uniform-KL + Logit L2 revives dead auction logits, decision mask filters PHASE_ROLL, and PFSP works."""
+    import torch.nn.functional as F
+    from main_train_model_2 import _has_nontrivial_decision
+    from model_2.engine.monopoly_core import PHASE_AUCTION
+    from model_2.training.league_manager import LeagueAgentRecord
+
+    # 1. Decision-only filter excludes single-action PHASE_ROLL and retains multi-choice phases
+    core = MonopolyCore(seed=501)
+    roll_masks = core.get_action_masks(core.active_decision_player)
+    roll_masks_t = {k: torch.from_numpy(v).unsqueeze(0) for k, v in roll_masks.items()}
+    action_keys = [
+        "core", "auction", "property", "trade_target",
+        "trade_offer_prop", "trade_offer_cash", "trade_req_prop",
+        "trade_req_cash", "trade_response",
+    ]
+    assert float(_has_nontrivial_decision(roll_masks_t, action_keys).item()) == 0.0
+
+    core.phase = PHASE_AUCTION
+    core.auction_property = 1
+    core.auction_highest_bid = 10
+    core.auction_active_bidders = [0, 1]
+    core.cash = [1500, 300, 300, 300]
+    core.active_decision_player = 0
+    auc_masks = core.get_action_masks(0)
+    assert auc_masks["auction"][5] == 1 and auc_masks["auction"][6] == 1
+    auc_masks_t = {k: torch.from_numpy(v).unsqueeze(0) for k, v in auc_masks.items()}
+    assert float(_has_nontrivial_decision(auc_masks_t, action_keys).item()) == 1.0
+
+    # 2. Uniform-KL + Zero-mean Logit L2 generates positive revival gradient on collapsed JumpList/JumpSqueeze
+    actor = ActorNetwork(obs_dim=500, hidden_dim=384)
+    with torch.no_grad():
+        actor.head_auction.bias[5] = -6.0
+        actor.head_auction.bias[6] = -6.5
+        actor.head_auction.bias[1] = 3.5
+
+    obs_auc = torch.from_numpy(core.get_actor_observation(0)).float().unsqueeze(0)
+    acts_auc = {k: torch.tensor([0], dtype=torch.long) for k in action_keys}
+    acts_auc["auction"] = torch.tensor([1], dtype=torch.long)
+    actor.zero_grad()
+    _, _, uni_kl, logit_l2 = actor.evaluate_actions_with_reg(obs_auc, auc_masks_t, acts_auc)
+    assert float(uni_kl.item()) > 0.0 and float(logit_l2.item()) > 0.0
+    (0.025 * uni_kl.mean() + 0.002 * logit_l2.mean()).backward()
+    # Gradient w.r.t. collapsed dead bias[5, 6] must be negative (so optimizer steps bias UPWARD)
+    assert float(actor.head_auction.bias.grad[5].item()) < -1e-4
+    assert float(actor.head_auction.bias.grad[6].item()) < -1e-4
+
+    # 3. PFSP prioritizes higher-Elo historical opponents
+    lm = LeagueManager(checkpoint_dir="/tmp/m2_test_pfsp_unused")
+    lm.main_agent_record.elo = 1000.0
+    lm.historical_records = [
+        LeagueAgentRecord("Hist_Weak", "historical", elo=600.0, checkpoint_path="w.pt"),
+        LeagueAgentRecord("Hist_Strong", "historical", elo=1400.0, checkpoint_path="s.pt"),
+    ]
+    counts = {"Hist_Weak": 0, "Hist_Strong": 0}
+    np.random.seed(7)
+    for _ in range(300):
+        counts[lm._select_historical_record(pfsp=True).name] += 1
+    assert counts["Hist_Strong"] > counts["Hist_Weak"] * 3
+
 
 
 

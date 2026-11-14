@@ -20,8 +20,8 @@ class RolloutBuffer:
         num_envs: int,
         obs_dim: int = 500,
         state_dim: int = 2032,
-        gamma: float = 0.9985,
-        gae_lambda: float = 0.98,
+        gamma: float = 0.9980,
+        gae_lambda: float = 0.955,
         device: torch.device = torch.device("cpu"),
     ):
         self.buffer_size = buffer_size

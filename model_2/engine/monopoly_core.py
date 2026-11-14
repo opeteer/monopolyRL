@@ -132,17 +132,17 @@ class MonopolyCore:
         self,
         seed: Optional[int] = None,
         max_rounds: Optional[int] = None,
-        gamma: float = 0.9985,
-        w1: float = 0.035,
-        w2: float = 0.0045,
-        w3: float = 0.012,
+        gamma: float = 0.9980,
+        w1: float = 0.030,
+        w2: float = 0.0032,
+        w3: float = 0.014,
         w4: float = 0.0006,
-        w_syn: float = 0.028,
-        beta_starve: float = 3.5,
-        w_house: float = 0.014,
-        w_cash: float = 0.0045,
-        w_opp_mono: float = 1.15,
-        w_lead: float = 0.60,
+        w_syn: float = 0.030,
+        beta_starve: float = 3.8,
+        w_house: float = 0.0128,
+        w_cash: float = 0.0032,
+        w_opp_mono: float = 0.85,
+        w_lead: float = 0.65,
         allow_trade: bool = True,
         include_synergy_obs: bool = True,
         player_names: Optional[List[str]] = None,
@@ -399,8 +399,8 @@ class MonopolyCore:
             term5_sum += (frac ** 2) * 50.0
         term5 = self.w_syn * term5_sum
 
-        # Term 6: Anti-Exploit Round-Based Monopoly Starvation Penalty (deepens through round 80 to defeat cash hoarding)
-        round_frac = min(2.0, self.round_count / 40.0)
+        # Term 6: Anti-Exploit Round-Based Monopoly Starvation Penalty (deepens through round 100 to defeat cash hoarding & late stalemates)
+        round_frac = min(2.5, self.round_count / 40.0)
         term6_starve = 0.0
         if street_monopolies_count == 0:
             term6_starve = self.beta_starve * (round_frac ** 2)

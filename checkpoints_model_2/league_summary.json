@@ -1,6 +1,6 @@
 {
   "main_agent": {
-    "name": "Model-2 Impala Fine",
+    "name": "Model-2 Impala",
     "role": "main",
     "elo": 655.7,
     "matches_played": 534,

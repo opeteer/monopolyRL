@@ -73,15 +73,18 @@ def parse_args():
     parser.add_argument("--eval_interval", type=int, default=defaults.get("eval_interval", 10), help="Iterations between league evaluations")
     parser.add_argument("--eval_games", type=int, default=defaults.get("eval_games", 4), help="Number of league evaluation matches per eval_interval")
     parser.add_argument("--checkpoint_dir", type=str, default=None, help="Custom checkpoint directory (overrides session dir if set)")
-    parser.add_argument("--entropy_coef", type=float, default=defaults.get("entropy_coef", 0.003), help="PPO entropy loss coefficient")
-    parser.add_argument("--entropy_min", type=float, default=defaults.get("entropy_min", 0.00035), help="Minimum entropy coefficient when annealing")
+    parser.add_argument("--entropy_coef", type=float, default=defaults.get("entropy_coef", 0.0035), help="PPO entropy loss coefficient")
+    parser.add_argument("--entropy_min", type=float, default=defaults.get("entropy_min", 0.0005), help="Minimum entropy coefficient when annealing")
+    parser.add_argument("--uniform_kl_coef", type=float, default=defaults.get("uniform_kl_coef", 0.020), help="Rare-phase Uniform-KL exploration barrier coefficient (prevents dead auction/trade logits)")
+    parser.add_argument("--uniform_kl_min", type=float, default=defaults.get("uniform_kl_min", 0.004), help="Minimum Uniform-KL barrier coefficient when annealing")
+    parser.add_argument("--logit_l2_coef", type=float, default=defaults.get("logit_l2_coef", 0.0015), help="Zero-mean valid-logit L2 regularization coefficient on rare decision heads")
     parser.add_argument("--no_entropy_anneal", action="store_true", default=defaults.get("no_entropy_anneal", False), help="Disable cosine entropy annealing")
-    parser.add_argument("--league_rollout_fraction", type=float, default=defaults.get("league_rollout_fraction", 0.25), help="Fraction of environments reserved for heterogeneous league rollout")
+    parser.add_argument("--league_rollout_fraction", type=float, default=defaults.get("league_rollout_fraction", 0.30), help="Fraction of environments reserved for heterogeneous league rollout")
     parser.add_argument("--curriculum", action="store_true", default=defaults.get("curriculum", True), help="Enable 2-phase curriculum learning")
     parser.add_argument("--no_curriculum", action="store_false", dest="curriculum", help="Disable curriculum learning")
     parser.add_argument("--curriculum_phase_2_frac", type=float, default=defaults.get("curriculum_phase_2_frac", 0.15), help="Fraction of total iterations to unlock Phase 2 full trading")
-    parser.add_argument("--gamma", type=float, default=defaults.get("gamma", 0.9985), help="GAE discount factor")
-    parser.add_argument("--gae_lambda", type=float, default=defaults.get("gae_lambda", 0.98), help="GAE lambda")
+    parser.add_argument("--gamma", type=float, default=defaults.get("gamma", 0.9980), help="GAE discount factor")
+    parser.add_argument("--gae_lambda", type=float, default=defaults.get("gae_lambda", 0.955), help="GAE lambda")
     parser.add_argument("--lr_actor", type=float, default=defaults.get("lr_actor", 2.0e-4), help="Actor initial learning rate")
     parser.add_argument("--lr_critic", type=float, default=defaults.get("lr_critic", 4.0e-4), help="Critic initial learning rate")
     parser.add_argument("--lr_actor_min", type=float, default=defaults.get("lr_actor_min", 2.5e-5), help="Minimum actor learning rate under cosine annealing")
@@ -89,19 +92,19 @@ def parse_args():
     parser.add_argument("--no_lr_anneal", action="store_true", default=defaults.get("no_lr_anneal", False), help="Disable cosine learning-rate annealing")
     parser.add_argument("--ppo_epochs", type=int, default=defaults.get("ppo_epochs", 4), help="PPO optimization epochs per iteration")
     parser.add_argument("--num_mini_batches", type=int, default=defaults.get("num_mini_batches", 8), help="Number of mini-batches per epoch")
-    parser.add_argument("--clip_param", type=float, default=defaults.get("clip_param", 0.12), help="PPO clip parameter (default: 0.12)")
-    parser.add_argument("--value_clip_param", type=float, default=defaults.get("value_clip_param", 2.0), help="PPO value clip range decoupled from policy clip (default: 2.0)")
-    parser.add_argument("--target_kl", type=float, default=defaults.get("target_kl", 0.020), help="PPO KL-divergence early-stopping threshold")
-    parser.add_argument("--w1", type=float, default=defaults.get("w1", 0.035), help="PBRS cash log potential weight")
-    parser.add_argument("--w2", type=float, default=defaults.get("w2", 0.0045), help="PBRS property equity weight")
-    parser.add_argument("--w3", type=float, default=defaults.get("w3", 0.012), help="PBRS monopoly completion bonus weight")
+    parser.add_argument("--clip_param", type=float, default=defaults.get("clip_param", 0.15), help="PPO clip parameter (default: 0.15)")
+    parser.add_argument("--value_clip_param", type=float, default=defaults.get("value_clip_param", 8.0), help="PPO value clip floor before adaptive scaling (default: 8.0)")
+    parser.add_argument("--target_kl", type=float, default=defaults.get("target_kl", 0.018), help="PPO KL-divergence early-stopping threshold (on real decision steps)")
+    parser.add_argument("--w1", type=float, default=defaults.get("w1", 0.030), help="PBRS cash log potential weight")
+    parser.add_argument("--w2", type=float, default=defaults.get("w2", 0.0032), help="PBRS property equity weight")
+    parser.add_argument("--w3", type=float, default=defaults.get("w3", 0.014), help="PBRS monopoly completion bonus weight")
     parser.add_argument("--w4", type=float, default=defaults.get("w4", 0.0006), help="PBRS rent hazard paranoia weight")
-    parser.add_argument("--w_syn", type=float, default=defaults.get("w_syn", 0.028), help="PBRS color synergy potential weight")
-    parser.add_argument("--beta_starve", type=float, default=defaults.get("beta_starve", 3.5), help="PBRS round-based monopoly starvation penalty weight")
-    parser.add_argument("--w_house", type=float, default=defaults.get("w_house", 0.014), help="PBRS house/hotel building equity weight")
-    parser.add_argument("--w_cash", type=float, default=defaults.get("w_cash", 0.0045), help="PBRS linear cash equity weight (equal to w2 to prevent arbitrage)")
-    parser.add_argument("--w_opp_mono", type=float, default=defaults.get("w_opp_mono", 1.15), help="PBRS anti-kingmaking opponent monopoly threat penalty weight")
-    parser.add_argument("--w_lead", type=float, default=defaults.get("w_lead", 0.60), help="PBRS relative net-worth lead preservation weight")
+    parser.add_argument("--w_syn", type=float, default=defaults.get("w_syn", 0.030), help="PBRS color synergy potential weight")
+    parser.add_argument("--beta_starve", type=float, default=defaults.get("beta_starve", 3.8), help="PBRS round-based monopoly starvation penalty weight")
+    parser.add_argument("--w_house", type=float, default=defaults.get("w_house", 0.0128), help="PBRS house/hotel building equity weight")
+    parser.add_argument("--w_cash", type=float, default=defaults.get("w_cash", 0.0032), help="PBRS linear cash equity weight (equal to w2 to prevent arbitrage)")
+    parser.add_argument("--w_opp_mono", type=float, default=defaults.get("w_opp_mono", 0.85), help="PBRS anti-kingmaking opponent monopoly threat penalty weight")
+    parser.add_argument("--w_lead", type=float, default=defaults.get("w_lead", 0.65), help="PBRS relative net-worth lead preservation weight")
     parser.add_argument("--resume", type=str, default=None, help="Resume training: 'latest' or path to checkpoint file")
     parser.add_argument("--resume_checkpoint", type=str, default=None, help="Legacy alias for --resume")
     parser.add_argument("--fine_tune", action="store_true", default=False, help="Fine-tune from --resume checkpoint: keeps trading unlocked, resets annealing schedule, and applies gentle fine-tuning LR/entropy defaults")
@@ -136,6 +139,15 @@ def find_latest_global_checkpoint() -> Optional[str]:
     return candidates[-1]
 
 
+def _has_nontrivial_decision(masks_in: Dict[str, torch.Tensor], action_keys: list) -> torch.Tensor:
+    """Returns float mask (1.0 where acting player has >1 valid option in >=1 head, excluding forced rolls)."""
+    ref = masks_in[action_keys[0]]
+    has_choice = torch.zeros(ref.shape[0], dtype=torch.bool, device=ref.device)
+    for k in action_keys:
+        has_choice = has_choice | ((masks_in[k] > 0).sum(dim=-1) > 1)
+    return has_choice.float()
+
+
 def _apply_league_opponents(
     env_indices_t: torch.Tensor,
     act_p: torch.Tensor,
@@ -146,6 +158,7 @@ def _apply_league_opponents(
     log_probs_per_env: torch.Tensor,
     active_masks_step: torch.Tensor,
     exploiter_masks_step: torch.Tensor,
+    decision_active: torch.Tensor,
     hist_policy: Optional[ActorNetwork],
     hist_end: int,
     num_league_envs: int,
@@ -185,7 +198,7 @@ def _apply_league_opponents(
                 actions_per_env[k][exp_idx, exp_p] = exp_acts[k]
             log_probs_per_env[exp_idx, exp_p] = exp_lps
             active_masks_step[exp_idx, exp_p] = 0.0
-            exploiter_masks_step[exp_idx, exp_p] = 1.0
+            exploiter_masks_step[exp_idx, exp_p] = decision_active[exp_idx]
 
 
 def main():
@@ -193,17 +206,23 @@ def main():
     if args.fine_tune:
         args.curriculum = False
         if "--lr_actor" not in sys.argv:
-            args.lr_actor = 5.0e-5
+            args.lr_actor = 6.0e-5
         if "--lr_actor_min" not in sys.argv:
             args.lr_actor_min = 1.0e-5
         if "--lr_critic" not in sys.argv:
-            args.lr_critic = 1.0e-4
+            args.lr_critic = 1.5e-4
         if "--lr_critic_min" not in sys.argv:
-            args.lr_critic_min = 2.0e-5
+            args.lr_critic_min = 2.5e-5
         if "--entropy_coef" not in sys.argv:
-            args.entropy_coef = 0.0012
+            args.entropy_coef = 0.0018
         if "--entropy_min" not in sys.argv:
-            args.entropy_min = 0.00035
+            args.entropy_min = 0.00045
+        if "--uniform_kl_coef" not in sys.argv:
+            args.uniform_kl_coef = 0.025
+        if "--uniform_kl_min" not in sys.argv:
+            args.uniform_kl_min = 0.005
+        if "--logit_l2_coef" not in sys.argv:
+            args.logit_l2_coef = 0.0020
     device = torch.device(args.device)
     if device.type == "cpu" and args.num_threads > 0:
         torch.set_num_threads(args.num_threads)
@@ -364,6 +383,8 @@ def main():
         ppo_epochs=args.ppo_epochs,
         num_mini_batches=args.num_mini_batches,
         entropy_coef=args.entropy_coef,
+        uniform_kl_coef=args.uniform_kl_coef,
+        logit_l2_coef=args.logit_l2_coef,
         target_kl=args.target_kl,
         device=device,
     )
@@ -449,6 +470,8 @@ def main():
                 if not args.no_entropy_anneal:
                     current_ent_coef = args.entropy_min + cosine_decay * (args.entropy_coef - args.entropy_min)
                     trainer.set_entropy_coef(current_ent_coef)
+                    current_uni_kl = args.uniform_kl_min + cosine_decay * (args.uniform_kl_coef - args.uniform_kl_min)
+                    trainer.set_uniform_kl_coef(current_uni_kl)
                 if not args.no_lr_anneal:
                     current_lr_actor = args.lr_actor_min + cosine_decay * (args.lr_actor - args.lr_actor_min)
                     current_lr_critic = args.lr_critic_min + cosine_decay * (args.lr_critic - args.lr_critic_min)
@@ -482,12 +505,21 @@ def main():
             # Rollout collection loop
             for step in range(args.rollout_steps):
                 if use_shm:
-                    # ZERO-COPY FAST PATH: Data is already in shm_obs, shm_state, shm_masks
+                    # ZERO-COPY FAST PATH on CPU; direct device transfer when training on GPU
+                    if device.type == "cpu":
+                        step_obs, step_state, step_act_p = shm_obs, shm_state, shm_act_p
+                        step_masks = shm_masks
+                    else:
+                        step_obs = shm_obs.to(device, non_blocking=True)
+                        step_state = shm_state.to(device, non_blocking=True)
+                        step_act_p = shm_act_p.to(device, non_blocking=True)
+                        step_masks = {k: shm_masks[k].to(device, non_blocking=True) for k in buffer.action_keys}
+
                     with torch.inference_mode():
-                        values = main_critic(shm_state)
-                        act_p = shm_act_p
-                        active_obs = shm_obs[env_indices_t, act_p]
-                        active_masks_in = {k: shm_masks[k][env_indices_t, act_p] for k in buffer.action_keys}
+                        values = main_critic(step_state)
+                        act_p = step_act_p
+                        active_obs = step_obs[env_indices_t, act_p]
+                        active_masks_in = {k: step_masks[k][env_indices_t, act_p] for k in buffer.action_keys}
                         act_dict_active, lp_active, _ = main_actor(active_obs, active_masks_in)
 
                         for k in buffer.action_keys:
@@ -502,14 +534,15 @@ def main():
                         log_probs_per_env.zero_()
                         log_probs_per_env[env_indices_t, act_p] = lp_active
 
+                        decision_active = _has_nontrivial_decision(active_masks_in, buffer.action_keys)
                         active_masks_step.zero_()
-                        active_masks_step[env_indices_t, act_p] = 1.0
+                        active_masks_step[env_indices_t, act_p] = decision_active
 
                         # Heterogeneous League & Exploiter Rollout
                         _apply_league_opponents(
-                            env_indices_t, act_p, shm_obs, shm_masks, buffer.action_keys,
+                            env_indices_t, act_p, step_obs, step_masks, buffer.action_keys,
                             actions_per_env, log_probs_per_env, active_masks_step, exploiter_masks_step,
-                            iter_hist_policy, hist_end, num_league_envs, exploiter_actor, obs_dim,
+                            decision_active, iter_hist_policy, hist_end, num_league_envs, exploiter_actor, obs_dim,
                         )
 
                         # Direct write to shared action buffers
@@ -518,12 +551,12 @@ def main():
 
                     # Insert state snapshot into buffer prior to stepping
                     buffer.insert(
-                        obs=shm_obs,
-                        global_state=shm_state,
+                        obs=step_obs,
+                        global_state=step_state,
                         actions=actions_per_env,
-                        action_masks=shm_masks,
-                        rewards=shm_rewards,  # updated immediately after step
-                        dones=shm_dones,
+                        action_masks=step_masks,
+                        rewards=shm_rewards if device.type == "cpu" else shm_rewards.to(device),
+                        dones=shm_dones if device.type == "cpu" else shm_dones.to(device),
                         values=values,
                         log_probs=log_probs_per_env,
                         active_masks=active_masks_step,
@@ -533,8 +566,8 @@ def main():
                     # Step parallel environments
                     _, _, _, _, _, _, step_stats = vec_env.step()
                     # Store exact post-step rewards and terminal flags
-                    buffer.rewards[buffer.step - 1] = shm_rewards
-                    buffer.dones[buffer.step - 1] = shm_dones
+                    buffer.rewards[buffer.step - 1] = shm_rewards if device.type == "cpu" else shm_rewards.to(device)
+                    buffer.dones[buffer.step - 1] = shm_dones if device.type == "cpu" else shm_dones.to(device)
 
                     if step_stats["episodes"] > 0:
                         telemetry_window["episodes"] += step_stats["episodes"]
@@ -577,13 +610,14 @@ def main():
 
                         log_probs_per_env.zero_()
                         log_probs_per_env[env_indices_t, act_p_t] = lp_active
+                        decision_active = _has_nontrivial_decision(active_masks_in, buffer.action_keys)
                         active_masks_step.zero_()
-                        active_masks_step[env_indices_t, act_p_t] = 1.0
+                        active_masks_step[env_indices_t, act_p_t] = decision_active
 
                         _apply_league_opponents(
                             env_indices_t, act_p_t, batch_obs, batch_masks, buffer.action_keys,
                             actions_per_env, log_probs_per_env, active_masks_step, exploiter_masks_step,
-                            iter_hist_policy, hist_end, num_league_envs, exploiter_actor, obs_dim,
+                            decision_active, iter_hist_policy, hist_end, num_league_envs, exploiter_actor, obs_dim,
                         )
 
                     a_cpu = {k: actions_per_env[k].cpu().numpy() for k in buffer.action_keys}
@@ -652,8 +686,9 @@ def main():
             # Compute GAE
             with torch.inference_mode():
                 if use_shm:
-                    last_values = main_critic(shm_state)
-                    last_dones = shm_dones
+                    last_state_dev = shm_state if device.type == "cpu" else shm_state.to(device)
+                    last_values = main_critic(last_state_dev)
+                    last_dones = shm_dones if device.type == "cpu" else shm_dones.to(device)
                 else:
                     for e_idx in range(args.num_envs):
                         batch_states_np[e_idx] = current_infos_list[e_idx]["player_0"]["global_state"]
@@ -801,9 +836,12 @@ def main():
 
                     league_mgr.update_match_results(lineup_records, ranks, net_worths)
                 if (
-                    iteration % 50 == 0
-                    and league_mgr.exploiter_record.matches_played >= 5
-                    and league_mgr.exploiter_record.win_rate < 0.15
+                    (
+                        iteration % 50 == 0
+                        and league_mgr.exploiter_record.matches_played >= 5
+                        and league_mgr.exploiter_record.win_rate < 0.15
+                    )
+                    or (iteration % 200 == 0)
                 ):
                     exploiter_actor.load_state_dict(main_actor.state_dict())
                     exploiter_optimizer.state.clear()

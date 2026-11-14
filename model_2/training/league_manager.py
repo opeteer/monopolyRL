@@ -180,19 +180,32 @@ class LeagueManager:
             lineup_policies.append(exploiter_policy)
             lineup_records.append(self.exploiter_record)
 
-            # 1 Historical Checkpoint
-            hist_rec = np.random.choice(self.historical_records)
+            # 1 Historical Checkpoint (PFSP Elo-weighted prioritization)
+            hist_rec = self._select_historical_record(pfsp=True)
             hist_policy = self._get_cached_policy(hist_rec)
             lineup_policies.append(hist_policy)
             lineup_records.append(hist_rec)
 
         return lineup_policies, lineup_records
 
-    def get_random_historical_policy(self) -> Optional[ActorNetwork]:
-        """Returns a cached policy randomly sampled from the historical pool."""
+    def _select_historical_record(self, pfsp: bool = True) -> LeagueAgentRecord:
+        """Selects a historical checkpoint using Prioritized Fictitious Self-Play (PFSP) Elo weights."""
+        if len(self.historical_records) == 1 or not pfsp:
+            return np.random.choice(self.historical_records)
+        main_elo = float(self.main_agent_record.elo)
+        elos = np.array([float(rec.elo) for rec in self.historical_records], dtype=np.float64)
+        diffs = np.clip((elos - main_elo) / 200.0, -10.0, 10.0)
+        expected_opp_score = 1.0 / (1.0 + np.exp(-diffs))
+        weights = (expected_opp_score ** 1.5) + 0.10
+        probs = weights / weights.sum()
+        idx = int(np.random.choice(len(self.historical_records), p=probs))
+        return self.historical_records[idx]
+
+    def get_random_historical_policy(self, pfsp: bool = True) -> Optional[ActorNetwork]:
+        """Returns a cached policy sampled from the historical pool (PFSP-prioritized by default)."""
         if not self.historical_records:
             return None
-        rec = np.random.choice(self.historical_records)
+        rec = self._select_historical_record(pfsp=pfsp)
         return self._get_cached_policy(rec)
 
     def _get_cached_policy(self, record: LeagueAgentRecord) -> ActorNetwork:
