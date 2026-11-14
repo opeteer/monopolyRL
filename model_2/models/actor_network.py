@@ -167,12 +167,12 @@ class ActorNetwork(nn.Module):
                 )
                 entropy = (
                     is_core * ent_dict["core"] +
-                    is_auc * ent_dict["auction"] +
+                    2.5 * is_auc * ent_dict["auction"] +
                     is_manage * ent_dict["property"] +
                     is_trade_check * (ent_dict["trade_offer_prop"] + ent_dict["trade_req_prop"]) +
                     is_trade_detail * (ent_dict["trade_offer_cash"] + ent_dict["trade_req_cash"]) +
                     is_trade_target * ent_dict["trade_target"] +
-                    is_trade_resp * ent_dict["trade_response"]
+                    1.5 * is_trade_resp * ent_dict["trade_response"]
                 )
                 return log_prob, entropy
 

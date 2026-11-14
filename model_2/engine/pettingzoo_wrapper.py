@@ -37,7 +37,7 @@ class MonopolyParallelEnv(ParallelEnv):
         beta_starve: float = 3.5,
         w_house: float = 0.014,
         w_cash: float = 0.0045,
-        w_opp_mono: float = 0.90,
+        w_opp_mono: float = 1.15,
         w_lead: float = 0.60,
         allow_trade: bool = True,
         include_synergy_obs: bool = True,

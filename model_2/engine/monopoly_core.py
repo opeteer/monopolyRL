@@ -73,6 +73,9 @@ COLOR_GROUPS_MONOPOLY = tuple(
     (tuple(tiles), float(GROUP_MONOPOLY_BONUS.get(grp_name, 0.0)), grp_name not in ("RAILROAD", "UTILITY"))
     for grp_name, tiles in COLOR_GROUPS.items()
 )
+MEAN_STREET_MONOPOLY_BONUS = sum(
+    b for _, b, is_st in COLOR_GROUPS_MONOPOLY if is_st
+) / max(1, sum(1 for _, _, is_st in COLOR_GROUPS_MONOPOLY if is_st))
 STREET_GROUPS_SYNERGY = tuple(
     (grp_name, tuple(tiles), float(len(tiles)))
     for grp_name, tiles in COLOR_GROUPS.items()
@@ -138,7 +141,7 @@ class MonopolyCore:
         beta_starve: float = 3.5,
         w_house: float = 0.014,
         w_cash: float = 0.0045,
-        w_opp_mono: float = 0.90,
+        w_opp_mono: float = 1.15,
         w_lead: float = 0.60,
         allow_trade: bool = True,
         include_synergy_obs: bool = True,
@@ -355,14 +358,14 @@ class MonopolyCore:
         term1 = self.w1 * math.log(c_i + 1.0) + self.w_cash * float(c_i)
 
         # Term 2: Property equity + House/Hotel development value
-        # Weighting mortgage at 1.25x prices 10% unmortgage interest + illiquidity friction,
-        # discouraging unnecessary mortgaging while keeping unmortgaging positive when liquid.
+        # Weighting mortgage at 1.12x matches the 10% unmortgage interest + 2% illiquidity friction,
+        # eliminating phantom unmortgage arbitrage and cross-turn mortgage/unmortgage thrashing.
         term2_prop = 0.0
         term2_house = 0.0
         for p in PURCHASABLE_TILES_TUPLE:
             if self.property_owner[p] == player_id:
                 m_p = 1.0 if self.property_mortgaged[p] else 0.0
-                term2_prop += (self._tile_prices_f[p] - m_p * 1.25 * self._tile_mortgages_f[p])
+                term2_prop += (self._tile_prices_f[p] - m_p * 1.12 * self._tile_mortgages_f[p])
                 term2_house += float(self.property_houses[p] * self._tile_house_costs_f[p])
         term2 = (self.w2 * term2_prop) + (self.w_house * term2_house)
 
@@ -402,17 +405,18 @@ class MonopolyCore:
         if street_monopolies_count == 0:
             term6_starve = self.beta_starve * (round_frac ** 2)
 
-        # Term 7: Opponent Street Monopoly Threat Penalty (eliminates blind kingmaking & nominal-price bias)
+        # Term 7: Value-scaled Opponent Street Monopoly Threat Penalty (eliminates blind kingmaking & nominal-price bias)
         opp_threat_score = 0.0
         alive_opps = [pl for pl in range(4) if pl != player_id and not self.bankrupt[pl]]
-        for tiles, _, is_street in COLOR_GROUPS_MONOPOLY:
+        for tiles, grp_bonus, is_street in COLOR_GROUPS_MONOPOLY:
             if not is_street:
                 continue
             first_owner = self.property_owner[tiles[0]]
             if first_owner != -1 and first_owner != player_id and not self.bankrupt[first_owner]:
                 if all(self.property_owner[t] == first_owner for t in tiles):
                     avg_h = sum(self.property_houses[t] for t in tiles) / float(len(tiles))
-                    opp_threat_score += (1.0 + 0.15 * avg_h)
+                    value_scale = 0.5 + 0.5 * (grp_bonus / MEAN_STREET_MONOPOLY_BONUS)
+                    opp_threat_score += value_scale * (1.0 + 0.15 * avg_h)
         term7_opp_threat = self.w_opp_mono * opp_threat_score
 
         # Term 8: Relative Net-Worth Lead (encourages closing out dominant 1v1 leads cleanly)

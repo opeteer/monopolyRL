@@ -17,7 +17,7 @@ class TrainingConfig:
     checkpoint_interval: int = 25
     eval_interval: int = 10
     entropy_coef: float = 0.003
-    entropy_min: float = 0.00005
+    entropy_min: float = 0.00035
     no_entropy_anneal: bool = False
     league_rollout_fraction: float = 0.25
     curriculum: bool = True
@@ -41,7 +41,7 @@ class TrainingConfig:
     beta_starve: float = 3.5
     w_house: float = 0.014
     w_cash: float = 0.0045
-    w_opp_mono: float = 0.90
+    w_opp_mono: float = 1.15
     w_lead: float = 0.60
     max_rounds: int = 80
     randomize_first_player: bool = True

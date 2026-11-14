@@ -71,9 +71,10 @@ def parse_args():
     parser.add_argument("--no_shm", action="store_false", dest="use_shm", help="Disable shared memory vectorization (use standard Pipe Subproc)")
     parser.add_argument("--checkpoint_interval", type=int, default=defaults.get("checkpoint_interval", 25), help="Iterations between checkpoints")
     parser.add_argument("--eval_interval", type=int, default=defaults.get("eval_interval", 10), help="Iterations between league evaluations")
+    parser.add_argument("--eval_games", type=int, default=defaults.get("eval_games", 4), help="Number of league evaluation matches per eval_interval")
     parser.add_argument("--checkpoint_dir", type=str, default=None, help="Custom checkpoint directory (overrides session dir if set)")
     parser.add_argument("--entropy_coef", type=float, default=defaults.get("entropy_coef", 0.003), help="PPO entropy loss coefficient")
-    parser.add_argument("--entropy_min", type=float, default=defaults.get("entropy_min", 0.00005), help="Minimum entropy coefficient when annealing")
+    parser.add_argument("--entropy_min", type=float, default=defaults.get("entropy_min", 0.00035), help="Minimum entropy coefficient when annealing")
     parser.add_argument("--no_entropy_anneal", action="store_true", default=defaults.get("no_entropy_anneal", False), help="Disable cosine entropy annealing")
     parser.add_argument("--league_rollout_fraction", type=float, default=defaults.get("league_rollout_fraction", 0.25), help="Fraction of environments reserved for heterogeneous league rollout")
     parser.add_argument("--curriculum", action="store_true", default=defaults.get("curriculum", True), help="Enable 2-phase curriculum learning")
@@ -99,10 +100,11 @@ def parse_args():
     parser.add_argument("--beta_starve", type=float, default=defaults.get("beta_starve", 3.5), help="PBRS round-based monopoly starvation penalty weight")
     parser.add_argument("--w_house", type=float, default=defaults.get("w_house", 0.014), help="PBRS house/hotel building equity weight")
     parser.add_argument("--w_cash", type=float, default=defaults.get("w_cash", 0.0045), help="PBRS linear cash equity weight (equal to w2 to prevent arbitrage)")
-    parser.add_argument("--w_opp_mono", type=float, default=defaults.get("w_opp_mono", 0.90), help="PBRS anti-kingmaking opponent monopoly threat penalty weight")
+    parser.add_argument("--w_opp_mono", type=float, default=defaults.get("w_opp_mono", 1.15), help="PBRS anti-kingmaking opponent monopoly threat penalty weight")
     parser.add_argument("--w_lead", type=float, default=defaults.get("w_lead", 0.60), help="PBRS relative net-worth lead preservation weight")
     parser.add_argument("--resume", type=str, default=None, help="Resume training: 'latest' or path to checkpoint file")
     parser.add_argument("--resume_checkpoint", type=str, default=None, help="Legacy alias for --resume")
+    parser.add_argument("--fine_tune", action="store_true", default=False, help="Fine-tune from --resume checkpoint: keeps trading unlocked, resets annealing schedule, and applies gentle fine-tuning LR/entropy defaults")
     parser.add_argument("--max_rounds", type=int, default=defaults.get("max_rounds", 80), help="Max rounds per training/eval episode (default: 80, benchmarked from external 4p Monopoly bots)")
     parser.add_argument("--fixed_first_player", action="store_false", dest="randomize_first_player", default=defaults.get("randomize_first_player", True), help="Keep Player 0 as fixed starting player instead of randomizing first seat")
     parser.add_argument("--model_name", type=str, default="Model-2 Impala", help="Designated model name saved on completion (default: 'Model-2 Impala')")
@@ -188,6 +190,20 @@ def _apply_league_opponents(
 
 def main():
     args = parse_args()
+    if args.fine_tune:
+        args.curriculum = False
+        if "--lr_actor" not in sys.argv:
+            args.lr_actor = 5.0e-5
+        if "--lr_actor_min" not in sys.argv:
+            args.lr_actor_min = 1.0e-5
+        if "--lr_critic" not in sys.argv:
+            args.lr_critic = 1.0e-4
+        if "--lr_critic_min" not in sys.argv:
+            args.lr_critic_min = 2.0e-5
+        if "--entropy_coef" not in sys.argv:
+            args.entropy_coef = 0.0012
+        if "--entropy_min" not in sys.argv:
+            args.entropy_min = 0.00035
     device = torch.device(args.device)
     if device.type == "cpu" and args.num_threads > 0:
         torch.set_num_threads(args.num_threads)
@@ -281,7 +297,7 @@ def main():
 
     if resume_target and os.path.exists(resume_target):
         print(f"--> [Resume] Loading weights and state from {resume_target}")
-        ckpt = torch.load(resume_target, map_location=device)
+        ckpt = torch.load(resume_target, map_location=device, weights_only=False)
         state_dict = ckpt.get("state_dict", ckpt.get("actor_state_dict", None))
         if state_dict is not None:
             new_sd = main_actor.state_dict()
@@ -324,13 +340,16 @@ def main():
         else:
             exploiter_actor.load_state_dict(main_actor.state_dict())
 
-        # Restore iteration offset if present
+        # Restore iteration offset if present (unless --fine_tune runs a fresh annealing schedule)
         meta = ckpt.get("metadata", {})
-        if "iteration" in meta:
-            start_iteration = meta["iteration"] + 1
-        if "total_steps" in meta:
-            total_steps_executed = meta["total_steps"]
-        print(f"--> [Resume] Successfully restored. Resuming from iteration {start_iteration} (Total Steps: {total_steps_executed:,})")
+        if not args.fine_tune:
+            if "iteration" in meta:
+                start_iteration = meta["iteration"] + 1
+            if "total_steps" in meta:
+                total_steps_executed = meta["total_steps"]
+            print(f"--> [Resume] Successfully restored. Resuming from iteration {start_iteration} (Total Steps: {total_steps_executed:,})")
+        else:
+            print(f"--> [Fine-Tune] Loaded pre-trained weights from {resume_target}. Running fresh schedule 1..{args.num_iterations} (LR={args.lr_actor:.1e}->{args.lr_actor_min:.1e}, Ent={args.entropy_coef:.4f}->{args.entropy_min:.5f})")
 
     initial_total_steps = total_steps_executed
 
@@ -729,57 +748,58 @@ def main():
                 )
                 print(f"--> [Checkpoint Saved] {ckpt_path} (Total Steps: {total_steps_executed:,})")
 
-            # League Evaluation Match (Driven by hardware fluctuation entropy)
+            # League Evaluation Matches (Driven by hardware fluctuation entropy)
             if iteration % args.eval_interval == 0 and league_mgr.historical_records:
-                eval_env = MonopolyParallelEnv(
-                    max_rounds=args.max_rounds,
-                    seed=None,
-                    gamma=args.gamma,
-                    w1=args.w1,
-                    w2=args.w2,
-                    w3=args.w3,
-                    w4=args.w4,
-                    w_syn=args.w_syn,
-                    beta_starve=args.beta_starve,
-                    w_house=args.w_house,
-                    w_cash=args.w_cash,
-                    w_opp_mono=args.w_opp_mono,
-                    w_lead=args.w_lead,
-                    randomize_first_player=args.randomize_first_player,
-                )
-                eval_obs, eval_infos = eval_env.reset()
-                lineup_policies, lineup_records = league_mgr.sample_match_lineup(main_actor, exploiter_actor, mode="league")
+                for _eval_idx in range(max(1, args.eval_games)):
+                    eval_env = MonopolyParallelEnv(
+                        max_rounds=args.max_rounds,
+                        seed=None,
+                        gamma=args.gamma,
+                        w1=args.w1,
+                        w2=args.w2,
+                        w3=args.w3,
+                        w4=args.w4,
+                        w_syn=args.w_syn,
+                        beta_starve=args.beta_starve,
+                        w_house=args.w_house,
+                        w_cash=args.w_cash,
+                        w_opp_mono=args.w_opp_mono,
+                        w_lead=args.w_lead,
+                        randomize_first_player=args.randomize_first_player,
+                    )
+                    eval_obs, eval_infos = eval_env.reset()
+                    lineup_policies, lineup_records = league_mgr.sample_match_lineup(main_actor, exploiter_actor, mode="league")
 
-                done_eval = False
-                step_count = 0
-                while not done_eval and step_count < 4000:
-                    step_count += 1
-                    actions = {}
-                    for p_idx in range(4):
-                        p_name = f"player_{p_idx}"
-                        pol = lineup_policies[p_idx]
-                        o_raw = eval_obs[p_name]["obs"]
-                        if hasattr(pol, "obs_dim") and pol.obs_dim < len(o_raw):
-                            o_raw = o_raw[:pol.obs_dim]
-                        o_t = torch.tensor(o_raw, dtype=torch.float32, device=device).unsqueeze(0)
-                        m_t = {
-                            k: torch.tensor(eval_obs[p_name]["action_mask"][k], dtype=torch.int8, device=device).unsqueeze(0)
-                            for k in buffer.action_keys
-                        }
-                        with torch.inference_mode():
-                            a_dict, _, _ = pol(o_t, m_t, deterministic=True)
-                        actions[p_name] = {k: int(a_dict[k].item()) for k in buffer.action_keys}
+                    done_eval = False
+                    step_count = 0
+                    while not done_eval and step_count < 4000:
+                        step_count += 1
+                        actions = {}
+                        for p_idx in range(4):
+                            p_name = f"player_{p_idx}"
+                            pol = lineup_policies[p_idx]
+                            o_raw = eval_obs[p_name]["obs"]
+                            if hasattr(pol, "obs_dim") and pol.obs_dim < len(o_raw):
+                                o_raw = o_raw[:pol.obs_dim]
+                            o_t = torch.tensor(o_raw, dtype=torch.float32, device=device).unsqueeze(0)
+                            m_t = {
+                                k: torch.tensor(eval_obs[p_name]["action_mask"][k], dtype=torch.int8, device=device).unsqueeze(0)
+                                for k in buffer.action_keys
+                            }
+                            with torch.inference_mode():
+                                a_dict, _, _ = pol(o_t, m_t, deterministic=False, temperature=0.65)
+                            actions[p_name] = {k: int(a_dict[k].item()) for k in buffer.action_keys}
 
-                    eval_obs, _, terminations, truncations, eval_infos = eval_env.step(actions)
-                    done_eval = any(truncations.values()) or all(terminations.values())
+                        eval_obs, _, terminations, truncations, eval_infos = eval_env.step(actions)
+                        done_eval = any(truncations.values()) or all(terminations.values())
 
-                net_worths = [eval_env.core.get_player_net_worth(p) for p in range(4)]
-                order = np.argsort(net_worths)[::-1]
-                ranks = [0] * 4
-                for rank_pos, p_idx in enumerate(order):
-                    ranks[p_idx] = rank_pos + 1
+                    net_worths = [eval_env.core.get_player_net_worth(p) for p in range(4)]
+                    order = np.argsort(net_worths)[::-1]
+                    ranks = [0] * 4
+                    for rank_pos, p_idx in enumerate(order):
+                        ranks[p_idx] = rank_pos + 1
 
-                league_mgr.update_match_results(lineup_records, ranks, net_worths)
+                    league_mgr.update_match_results(lineup_records, ranks, net_worths)
                 if (
                     iteration % 50 == 0
                     and league_mgr.exploiter_record.matches_played >= 5

@@ -3,7 +3,7 @@
 Validates that Model-2 enforces only official Monopoly rules and minimal physical/halting guards
 without Model-1 hardcoded strategic heuristics ("training wheels"):
 1. Unrestricted liquidity mortgaging (any unbuilt, unmortgaged property at any cash level)
-   guided by policy-invariant PBRS (1.25x mortgage equity burn on wasteful mortgaging).
+   guided by policy-invariant PBRS (1.12x mortgage equity burn preventing low-cash thrash arbitrage).
 2. Pure public-information auction squeeze bid (`max_opp_cash + 1`) with zero hardcoded
    compute_bidding_ceiling valuation/price caps.
 3. Free trade pricing across $100-$2,000 ($100 step, 21 brackets) with no mortgage-value floor,
@@ -160,7 +160,7 @@ def test_model_2_pbrs_mortgage_burn_and_anti_kingmaking_terms():
     """Verifies PBRS discourages flush mortgaging, kills $500 arbitrage, and activates Term 7 & 8."""
     core = MonopolyCore(seed=42)
     assert abs(core.w_cash - core.w2) < 1e-9
-    assert core.w_opp_mono == 0.90
+    assert core.w_opp_mono == 1.15
     assert core.w_lead == 0.60
 
     # Mortgaging Penn RR ($100 mortgage) when already holding $5,000 must drop PBRS potential
@@ -659,5 +659,37 @@ def test_model_2_anti_stalemate_timeout_payoff_and_monopoly_dominance_over_cash(
     # 5. Default training horizon matches external 4p Monopoly bot benchmark buffer (80 rounds)
     assert TrainingConfig().max_rounds == 80
     assert get_preset("grandmaster_150m").max_rounds == 80
+
+
+def test_model_2_fine_tune_pbrs_thrash_fix_and_value_scaled_threat():
+    """Verifies low-cash unmortgage thrashing arbitrage is eliminated and Term 7 scales by group value."""
+    core = MonopolyCore(seed=303)
+    assert core.w_syn == 0.028
+
+    # Tight low cash ($250): unmortgaging Park Place (#37, mort $175 -> cost $192) must NOT yield positive arbitrage
+    core.property_owner[37] = 0
+    core.property_mortgaged[37] = True
+    core.cash = [250, 1500, 1500, 1500]
+    phi_tight_mtg = core._compute_potential(0)
+    core.property_mortgaged[37] = False
+    core.cash[0] -= int(175 * 1.10)
+    phi_tight_unmtg = core._compute_potential(0)
+    assert phi_tight_unmtg < phi_tight_mtg
+
+    # Value-scaled Term 7: opponent completing Dark Blue (#37, #39) penalizes more than Brown (#1, #3)
+    c_brown = MonopolyCore(seed=304)
+    c_brown.property_owner[1] = 1
+    phi_b0 = c_brown._compute_potential(0)
+    c_brown.property_owner[3] = 1
+    drop_brown = phi_b0 - c_brown._compute_potential(0)
+
+    c_blue = MonopolyCore(seed=304)
+    c_blue.property_owner[37] = 1
+    phi_db0 = c_blue._compute_potential(0)
+    c_blue.property_owner[39] = 1
+    drop_blue = phi_db0 - c_blue._compute_potential(0)
+
+    assert drop_blue > drop_brown + 0.5
+
 
 
