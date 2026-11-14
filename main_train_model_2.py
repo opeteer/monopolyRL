@@ -405,6 +405,18 @@ def main():
     league_mgr = LeagueManager(checkpoint_dir=checkpoint_dir, device=device)
     if args.model_name and hasattr(league_mgr, "main_agent_record"):
         league_mgr.main_agent_record.name = args.model_name
+    if resume_target is None and hasattr(league_mgr, "main_agent_record"):
+        league_mgr.main_agent_record.elo = 1200.0
+        league_mgr.main_agent_record.matches_played = 0
+        league_mgr.main_agent_record.wins = 0
+        league_mgr.main_agent_record.bankruptcies = 0
+        league_mgr.main_agent_record.total_net_worth = 0.0
+        if hasattr(league_mgr, "exploiter_record"):
+            league_mgr.exploiter_record.elo = 1200.0
+            league_mgr.exploiter_record.matches_played = 0
+            league_mgr.exploiter_record.wins = 0
+            league_mgr.exploiter_record.bankruptcies = 0
+            league_mgr.exploiter_record.total_net_worth = 0.0
 
     if start_iteration <= 1:
         league_mgr.save_checkpoint(
