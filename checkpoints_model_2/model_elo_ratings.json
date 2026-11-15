@@ -2,39 +2,35 @@
   "rating_system": "Plackett-Luce Multiplayer Win-Likelihood Elo (reworked)",
   "anchor_model": "M1-50M",
   "anchor_elo": 1200.0,
-  "total_calibration_games": 160,
+  "total_calibration_games": 300,
   "ratings": {
     "M2-Barracuda": {
-      "elo": 1306.3,
+      "elo": 1290.3,
       "ci_95": [
-        1202.8,
-        1430.4
+        1199.2,
+        1380.9
       ],
       "tier": "Supreme Grandmaster / Flagship",
       "checkpoint_path": "checkpoints_model_2/Model-2_Barracuda.pt",
       "training_steps": "150M + 30M Fine-Tune (180M total)",
-      "seat_games_160": 224,
-      "seat_wins_160": 80.0,
-      "seat_win_rate_160_pct": 35.71,
-      "avg_nw_92_round_robin": 3962.3,
-      "survival_pct_92_round_robin": 40.91,
-      "legacy_pairwise_mle_elo_92": 1251.4
+      "seat_games_300": 256,
+      "seat_wins_300": 76.0,
+      "seat_win_rate_300_pct": 29.69,
+      "head_to_head_vs_150m_32": "18-14 (56.25%)",
+      "league_internal_elo": 1266.2
     },
     "M2-Impala": {
-      "elo": 1212.9,
+      "elo": 1220.3,
       "ci_95": [
-        1097.8,
-        1333.5
+        1128.7,
+        1310.2
       ],
       "tier": "Master",
       "checkpoint_path": "checkpoints_model_2/Model-2_Impala.pt",
       "training_steps": "155M + 30M Fine-Tune",
-      "seat_games_160": 136,
-      "seat_wins_160": 32.0,
-      "seat_win_rate_160_pct": 23.53,
-      "avg_nw_92_round_robin": 3651.2,
-      "survival_pct_92_round_robin": 29.55,
-      "legacy_pairwise_mle_elo_92": 1210.3
+      "seat_games_300": 208,
+      "seat_wins_300": 46.0,
+      "seat_win_rate_300_pct": 22.12
     },
     "M1-50M": {
       "elo": 1200.0,
@@ -45,44 +41,35 @@
       "tier": "Master Baseline (Anchor)",
       "checkpoint_path": "checkpoints/main_iter_02441.pt",
       "training_steps": 49991680,
-      "seat_games_160": 88,
-      "seat_wins_160": 22.0,
-      "seat_win_rate_160_pct": 25.0,
-      "avg_nw_92_round_robin": 3382.2,
-      "survival_pct_92_round_robin": 36.36,
-      "legacy_pairwise_mle_elo_92": 1200.0
+      "seat_games_300": 144,
+      "seat_wins_300": 31.0,
+      "seat_win_rate_300_pct": 21.53
     },
     "M1-100M": {
-      "elo": 1103.1,
+      "elo": 1155.6,
       "ci_95": [
-        982.1,
-        1233.3
+        1057.6,
+        1261.2
       ],
       "tier": "Challenger (Overbid Bias)",
       "checkpoint_path": "checkpoints/main_iter_04882.pt",
       "training_steps": 99983360,
-      "seat_games_160": 176,
-      "seat_wins_160": 26.0,
-      "seat_win_rate_160_pct": 14.77,
-      "avg_nw_92_round_robin": 2685.0,
-      "survival_pct_92_round_robin": 30.68,
-      "legacy_pairwise_mle_elo_92": 1158.2
+      "seat_games_300": 264,
+      "seat_wins_300": 46.0,
+      "seat_win_rate_300_pct": 17.42
     },
     "M2-Iter0": {
-      "elo": 589.2,
+      "elo": 610.9,
       "ci_95": [
-        442.0,
-        773.1
+        477.6,
+        801.5
       ],
       "tier": "Untrained Baseline",
       "checkpoint_path": "checkpoints_model_2/main_iter_00000.pt",
       "training_steps": 0,
-      "seat_games_160": 16,
-      "seat_wins_160": 0.0,
-      "seat_win_rate_160_pct": 0.0,
-      "avg_nw_92_round_robin": 0.0,
-      "survival_pct_92_round_robin": 0.0,
-      "legacy_pairwise_mle_elo_92": 1012.6
+      "seat_games_300": 16,
+      "seat_wins_300": 0.0,
+      "seat_win_rate_300_pct": 0.0
     }
   }
 }
