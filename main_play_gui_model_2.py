@@ -114,6 +114,15 @@ def load_agent_policies(checkpoint_paths=None, target_obs_dim: int = 500, device
     return policies
 
 
+def _save_gui_match_log(core: MonopolyCore, path: str = "tournament_gui_match.log"):
+    """Persists full GUI event log to disk (both on game over and early exit)."""
+    with open(path, "w") as f_log:
+        f_log.write(f"=== TOURNAMENT GUI MATCH LOG (Seed: {core.current_seed}) ===\n")
+        for ev_line in core.event_log:
+            f_log.write(ev_line + "\n")
+    print(f"Full game event log saved to: {path} ({len(core.event_log)} events)")
+
+
 def main():
     args = parse_args()
     device = torch.device(args.device)
@@ -371,11 +380,7 @@ def main():
             print(f"Victory screenshot captured: {v_path}")
             core.event_log.append(f"Auto-saved: {os.path.basename(v_path)}")
 
-            with open("tournament_gui_match.log", "w") as f_log:
-                f_log.write(f"=== TOURNAMENT GUI MATCH LOG (Seed: {core.current_seed}) ===\n")
-                for ev_line in core.event_log:
-                    f_log.write(ev_line + "\n")
-            print(f"Full game event log saved to: tournament_gui_match.log ({len(core.event_log)} events)")
+            _save_gui_match_log(core)
 
         if game_over_captured and args.auto_quit_delay is not None and victory_time is not None:
             if current_time - victory_time >= args.auto_quit_delay:
@@ -384,6 +389,9 @@ def main():
 
         pygame.display.flip()
         clock.tick(60)
+
+    if not game_over_captured and core.event_log:
+        _save_gui_match_log(core)
 
     pygame.quit()
     sys.exit(0)

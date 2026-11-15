@@ -133,16 +133,16 @@ class MonopolyCore:
         seed: Optional[int] = None,
         max_rounds: Optional[int] = None,
         gamma: float = 0.9980,
-        w1: float = 0.030,
-        w2: float = 0.0032,
+        w1: float = 0.025,
+        w2: float = 0.0034,
         w3: float = 0.014,
         w4: float = 0.0006,
         w_syn: float = 0.030,
-        beta_starve: float = 3.8,
-        w_house: float = 0.0128,
-        w_cash: float = 0.0032,
+        beta_starve: float = 4.0,
+        w_house: float = 0.0145,
+        w_cash: float = 0.0034,
         w_opp_mono: float = 0.85,
-        w_lead: float = 0.65,
+        w_lead: float = 0.80,
         allow_trade: bool = True,
         include_synergy_obs: bool = True,
         player_names: Optional[List[str]] = None,
@@ -266,6 +266,8 @@ class MonopolyCore:
         self.goojf_cards = [0, 0, 0, 0]
         self.goojf_sources: List[List[str]] = [[], [], [], []]
         self.bankrupt = [False, False, False, False]
+        self.elimination_order: List[int] = []
+        self._rejected_exact_trades: Dict[Tuple[int, int, int, int, int, int], int] = {}
 
         # Bank Physical Scarcity
         self.bank_houses = 32
@@ -1172,11 +1174,13 @@ class MonopolyCore:
             self._handle_trade_response(p, trade_response, env_rewards)
 
         # ----------------- CHECK BANKRUPTCY & VICTORY -----------------
+        batch_creditor = getattr(self, "last_creditor", None)
         for pl in range(4):
             if not self.bankrupt[pl] and self.cash[pl] < 0:
-                self._resolve_bankruptcy(pl)
+                self._resolve_bankruptcy(pl, creditor_override=batch_creditor)
                 if self.bankrupt[pl]:
                     env_rewards[pl] -= 10.0
+        self.last_creditor = None
 
         # Check terminal conditions (Unbounded horizon survival or max rounds reached)
         active_players = [pl for pl in range(4) if not self.bankrupt[pl]]
@@ -1682,6 +1686,12 @@ class MonopolyCore:
 
         if self.cash[initiator] < offer_cash:
             return False
+        if self.cash[target] < req_cash:
+            return False
+
+        trade_sig = (initiator, target, offer_prop, offer_cash, req_prop, req_cash)
+        if self.round_count < self._rejected_exact_trades.get(trade_sig, -1):
+            return False
 
         self.pending_trade = {
             "initiator": initiator,
@@ -1722,10 +1732,21 @@ class MonopolyCore:
                         self.property_owner[req_p] = init
 
                     self.trades_accepted_count += 1
+                    self._rejected_exact_trades.clear()
                     self.event_log.append(f"TRADE ACCEPTED between {self.get_player_name(init)} and {self.get_player_name(target)}!")
                 else:
                     self.event_log.append("Trade failed due to insufficient funds.")
             else:
+                trade = self.pending_trade
+                sig = (
+                    init,
+                    target,
+                    trade["offer_prop"],
+                    trade["offer_cash"],
+                    trade["req_prop"],
+                    trade["req_cash"],
+                )
+                self._rejected_exact_trades[sig] = self.round_count + 4
                 self.event_log.append(f"Trade REJECTED by {self.get_player_name(target)}.")
 
         self.pending_trade = None
@@ -1790,6 +1811,7 @@ class MonopolyCore:
             if target < curr:
                 salary = self.house_rules.apply_pass_go_salary(p, 200)
                 self.cash[p] += salary
+                self.event_log.append(f"{self.get_player_name(p)} passed GO and collected ${salary}.")
             self.position[p] = target
             owner = self.property_owner[target]
             if owner == -1:
@@ -1878,10 +1900,10 @@ class MonopolyCore:
         self.jail_turns[p] = 0
         self.consecutive_doubles = 0
 
-    def _resolve_bankruptcy(self, p: int):
+    def _resolve_bankruptcy(self, p: int, creditor_override: Optional[int] = None):
         """Liquidates assets or eliminates bankrupt player under official tournament rules."""
         owned_props = [t for t in PURCHASABLE_TILES if self.property_owner[t] == p]
-        creditor = getattr(self, "last_creditor", None)
+        creditor = creditor_override if creditor_override is not None else getattr(self, "last_creditor", None)
         if creditor == p or (creditor is not None and self.bankrupt[creditor]):
             creditor = None
 
@@ -1904,6 +1926,9 @@ class MonopolyCore:
                 self.property_houses[t_sell] -= 1
                 self.bank_houses += 1
                 self.cash[p] += refund
+                self.event_log.append(
+                    f"Forced liquidation: {self.get_player_name(p)} sold a house on {TILES_DATA[t_sell]['name']} for ${refund}."
+                )
             else:
                 # max_h == 5 (Hotel)
                 if self.bank_houses >= 4:
@@ -1911,6 +1936,9 @@ class MonopolyCore:
                     self.bank_hotels += 1
                     self.bank_houses -= 4
                     self.cash[p] += refund
+                    self.event_log.append(
+                        f"Forced liquidation: {self.get_player_name(p)} sold hotel on {TILES_DATA[t_sell]['name']} for ${refund} (converted to 4 houses)."
+                    )
                 else:
                     # Bank housing shortage: liquidate all hotels in group down to highest uniform level bank can supply
                     cur_houses_in_grp = sum(self.property_houses[t] for t in group_tiles if self.property_houses[t] <= 4)
@@ -1927,7 +1955,11 @@ class MonopolyCore:
                     for t_g in group_tiles:
                         self.property_houses[t_g] = target_h
                     levels_sold = total_levels_before - (n_grp * target_h)
-                    self.cash[p] += levels_sold * refund
+                    liq_cash = levels_sold * refund
+                    self.cash[p] += liq_cash
+                    self.event_log.append(
+                        f"Forced liquidation: {self.get_player_name(p)} liquidated {grp} group hotels to {target_h} houses/tile (bank shortage) for ${liq_cash}."
+                    )
 
         # 2. Mortgage properties if still in debt
         for t in owned_props:
@@ -1935,10 +1967,15 @@ class MonopolyCore:
                 mtg = self.get_property_mortgage(t, TILES_DATA[t]["mortgage"])
                 self.property_mortgaged[t] = True
                 self.cash[p] += mtg
+                self.event_log.append(
+                    f"Forced liquidation: {self.get_player_name(p)} mortgaged {TILES_DATA[t]['name']} for ${mtg}."
+                )
 
         # If still in debt: PLAYER IS OFFICIALLY BANKRUPT!
         if self.cash[p] < 0:
             self.bankrupt[p] = True
+            if p not in self.elimination_order:
+                self.elimination_order.append(p)
             if creditor is not None:
                 # Official Tournament Rule: Bankrupt to another player!
                 # All remaining properties (mortgaged) and GOOJF cards transfer to creditor!

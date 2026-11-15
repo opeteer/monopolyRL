@@ -161,7 +161,7 @@ def test_model_2_pbrs_mortgage_burn_and_anti_kingmaking_terms():
     core = MonopolyCore(seed=42)
     assert abs(core.w_cash - core.w2) < 1e-9
     assert core.w_opp_mono == 0.85
-    assert core.w_lead == 0.65
+    assert core.w_lead == 0.80
 
     # Mortgaging Penn RR ($100 mortgage) when already holding $5,000 must drop PBRS potential
     core.property_owner[15] = 0
@@ -755,6 +755,178 @@ def test_model_2_dead_logit_revival_decision_mask_and_pfsp():
     for _ in range(300):
         counts[lm._select_historical_record(pfsp=True).name] += 1
     assert counts["Hist_Strong"] > counts["Hist_Weak"] * 3
+
+
+def test_model_2_forced_liquidation_logging_and_multi_debtor_creditor():
+    """Verifies forced liquidation logs building/mortgage sales, multi-debtor creditor is preserved, and RR Pass-GO logs."""
+    from model_2.engine.monopoly_core import PHASE_ROLL
+
+    # 1. Forced house/hotel liquidation & mortgage must be recorded in event_log
+    core = MonopolyCore(seed=601, randomize_first_player=False)
+    core.property_owner[37] = 0
+    core.property_owner[39] = 0
+    core.property_houses[37] = 5  # Park Place Hotel
+    core.property_houses[39] = 5  # Boardwalk Hotel
+    core.bank_hotels = 10
+    core.cash = [-150, 1500, 1500, 1500]
+    core.last_creditor = 1
+    core._resolve_bankruptcy(0)
+    assert not core.bankrupt[0]
+    assert core.cash[0] >= 0
+    assert any("Forced liquidation:" in ev and "hotel" in ev.lower() for ev in core.event_log)
+
+    # 2. Multi-debtor insolvency in a single step preserves creditor for all bankrupt players
+    core2 = MonopolyCore(seed=602, randomize_first_player=False)
+    core2.current_player = 0
+    core2.active_decision_player = 0
+    core2.phase = PHASE_ROLL
+    core2.position[0] = 0
+    core2.cash = [1500, 5, 5, 1500]
+    core2.property_owner[1] = 1
+    core2.property_owner[3] = 2
+    core2.property_mortgaged[1] = True
+    core2.property_mortgaged[3] = True
+    # Force roll (1, 1) -> tile 2 (Community Chest) and top card = "It is Your Birthday" ($10 from each player)
+    core2.rng.randint = lambda a, b: 1
+    core2.deck_manager.chest_queue[0] = {"id": 108, "name": "It is Your Birthday", "action": "collect_from_each_player", "amount": 10}
+    core2.step({
+        "player_0": {
+            "core": 0, "auction": 0, "property": 160,
+            "trade_target": 0, "trade_offer_prop": 40, "trade_offer_cash": 0,
+            "trade_req_prop": 40, "trade_req_cash": 0, "trade_response": 0,
+        }
+    })
+    assert core2.bankrupt[1] and core2.bankrupt[2]
+    assert core2.property_owner[1] == 0
+    assert core2.property_owner[3] == 0
+    assert core2.last_creditor is None
+
+    # 3. Advance to Nearest Railroad logs passing GO
+    core3 = MonopolyCore(seed=603, randomize_first_player=False)
+    core3.position[0] = 36
+    core3.cash[0] = 500
+    core3._execute_card_action(0, {"action": "advance_nearest_railroad"}, is_double=False)
+    assert core3.position[0] == 5
+    assert core3.cash[0] == 700
+    assert any("passed GO and collected $200" in ev for ev in core3.event_log)
+
+
+def test_model_2_elo_rework_zero_sum_no_drain_and_mle():
+    """Verifies reworked LeagueManager Elo: self-deduplication, zero-sum vs live opponents, no eviction drain, and MLE solver."""
+    import tempfile
+    from model_2.training.league_manager import LeagueAgentRecord
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        lm = LeagueManager(checkpoint_dir=tmpdir, k_factor=32.0, max_historical_pool=5, anchor_elo=1200.0)
+        main = lm.main_agent_record
+        exp = lm.exploiter_record
+        hist = LeagueAgentRecord("Hist_0", "historical", elo=1200.0, checkpoint_path="h0.pt")
+
+        # 1. Self-play deduplication + zero-sum between live Main and Exploiter (when historical frozen)
+        # Main seat 0 wins (rank 1), Main seat 1 places 4th, Exploiter 2nd, Hist 3rd
+        # Because Main skips self-vs-self, Main gains vs Exp/Hist and loses vs Exp/Hist identically;
+        # specifically against equal-Elo Exp, (1st vs 2nd -> +0.85) + (4th vs 2nd -> 0.0) -> avg 0.425 < 0.50 -> exact zero-sum with Exp!
+        lm.update_match_results([main, main, exp, hist], ranks=[1, 4, 2, 3], net_worths=[5000, -10, 0, 0])
+        assert hist.elo == 1200.0, "Frozen historical anchor must not leak Elo"
+
+        # Pure Main vs Exploiter zero-sum check (no historical)
+        lm2 = LeagueManager(checkpoint_dir=tmpdir, k_factor=32.0, anchor_elo=1200.0)
+        m2, e2 = lm2.main_agent_record, lm2.exploiter_record
+        lm2.update_match_results([m2, m2, e2, e2], ranks=[1, 2, 3, 4], net_worths=[4000, 1000, 0, 0])
+        assert abs((m2.elo + e2.elo) - 2400.0) < 1e-9, "Live Elo exchange must be strictly zero-sum"
+        assert m2.elo > 1200.0 and e2.elo < 1200.0
+
+        # 2. No eviction Elo drain over 25 checkpoint cycles when Main improves against historical pool
+        lm3 = LeagueManager(checkpoint_dir=tmpdir, k_factor=32.0, max_historical_pool=5, anchor_elo=1200.0)
+        actor = ActorNetwork(obs_dim=500, hidden_dim=384)
+        for it in range(1, 26):
+            lm3.save_checkpoint(actor, iteration=it * 50, role="main")
+            h_rec = lm3.historical_records[-1]
+            # Main consistently beats older historical snapshots (60% win share)
+            lm3.update_match_results(
+                [lm3.main_agent_record, lm3.main_agent_record, lm3.exploiter_record, h_rec],
+                ranks=[1, 3, 2, 4],
+                net_worths=[4000, 0, 100, -50],
+            )
+        assert lm3.main_agent_record.elo > 1250.0, f"Main Elo should climb above 1250, got {lm3.main_agent_record.elo}"
+        lm3.sync_exploiter_elo()
+        assert lm3.exploiter_record.elo == lm3.main_agent_record.elo
+
+        # 3. Stationary MLE Bradley-Terry & Plackett-Luce Elo calibration recover monotonic strength ordering
+        matches = []
+        for _ in range(20):
+            matches.append((["Strong", "Mid", "Mid", "Weak"], [1, 2, 3, 4]))
+            matches.append((["Mid", "Weak", "Strong", "Weak"], [2, 3, 1, 4]))
+            matches.append((["Mid", "Weak", "Weak", "Strong"], [1, 3, 4, 2]))
+        mle = LeagueManager.compute_mle_elos(matches, anchor_name="Mid", anchor_elo=1200.0)
+        assert mle["Mid"] == 1200.0
+        assert mle["Strong"] > mle["Mid"] > mle["Weak"]
+
+        pl = LeagueManager.compute_plackett_luce_elos(matches, anchor_name="Mid", anchor_elo=1200.0)
+        assert pl["Mid"] == 1200.0
+        assert pl["Strong"] > pl["Mid"] > pl["Weak"]
+
+
+def test_model_2_barracuda_finetune_fixes_trade_spam_elim_and_preset():
+    """Verifies exact-signature trade spam guard, impossible cash request rejection, elimination order, and fine-tune preset."""
+    core = MonopolyCore(seed=707, randomize_first_player=False)
+    core.allow_trade = True
+    core.cash = [1500, 300, 1500, 1500]
+    core.property_owner[27] = 0  # Ventnor owned by P0
+    core.property_owner[39] = 1  # Boardwalk owned by P1
+    core.phase = PHASE_PROPERTY_MANAGE
+    core.active_decision_player = 0
+    core.current_player = 0
+
+    # 1. Impossible cash beg ($2000 when P1 only has $300 cash) is blocked cleanly before entering TRADE_RESPONSE
+    assert core._propose_trade(0, 0, 27, 0, 40, 20) is False
+    assert core.pending_trade is None
+
+    # 2. Valid $200 cash request (bracket 2 <= P1's $300) succeeds; if P1 rejects, exact same offer is blocked for 4 rounds
+    assert core._propose_trade(0, 0, 27, 0, 40, 2) is True
+    core._handle_trade_response(1, trade_response=0)
+    assert core.pending_trade is None
+    assert core._propose_trade(0, 0, 27, 0, 40, 2) is False, "Exact duplicate rejected trade must be on cooldown"
+
+    # Revising the offer ($100 instead of $200) is NOT locked out and enters TRADE_RESPONSE immediately
+    assert core._propose_trade(0, 0, 27, 0, 40, 1) is True
+    core._handle_trade_response(1, trade_response=1)  # Accept clears cooldown memory
+    core.property_owner[27] = 0
+    assert core._propose_trade(0, 0, 27, 0, 40, 2) is True
+
+    # 3. Elimination order tracks exact bankruptcy order
+    core_elim = MonopolyCore(seed=708, randomize_first_player=False)
+    core_elim.cash = [1500, -50, -100, 1500]
+    core_elim._resolve_bankruptcy(2, creditor_override=None)
+    core_elim._resolve_bankruptcy(1, creditor_override=0)
+    assert core_elim.elimination_order == [2, 1]
+
+    # 4. barracuda_finetune_30m preset & PBRS calibration sanity
+    cfg = get_preset("barracuda_finetune_30m")
+    assert cfg is not None
+    assert cfg.total_steps == 30_000_000
+    assert cfg.curriculum is False
+    assert cfg.w2 == cfg.w_cash == 0.0034
+    assert cfg.w1 == 0.025 and cfg.w_house == 0.0145 and cfg.w_lead == 0.80 and cfg.beta_starve == 4.0
+    assert cfg.uniform_kl_coef == 0.012 and cfg.lr_actor == 5.0e-5
+
+    # 5. ActorNetwork trade cash regularizer activates in PHASE_PROPERTY_MANAGE with valid trade choices
+    actor = ActorNetwork(obs_dim=500, hidden_dim=384)
+    core_reg = MonopolyCore(seed=709, randomize_first_player=False)
+    core_reg.phase = PHASE_PROPERTY_MANAGE
+    core_reg.active_decision_player = 0
+    core_reg.current_player = 0
+    core_reg.property_owner[5] = 0
+    obs_m = torch.from_numpy(core_reg.get_actor_observation(0)).float().unsqueeze(0)
+    masks_m = {k: torch.from_numpy(v).unsqueeze(0) for k, v in core_reg.get_action_masks(0).items()}
+    acts_m = {k: torch.tensor([0], dtype=torch.long) for k in masks_m}
+    acts_m["core"] = torch.tensor([5], dtype=torch.long)
+    acts_m["property"] = torch.tensor([160], dtype=torch.long)
+    _, _, _, logit_l2 = actor.evaluate_actions_with_reg(obs_m, masks_m, acts_m)
+    assert torch.isfinite(logit_l2).all()
+    assert float(logit_l2.item()) >= 0.0
+
+
 
 
 

@@ -95,16 +95,16 @@ def parse_args():
     parser.add_argument("--clip_param", type=float, default=defaults.get("clip_param", 0.15), help="PPO clip parameter (default: 0.15)")
     parser.add_argument("--value_clip_param", type=float, default=defaults.get("value_clip_param", 8.0), help="PPO value clip floor before adaptive scaling (default: 8.0)")
     parser.add_argument("--target_kl", type=float, default=defaults.get("target_kl", 0.018), help="PPO KL-divergence early-stopping threshold (on real decision steps)")
-    parser.add_argument("--w1", type=float, default=defaults.get("w1", 0.030), help="PBRS cash log potential weight")
-    parser.add_argument("--w2", type=float, default=defaults.get("w2", 0.0032), help="PBRS property equity weight")
+    parser.add_argument("--w1", type=float, default=defaults.get("w1", 0.025), help="PBRS cash log potential weight")
+    parser.add_argument("--w2", type=float, default=defaults.get("w2", 0.0034), help="PBRS property equity weight")
     parser.add_argument("--w3", type=float, default=defaults.get("w3", 0.014), help="PBRS monopoly completion bonus weight")
     parser.add_argument("--w4", type=float, default=defaults.get("w4", 0.0006), help="PBRS rent hazard paranoia weight")
     parser.add_argument("--w_syn", type=float, default=defaults.get("w_syn", 0.030), help="PBRS color synergy potential weight")
-    parser.add_argument("--beta_starve", type=float, default=defaults.get("beta_starve", 3.8), help="PBRS round-based monopoly starvation penalty weight")
-    parser.add_argument("--w_house", type=float, default=defaults.get("w_house", 0.0128), help="PBRS house/hotel building equity weight")
-    parser.add_argument("--w_cash", type=float, default=defaults.get("w_cash", 0.0032), help="PBRS linear cash equity weight (equal to w2 to prevent arbitrage)")
+    parser.add_argument("--beta_starve", type=float, default=defaults.get("beta_starve", 4.0), help="PBRS round-based monopoly starvation penalty weight")
+    parser.add_argument("--w_house", type=float, default=defaults.get("w_house", 0.0145), help="PBRS house/hotel building equity weight")
+    parser.add_argument("--w_cash", type=float, default=defaults.get("w_cash", 0.0034), help="PBRS linear cash equity weight (equal to w2 to prevent mortgage thrash arbitrage)")
     parser.add_argument("--w_opp_mono", type=float, default=defaults.get("w_opp_mono", 0.85), help="PBRS anti-kingmaking opponent monopoly threat penalty weight")
-    parser.add_argument("--w_lead", type=float, default=defaults.get("w_lead", 0.65), help="PBRS relative net-worth lead preservation weight")
+    parser.add_argument("--w_lead", type=float, default=defaults.get("w_lead", 0.80), help="PBRS relative net-worth lead preservation weight")
     parser.add_argument("--resume", type=str, default=None, help="Resume training: 'latest' or path to checkpoint file")
     parser.add_argument("--resume_checkpoint", type=str, default=None, help="Legacy alias for --resume")
     parser.add_argument("--fine_tune", action="store_true", default=False, help="Fine-tune from --resume checkpoint: keeps trading unlocked, resets annealing schedule, and applies gentle fine-tuning LR/entropy defaults")
@@ -205,24 +205,27 @@ def main():
     args = parse_args()
     if args.fine_tune:
         args.curriculum = False
-        if "--lr_actor" not in sys.argv:
-            args.lr_actor = 6.0e-5
-        if "--lr_actor_min" not in sys.argv:
-            args.lr_actor_min = 1.0e-5
-        if "--lr_critic" not in sys.argv:
-            args.lr_critic = 1.5e-4
-        if "--lr_critic_min" not in sys.argv:
-            args.lr_critic_min = 2.5e-5
-        if "--entropy_coef" not in sys.argv:
-            args.entropy_coef = 0.0018
-        if "--entropy_min" not in sys.argv:
-            args.entropy_min = 0.00045
-        if "--uniform_kl_coef" not in sys.argv:
-            args.uniform_kl_coef = 0.025
-        if "--uniform_kl_min" not in sys.argv:
-            args.uniform_kl_min = 0.005
-        if "--logit_l2_coef" not in sys.argv:
-            args.logit_l2_coef = 0.0020
+        if args.preset != "barracuda_finetune_30m":
+            if "--lr_actor" not in sys.argv:
+                args.lr_actor = 5.0e-5
+            if "--lr_actor_min" not in sys.argv:
+                args.lr_actor_min = 8.0e-6
+            if "--lr_critic" not in sys.argv:
+                args.lr_critic = 1.5e-4
+            if "--lr_critic_min" not in sys.argv:
+                args.lr_critic_min = 2.5e-5
+            if "--entropy_coef" not in sys.argv:
+                args.entropy_coef = 0.0015
+            if "--entropy_min" not in sys.argv:
+                args.entropy_min = 0.0003
+            if "--uniform_kl_coef" not in sys.argv:
+                args.uniform_kl_coef = 0.012
+            if "--uniform_kl_min" not in sys.argv:
+                args.uniform_kl_min = 0.003
+            if "--logit_l2_coef" not in sys.argv:
+                args.logit_l2_coef = 0.0018
+            if "--target_kl" not in sys.argv:
+                args.target_kl = 0.015
     device = torch.device(args.device)
     if device.type == "cpu" and args.num_threads > 0:
         torch.set_num_threads(args.num_threads)
@@ -841,10 +844,19 @@ def main():
                         done_eval = any(truncations.values()) or all(terminations.values())
 
                     net_worths = [eval_env.core.get_player_net_worth(p) for p in range(4)]
-                    order = np.argsort(net_worths)[::-1]
-                    ranks = [0] * 4
-                    for rank_pos, p_idx in enumerate(order):
-                        ranks[p_idx] = rank_pos + 1
+                    elim_order = getattr(eval_env.core, "elimination_order", [])
+                    # Rank active survivors above bankrupt seats, using elimination order (last out > first out)
+                    scores_for_rank = [
+                        (
+                            0 if eval_env.core.bankrupt[p] else 1,
+                            elim_order.index(p) if (eval_env.core.bankrupt[p] and p in elim_order) else net_worths[p],
+                        )
+                        for p in range(4)
+                    ]
+                    ranks = [
+                        1 + sum(1 for q in range(4) if scores_for_rank[q] > scores_for_rank[p])
+                        for p in range(4)
+                    ]
 
                     league_mgr.update_match_results(lineup_records, ranks, net_worths)
                 if (
@@ -857,6 +869,7 @@ def main():
                 ):
                     exploiter_actor.load_state_dict(main_actor.state_dict())
                     exploiter_optimizer.state.clear()
+                    league_mgr.sync_exploiter_elo()
                 league_mgr.save_league_summary()
                 print(
                     f"--> [League Match] Ranks: {ranks} | Steps: {step_count} | "

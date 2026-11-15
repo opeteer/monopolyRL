@@ -222,6 +222,7 @@ class ActorNetwork(nn.Module):
 
         is_buy = u[..., 1]
         is_auc = u[..., 2]
+        is_manage = u[..., 4]
         is_trade_resp = u[..., 5]
 
         auc_uni_kl = self._valid_uniform_kl(dists["auction"].logits, action_masks["auction"])
@@ -231,7 +232,13 @@ class ActorNetwork(nn.Module):
         auc_l2 = self._valid_logit_l2(dists["auction"].logits, action_masks["auction"])
         tr_l2 = self._valid_logit_l2(dists["trade_response"].logits, action_masks["trade_response"])
         buy_l2 = self._valid_logit_l2(dists["core"].logits, action_masks["core"])
-        logit_l2 = is_auc * auc_l2 + 0.50 * is_trade_resp * tr_l2 + 0.25 * is_buy * buy_l2
+
+        has_trade_choice = (action_masks["trade_req_cash"].sum(dim=-1) > 1.5).to(obs.dtype)
+        offer_cash_l2 = self._valid_logit_l2(dists["trade_offer_cash"].logits, action_masks["trade_offer_cash"])
+        req_cash_l2 = self._valid_logit_l2(dists["trade_req_cash"].logits, action_masks["trade_req_cash"])
+        trade_cash_l2 = is_manage * has_trade_choice * (offer_cash_l2 + req_cash_l2)
+
+        logit_l2 = is_auc * auc_l2 + 0.50 * is_trade_resp * tr_l2 + 0.25 * is_buy * buy_l2 + 0.15 * trade_cash_l2
         return uniform_kl, logit_l2
 
     @staticmethod

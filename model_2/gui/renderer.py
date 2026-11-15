@@ -444,7 +444,7 @@ class MonopolyRenderer:
                         "accent_color": (192, 57, 43), "icon": "X",
                         "timer": 120, "max_timer": 120
                     })
-                elif "sent to Jail" in ev:
+                elif "sent directly to jail" in ev.lower() or "landed on go to jail" in ev.lower() or "sent to jail" in ev.lower():
                     self.active_toasts.append({
                         "title": "ARRESTED -> GO TO JAIL", "sub": ev,
                         "accent_color": (155, 89, 182), "icon": "!",
@@ -476,7 +476,7 @@ class MonopolyRenderer:
                 if actual_jail and not tracked_jail:
                     # Direct swift transfer to jail cell
                     self.hop_queues[p] = [10]
-                elif (tracked_pos - actual_pos) % 40 == 37:
+                elif (tracked_pos - actual_pos) % 40 == 3:
                     # Chance card: Go back 3 spaces
                     self.hop_queues[p] = [
                         (tracked_pos - 1) % 40,

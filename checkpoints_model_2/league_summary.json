@@ -2,11 +2,12 @@
   "main_agent": {
     "name": "Model-2 Barracuda",
     "role": "main",
-    "elo": 103.7,
+    "elo": 1306.3,
     "matches_played": 1168,
     "wins": 323,
     "win_rate": 0.277,
-    "checkpoint_path": null
+    "checkpoint_path": null,
+    "legacy_uncalibrated_elo": 103.7
   },
   "exploiter": {
     "name": "MainExploiter",
@@ -153,5 +154,7 @@
       "win_rate": 0.0,
       "checkpoint_path": "checkpoints_model_2/main_iter_03662.pt"
     }
-  ]
+  ],
+  "recalibrated_rating_system": "Plackett-Luce Multiplayer Elo (anchor: M1-50M = 1200.0)",
+  "model_ratings_file": "checkpoints_model_2/model_elo_ratings.json"
 }

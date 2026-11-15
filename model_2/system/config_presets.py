@@ -37,16 +37,16 @@ class TrainingConfig:
     ppo_epochs: int = 4
     num_mini_batches: int = 8
     target_kl: float = 0.018
-    w1: float = 0.030
-    w2: float = 0.0032
+    w1: float = 0.025
+    w2: float = 0.0034
     w3: float = 0.014
     w4: float = 0.0006
     w_syn: float = 0.030
-    beta_starve: float = 3.8
-    w_house: float = 0.0128
-    w_cash: float = 0.0032
+    beta_starve: float = 4.0
+    w_house: float = 0.0145
+    w_cash: float = 0.0034
     w_opp_mono: float = 0.85
-    w_lead: float = 0.65
+    w_lead: float = 0.80
     max_rounds: int = 80
     randomize_first_player: bool = True
     use_shm: bool = True
@@ -174,6 +174,36 @@ PRESETS: Dict[str, TrainingConfig] = {
         checkpoint_interval=50,
         eval_interval=25,
         curriculum_phase_2_frac=0.05,
+    ),
+    "barracuda_finetune_30m": TrainingConfig(
+        preset_name="barracuda_finetune_30m",
+        description="Model-2 Barracuda 30M fine-tuning polish (anti-spam, property>cash equity, faster closeout)",
+        total_steps=30_000_000,
+        rollout_steps=512,
+        num_envs=80,
+        num_workers=10,
+        num_threads=6,
+        checkpoint_interval=50,
+        eval_interval=25,
+        curriculum=False,
+        curriculum_phase_2_frac=0.0,
+        league_rollout_fraction=0.35,
+        lr_actor=5.0e-5,
+        lr_actor_min=8.0e-6,
+        lr_critic=1.5e-4,
+        lr_critic_min=2.5e-5,
+        entropy_coef=0.0015,
+        entropy_min=0.0003,
+        uniform_kl_coef=0.012,
+        uniform_kl_min=0.003,
+        logit_l2_coef=0.0018,
+        target_kl=0.015,
+        w1=0.025,
+        w2=0.0034,
+        w_cash=0.0034,
+        w_house=0.0145,
+        beta_starve=4.0,
+        w_lead=0.80,
     ),
 }
 

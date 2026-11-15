@@ -250,6 +250,7 @@ class MonopolyDashboard:
             self.surface.blit(r_txt, (r_rect.centerx - r_txt.get_width() // 2, r_rect.centery - r_txt.get_height() // 2))
 
         # Model / Policy Badge (e.g. 50M vs 100M)
+        lbl_right_edge = x + w - 10
         if hasattr(self, "agent_labels") and self.agent_labels and p < len(self.agent_labels) and self.agent_labels[p]:
             lbl = self.agent_labels[p]
             lbl_surf = self.font_badge.render(lbl, True, (255, 255, 255))
@@ -257,6 +258,7 @@ class MonopolyDashboard:
             lbl_rect = pygame.Rect(x + w - lbl_surf.get_width() - 14, y + 6, lbl_surf.get_width() + 10, 20)
             pygame.draw.rect(self.surface, lbl_bg, lbl_rect, border_radius=4)
             self.surface.blit(lbl_surf, (lbl_rect.centerx - lbl_surf.get_width() // 2, lbl_rect.centery - lbl_surf.get_height() // 2))
+            lbl_right_edge = lbl_rect.x - 8
 
         # Status Badges
         if core.bankrupt[p]:
@@ -269,10 +271,10 @@ class MonopolyDashboard:
             j_txt = self.font_badge.render(f"JAIL ({core.jail_turns[p]}/3)", True, (240, 160, 40))
             self.surface.blit(j_txt, (pill_rect.right + 36, y + 9))
 
-        # Active turn indicator badge
+        # Active turn indicator badge (placed left of model badge to avoid overlap)
         if is_active:
-            act_txt = self.font_badge.render("* ACTIVE TURN", True, PLAYER_COLORS[p])
-            self.surface.blit(act_txt, (x + w - act_txt.get_width() - 10, y + 9))
+            act_txt = self.font_badge.render("* ACTIVE", True, PLAYER_COLORS[p])
+            self.surface.blit(act_txt, (lbl_right_edge - act_txt.get_width(), y + 9))
 
         # 2. Financial Stats: Cash & Net Worth
         cash = core.cash[p]
