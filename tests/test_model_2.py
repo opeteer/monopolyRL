@@ -35,33 +35,26 @@ from model_2.models.storage import RolloutBuffer
 from model_2.training.mappo_trainer import MAPPOTrainer
 from model_2.training.league_manager import LeagueManager
 from model_2.system.config_presets import get_preset, TrainingConfig
-from monopoly_marl.engine.monopoly_core import MonopolyCore as Model1Core
-from monopoly_marl.models.actor_network import ActorNetwork as Model1ActorNetwork
 
 
-def test_model_2_unconstrained_official_masks_vs_model_1():
-    """Verifies Model-2 unlocks Model-1 mortgage & auction ceiling restrictions while keeping official rules."""
-    c1 = Model1Core(seed=7)
+def test_model_2_unconstrained_official_masks():
+    """Verifies Model-2 enforces only official Monopoly rules without mortgage or auction ceiling locks."""
     c2 = MonopolyCore(seed=7)
+    c2.phase = PHASE_PROPERTY_MANAGE
+    c2.active_decision_player = 0
+    c2.current_player = 0
+    c2.allow_trade = True
+    c2.cash = [5000, 1500, 1500, 1500]
+    # Give P0 maxed Brown monopoly (houses=5 -> official rule forbids mortgaging Brown) + singleton Reading RR (#5)
+    c2.property_owner[1] = 0
+    c2.property_owner[3] = 0
+    c2.property_houses[1] = 5
+    c2.property_houses[3] = 5
+    c2.property_owner[5] = 0
+    c2.property_owner[15] = 1
 
-    for c in (c1, c2):
-        c.phase = PHASE_PROPERTY_MANAGE
-        c.active_decision_player = 0
-        c.current_player = 0
-        c.allow_trade = True
-        c.cash = [5000, 1500, 1500, 1500]
-        # Give P0 maxed Brown monopoly (houses=5 -> official rule forbids mortgaging Brown) + singleton Reading RR (#5)
-        c.property_owner[1] = 0
-        c.property_owner[3] = 0
-        c.property_houses[1] = 5
-        c.property_houses[3] = 5
-        c.property_owner[5] = 0
-        c.property_owner[15] = 1
-
-    m1 = c1.get_action_masks(0)
     m2 = c2.get_action_masks(0)
-    # Model-1 blocks mortgaging #5 when cash >= 250 & Brown monopoly is maxed; Model-2 allows it freely
-    assert m1["property"][80 + 5] == 0
+    # Model-2 allows mortgaging #5 freely even when cash >= 250 & Brown monopoly is maxed
     assert m2["property"][80 + 5] == 1
     # Official Monopoly rule remains enforced in Model-2: cannot mortgage Brown streets while houses exist
     assert m2["property"][80 + 1] == 0
@@ -76,21 +69,18 @@ def test_model_2_unconstrained_official_masks_vs_model_1():
     assert not hasattr(c2, "accepted_prop_hold_cooldown")
     assert not hasattr(c2, "prop_mortgage_cooldown")
 
-    # Auction squeeze comparison: Baltic Ave ($60, #3); P0 has $1500, richest opponent P1 has $350
-    c1_auc = Model1Core(seed=8)
+    # Auction squeeze: Baltic Ave ($60, #3); P0 has $1500, richest opponent P1 has $350
     c2_auc = MonopolyCore(seed=8)
-    for c in (c1_auc, c2_auc):
-        c.phase = PHASE_AUCTION
-        c.active_decision_player = 0
-        c.current_player = 0
-        c.auction_property = 3
-        c.auction_highest_bid = 60
-        c.auction_highest_bidder = 1
-        c.auction_active_bidders = [0, 1]
-        c.cash = [1500, 350, 0, 0]
+    c2_auc.phase = PHASE_AUCTION
+    c2_auc.active_decision_player = 0
+    c2_auc.current_player = 0
+    c2_auc.auction_property = 3
+    c2_auc.auction_highest_bid = 60
+    c2_auc.auction_highest_bidder = 1
+    c2_auc.auction_active_bidders = [0, 1]
+    c2_auc.cash = [1500, 350, 0, 0]
 
-    # Model-1 caps squeeze at $60 ceiling <= current bid $60 (blocked); Model-2 allows unconstrained $351 squeeze!
-    assert c1_auc.get_action_masks(0)["auction"][ACT_AUC_JUMP_SQUEEZE] == 0
+    # Model-2 allows unconstrained $351 squeeze
     assert c2_auc.get_action_masks(0)["auction"][ACT_AUC_JUMP_SQUEEZE] == 1
     c2_auc.step({
         "player_0": {
@@ -399,9 +389,6 @@ def test_model_2_networks_trainer_and_league_compatibility():
     cfg_150m = get_preset("grandmaster_150m")
     assert cfg_150m is not None and cfg_150m.total_steps == 150_000_000
 
-    # Cross-model checkpoint auto-detection helper check (Model-1 hidden=256 vs Model-2 hidden=384)
-    m1_actor = Model1ActorNetwork(obs_dim=500, hidden_dim=256)
-    assert "res_block.0.weight" not in m1_actor.state_dict()
     assert "res_block.0.weight" in actor.state_dict()
     lm = LeagueManager(checkpoint_dir="/tmp/m2_test_ckpts_unused")
     assert lm.checkpoint_dir == "/tmp/m2_test_ckpts_unused"
