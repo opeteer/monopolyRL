@@ -207,25 +207,27 @@ def main():
         args.curriculum = False
         if args.preset != "barracuda_finetune_30m":
             if "--lr_actor" not in sys.argv:
-                args.lr_actor = 5.0e-5
+                args.lr_actor = 3.0e-5
             if "--lr_actor_min" not in sys.argv:
-                args.lr_actor_min = 8.0e-6
+                args.lr_actor_min = 5.0e-6
             if "--lr_critic" not in sys.argv:
-                args.lr_critic = 1.5e-4
+                args.lr_critic = 1.0e-4
             if "--lr_critic_min" not in sys.argv:
-                args.lr_critic_min = 2.5e-5
+                args.lr_critic_min = 2.0e-5
+            if "--clip_param" not in sys.argv:
+                args.clip_param = 0.12
             if "--entropy_coef" not in sys.argv:
-                args.entropy_coef = 0.0015
+                args.entropy_coef = 0.0012
             if "--entropy_min" not in sys.argv:
-                args.entropy_min = 0.0003
+                args.entropy_min = 0.00025
             if "--uniform_kl_coef" not in sys.argv:
-                args.uniform_kl_coef = 0.012
+                args.uniform_kl_coef = 0.006
             if "--uniform_kl_min" not in sys.argv:
-                args.uniform_kl_min = 0.003
+                args.uniform_kl_min = 0.0015
             if "--logit_l2_coef" not in sys.argv:
-                args.logit_l2_coef = 0.0018
+                args.logit_l2_coef = 0.0012
             if "--target_kl" not in sys.argv:
-                args.target_kl = 0.015
+                args.target_kl = 0.012
     device = torch.device(args.device)
     if device.type == "cpu" and args.num_threads > 0:
         torch.set_num_threads(args.num_threads)
@@ -421,7 +423,11 @@ def main():
             league_mgr.exploiter_record.bankruptcies = 0
             league_mgr.exploiter_record.total_net_worth = 0.0
 
-    if start_iteration <= 1:
+    if args.fine_tune and resume_target:
+        league_mgr.reset_for_finetune(
+            main_actor, critic=main_critic, exploiter=exploiter_actor
+        )
+    elif start_iteration <= 1:
         league_mgr.save_checkpoint(
             main_actor, iteration=0, role="main", critic=main_critic, exploiter=exploiter_actor
         )

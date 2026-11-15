@@ -867,64 +867,56 @@ def test_model_2_elo_rework_zero_sum_no_drain_and_mle():
         assert pl["Strong"] > pl["Mid"] > pl["Weak"]
 
 
-def test_model_2_barracuda_finetune_fixes_trade_spam_elim_and_preset():
-    """Verifies exact-signature trade spam guard, impossible cash request rejection, elimination order, and fine-tune preset."""
-    core = MonopolyCore(seed=707, randomize_first_player=False)
-    core.allow_trade = True
-    core.cash = [1500, 300, 1500, 1500]
-    core.property_owner[27] = 0  # Ventnor owned by P0
-    core.property_owner[39] = 1  # Boardwalk owned by P1
-    core.phase = PHASE_PROPERTY_MANAGE
-    core.active_decision_player = 0
-    core.current_player = 0
-
-    # 1. Impossible cash beg ($2000 when P1 only has $300 cash) is blocked cleanly before entering TRADE_RESPONSE
-    assert core._propose_trade(0, 0, 27, 0, 40, 20) is False
-    assert core.pending_trade is None
-
-    # 2. Valid $200 cash request (bracket 2 <= P1's $300) succeeds; if P1 rejects, exact same offer is blocked for 4 rounds
-    assert core._propose_trade(0, 0, 27, 0, 40, 2) is True
-    core._handle_trade_response(1, trade_response=0)
-    assert core.pending_trade is None
-    assert core._propose_trade(0, 0, 27, 0, 40, 2) is False, "Exact duplicate rejected trade must be on cooldown"
-
-    # Revising the offer ($100 instead of $200) is NOT locked out and enters TRADE_RESPONSE immediately
-    assert core._propose_trade(0, 0, 27, 0, 40, 1) is True
-    core._handle_trade_response(1, trade_response=1)  # Accept clears cooldown memory
-    core.property_owner[27] = 0
-    assert core._propose_trade(0, 0, 27, 0, 40, 2) is True
-
-    # 3. Elimination order tracks exact bankruptcy order
+def test_model_2_barracuda_finetune_elim_preset_and_regularizer():
+    """Verifies elimination order tracking, fine-tune preset/PBRS params, bounded logit L2, and anchored LeagueManager."""
+    # 1. Elimination order tracks exact bankruptcy order
     core_elim = MonopolyCore(seed=708, randomize_first_player=False)
     core_elim.cash = [1500, -50, -100, 1500]
     core_elim._resolve_bankruptcy(2, creditor_override=None)
     core_elim._resolve_bankruptcy(1, creditor_override=0)
     assert core_elim.elimination_order == [2, 1]
 
-    # 4. barracuda_finetune_30m preset & PBRS calibration sanity
+    # 2. barracuda_finetune_30m preset & PBRS calibration sanity
     cfg = get_preset("barracuda_finetune_30m")
     assert cfg is not None
     assert cfg.total_steps == 30_000_000
     assert cfg.curriculum is False
     assert cfg.w2 == cfg.w_cash == 0.0034
     assert cfg.w1 == 0.025 and cfg.w_house == 0.0145 and cfg.w_lead == 0.80 and cfg.beta_starve == 4.0
-    assert cfg.uniform_kl_coef == 0.012 and cfg.lr_actor == 5.0e-5
+    assert cfg.uniform_kl_coef == 0.006 and cfg.lr_actor == 3.0e-5 and cfg.clip_param == 0.12 and cfg.target_kl == 0.012
 
-    # 5. ActorNetwork trade cash regularizer activates in PHASE_PROPERTY_MANAGE with valid trade choices
+    # 3. ActorNetwork trade cash regularizer uses conditioned masks (never leaks -1e8 -> 1e13) across all trade modes
     actor = ActorNetwork(obs_dim=500, hidden_dim=384)
     core_reg = MonopolyCore(seed=709, randomize_first_player=False)
     core_reg.phase = PHASE_PROPERTY_MANAGE
     core_reg.active_decision_player = 0
     core_reg.current_player = 0
     core_reg.property_owner[5] = 0
+    core_reg.property_owner[18] = 1
     obs_m = torch.from_numpy(core_reg.get_actor_observation(0)).float().unsqueeze(0)
     masks_m = {k: torch.from_numpy(v).unsqueeze(0) for k, v in core_reg.get_action_masks(0).items()}
-    acts_m = {k: torch.tensor([0], dtype=torch.long) for k in masks_m}
-    acts_m["core"] = torch.tensor([5], dtype=torch.long)
-    acts_m["property"] = torch.tensor([160], dtype=torch.long)
-    _, _, _, logit_l2 = actor.evaluate_actions_with_reg(obs_m, masks_m, acts_m)
-    assert torch.isfinite(logit_l2).all()
-    assert float(logit_l2.item()) >= 0.0
+    for offer_p, req_p, off_c in [(40, 18, 2), (5, 40, 0), (5, 18, 1), (40, 40, 0)]:
+        acts_m = {k: torch.tensor([0], dtype=torch.long) for k in masks_m}
+        acts_m["core"] = torch.tensor([5], dtype=torch.long)
+        acts_m["property"] = torch.tensor([160], dtype=torch.long)
+        acts_m["trade_offer_prop"] = torch.tensor([offer_p], dtype=torch.long)
+        acts_m["trade_req_prop"] = torch.tensor([req_p], dtype=torch.long)
+        acts_m["trade_offer_cash"] = torch.tensor([off_c], dtype=torch.long)
+        _, _, _, logit_l2 = actor.evaluate_actions_with_reg(obs_m, masks_m, acts_m)
+        assert torch.isfinite(logit_l2).all()
+        assert 0.0 <= float(logit_l2.item()) < 50.0, f"Logit L2 must never leak -1e8 masked entries, got {logit_l2.item()}"
+
+    # 4. LeagueManager fine-tune reset pins Historical_00000 baseline anchor against eviction
+    import tempfile
+    from model_2.training.league_manager import LeagueManager
+    with tempfile.TemporaryDirectory() as ft_tmp:
+        lm_ft = LeagueManager(checkpoint_dir=ft_tmp, max_historical_pool=3)
+        lm_ft.reset_for_finetune(actor)
+        assert len(lm_ft.historical_records) == 1 and lm_ft.historical_records[0].name == "Historical_00000"
+        for it in (50, 100, 150, 200):
+            lm_ft.save_checkpoint(actor, iteration=it, role="main")
+        names_pool = [r.name for r in lm_ft.historical_records]
+        assert "Historical_00000" in names_pool and len(names_pool) == 3
 
 
 

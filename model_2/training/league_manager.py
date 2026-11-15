@@ -71,6 +71,7 @@ class LeagueManager:
         self.main_agent_record = LeagueAgentRecord("MainAgent", "main", elo=self.anchor_elo)
         self.exploiter_record = LeagueAgentRecord("MainExploiter", "exploiter", elo=self.anchor_elo)
         self.historical_records: List[LeagueAgentRecord] = []
+        self.pinned_anchor_name: Optional[str] = None
 
         # Load existing league state if present
         summary_path = os.path.join(checkpoint_dir, "league_summary.json")
@@ -107,6 +108,31 @@ class LeagueManager:
         # Cached policy instances
         self.cached_historical_policies: Dict[str, ActorNetwork] = {}
 
+    def reset_for_finetune(
+        self,
+        anchor_policy: ActorNetwork,
+        critic: Optional[torch.nn.Module] = None,
+        exploiter: Optional[ActorNetwork] = None,
+    ) -> str:
+        """Resets league standings for fine-tuning and pins the pre-fine-tune model as Historical_00000."""
+        for rec in (self.main_agent_record, self.exploiter_record):
+            rec.elo = self.anchor_elo
+            rec.matches_played = 0
+            rec.wins = 0
+            rec.bankruptcies = 0
+            rec.total_net_worth = 0.0
+        self.historical_records.clear()
+        self.cached_historical_policies.clear()
+        self.pinned_anchor_name = "Historical_00000"
+        return self.save_checkpoint(
+            anchor_policy,
+            iteration=0,
+            role="main",
+            metadata={"fine_tune_anchor": True, "iteration": 0},
+            critic=critic,
+            exploiter=exploiter,
+        )
+
     def save_checkpoint(
         self,
         policy: ActorNetwork,
@@ -139,9 +165,14 @@ class LeagueManager:
             record = LeagueAgentRecord(hist_name, "historical", elo=self.main_agent_record.elo, checkpoint_path=path)
             self.historical_records.append(record)
 
-            # Evict oldest if beyond capacity
+            # Evict oldest non-pinned snapshot if beyond capacity
             if len(self.historical_records) > self.max_historical_pool:
-                removed = self.historical_records.pop(0)
+                evict_idx = 1 if (
+                    self.pinned_anchor_name
+                    and len(self.historical_records) > 1
+                    and self.historical_records[0].name == self.pinned_anchor_name
+                ) else 0
+                removed = self.historical_records.pop(evict_idx)
                 if removed.name in self.cached_historical_policies:
                     del self.cached_historical_policies[removed.name]
 

@@ -52,6 +52,7 @@ class MAPPOTrainer:
         self.target_kl = target_kl
         self.device = device
         self.ret_std = 1.0
+        self._ret_std_initialized = False
 
         self.optimizer_actor = optim.AdamW(
             self.actor.parameters(), lr=lr_actor, eps=1e-5, weight_decay=weight_decay
@@ -208,7 +209,11 @@ class MAPPOTrainer:
                     live_rets = returns[alive_mask > 0.5]
                     if live_rets.numel() > 1:
                         batch_std = float(live_rets.std(unbiased=False).clamp(min=1.0, max=100.0).item())
-                        self.ret_std = 0.95 * self.ret_std + 0.05 * batch_std
+                        if not self._ret_std_initialized:
+                            self.ret_std = batch_std
+                            self._ret_std_initialized = True
+                        else:
+                            self.ret_std = 0.95 * self.ret_std + 0.05 * batch_std
 
                 scale = max(1.0, float(self.ret_std))
                 eff_vclip = max(float(self.value_clip_param), 0.5 * scale)

@@ -184,7 +184,7 @@ class ActorNetwork(nn.Module):
     @staticmethod
     def _valid_uniform_kl(logits: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
         """Computes D_KL(Uniform(valid) || pi_valid) >= 0; 0 when <=1 action is valid."""
-        m = (mask > 0).to(logits.dtype).to(logits.device)
+        m = ((mask > 0) & (logits > -1e4)).to(logits.dtype).to(logits.device)
         cnt = m.sum(dim=-1, keepdim=True)
         has_choice = (cnt.squeeze(-1) > 1.5).to(logits.dtype)
         safe_cnt = cnt.clamp(min=1.0)
@@ -197,7 +197,7 @@ class ActorNetwork(nn.Module):
     @staticmethod
     def _valid_logit_l2(logits: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
         """Computes mean squared deviation of valid logits from their valid mean."""
-        m = (mask > 0).to(logits.dtype).to(logits.device)
+        m = ((mask > 0) & (logits > -1e4)).to(logits.dtype).to(logits.device)
         cnt = m.sum(dim=-1, keepdim=True)
         has_choice = (cnt.squeeze(-1) > 1.5).to(logits.dtype)
         safe_cnt = cnt.clamp(min=1.0)
@@ -209,7 +209,9 @@ class ActorNetwork(nn.Module):
         self,
         obs: torch.Tensor,
         action_masks: Dict[str, torch.Tensor],
+        actions: Dict[str, torch.Tensor],
         dists: Dict[str, Categorical],
+        cond_masks: Dict[str, torch.Tensor],
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Computes Uniform-KL barrier & zero-mean logit L2 regularization for rare/critical phases."""
         batch_zero = torch.zeros(obs.shape[:-1], dtype=obs.dtype, device=obs.device)
@@ -233,12 +235,17 @@ class ActorNetwork(nn.Module):
         tr_l2 = self._valid_logit_l2(dists["trade_response"].logits, action_masks["trade_response"])
         buy_l2 = self._valid_logit_l2(dists["core"].logits, action_masks["core"])
 
-        has_trade_choice = (action_masks["trade_req_cash"].sum(dim=-1) > 1.5).to(obs.dtype)
-        offer_cash_l2 = self._valid_logit_l2(dists["trade_offer_cash"].logits, action_masks["trade_offer_cash"])
-        req_cash_l2 = self._valid_logit_l2(dists["trade_req_cash"].logits, action_masks["trade_req_cash"])
-        trade_cash_l2 = is_manage * has_trade_choice * (offer_cash_l2 + req_cash_l2)
+        # Apply trade-cash logit regularization strictly on active trade-proposal steps using conditioned masks
+        trade_enabled = (action_masks["trade_req_cash"].sum(dim=-1) > 1.5).to(obs.dtype)
+        has_trade_prop = ((actions["trade_offer_prop"] < 40) | (actions["trade_req_prop"] < 40)).to(obs.dtype)
+        is_trade_detail = is_manage * (actions["property"] == 160).to(obs.dtype) * trade_enabled * has_trade_prop
+        cond_oc_mask = cond_masks["trade_offer_cash"]
+        cond_rc_mask = cond_masks["trade_req_cash"]
+        offer_cash_l2 = self._valid_logit_l2(dists["trade_offer_cash"].logits, cond_oc_mask)
+        req_cash_l2 = self._valid_logit_l2(dists["trade_req_cash"].logits, cond_rc_mask)
+        trade_cash_l2 = is_trade_detail * (offer_cash_l2 + req_cash_l2)
 
-        logit_l2 = is_auc * auc_l2 + 0.50 * is_trade_resp * tr_l2 + 0.25 * is_buy * buy_l2 + 0.15 * trade_cash_l2
+        logit_l2 = is_auc * auc_l2 + 0.50 * is_trade_resp * tr_l2 + 0.10 * is_buy * buy_l2 + 0.05 * trade_cash_l2
         return uniform_kl, logit_l2
 
     @staticmethod
@@ -257,7 +264,7 @@ class ActorNetwork(nn.Module):
         given_actions: Optional[Dict[str, torch.Tensor]] = None,
         deterministic: bool = False,
         temperature: float = 1.0,
-    ) -> Tuple[Dict[str, Categorical], Dict[str, torch.Tensor]]:
+    ) -> Tuple[Dict[str, Categorical], Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:
         """Builds phase-conditioned distributions and sequentially samples (or evaluates) trade heads.
 
         Sequential trade conditioning guarantees:
@@ -387,7 +394,12 @@ class ActorNetwork(nn.Module):
         )
         actions_dict["trade_req_cash"] = req_cash
 
-        return dists, actions_dict
+        cond_masks = {
+            "trade_offer_prop": cond_op_mask,
+            "trade_offer_cash": cond_oc_mask,
+            "trade_req_cash": cond_rc_mask,
+        }
+        return dists, actions_dict, cond_masks
 
     def forward(
         self,
@@ -400,7 +412,7 @@ class ActorNetwork(nn.Module):
 
         Returns (actions_dict, total_log_prob, total_entropy).
         """
-        dists, actions_dict = self._build_distributions_and_actions(
+        dists, actions_dict, _ = self._build_distributions_and_actions(
             obs, action_masks, given_actions=None, deterministic=deterministic, temperature=temperature
         )
         log_prob, entropy = self._compute_phase_aware_lp_entropy(obs, action_masks, actions_dict, dists)
@@ -413,7 +425,7 @@ class ActorNetwork(nn.Module):
         actions: Dict[str, torch.Tensor],
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Evaluates log probabilities and entropies for specific given actions."""
-        dists, _ = self._build_distributions_and_actions(
+        dists, _, _ = self._build_distributions_and_actions(
             obs, action_masks, given_actions=actions, deterministic=False, temperature=1.0
         )
         return self._compute_phase_aware_lp_entropy(obs, action_masks, actions, dists)
@@ -425,9 +437,11 @@ class ActorNetwork(nn.Module):
         actions: Dict[str, torch.Tensor],
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Evaluates log_prob, entropy, uniform-KL barrier, and logit L2 regularization."""
-        dists, _ = self._build_distributions_and_actions(
+        dists, _, cond_masks = self._build_distributions_and_actions(
             obs, action_masks, given_actions=actions, deterministic=False, temperature=1.0
         )
         log_prob, entropy = self._compute_phase_aware_lp_entropy(obs, action_masks, actions, dists)
-        uniform_kl, logit_l2 = self._compute_exploration_regularizers(obs, action_masks, dists)
+        uniform_kl, logit_l2 = self._compute_exploration_regularizers(
+            obs, action_masks, actions, dists, cond_masks
+        )
         return log_prob, entropy, uniform_kl, logit_l2

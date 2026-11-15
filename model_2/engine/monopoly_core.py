@@ -267,7 +267,6 @@ class MonopolyCore:
         self.goojf_sources: List[List[str]] = [[], [], [], []]
         self.bankrupt = [False, False, False, False]
         self.elimination_order: List[int] = []
-        self._rejected_exact_trades: Dict[Tuple[int, int, int, int, int, int], int] = {}
 
         # Bank Physical Scarcity
         self.bank_houses = 32
@@ -1686,12 +1685,6 @@ class MonopolyCore:
 
         if self.cash[initiator] < offer_cash:
             return False
-        if self.cash[target] < req_cash:
-            return False
-
-        trade_sig = (initiator, target, offer_prop, offer_cash, req_prop, req_cash)
-        if self.round_count < self._rejected_exact_trades.get(trade_sig, -1):
-            return False
 
         self.pending_trade = {
             "initiator": initiator,
@@ -1732,21 +1725,10 @@ class MonopolyCore:
                         self.property_owner[req_p] = init
 
                     self.trades_accepted_count += 1
-                    self._rejected_exact_trades.clear()
                     self.event_log.append(f"TRADE ACCEPTED between {self.get_player_name(init)} and {self.get_player_name(target)}!")
                 else:
                     self.event_log.append("Trade failed due to insufficient funds.")
             else:
-                trade = self.pending_trade
-                sig = (
-                    init,
-                    target,
-                    trade["offer_prop"],
-                    trade["offer_cash"],
-                    trade["req_prop"],
-                    trade["req_cash"],
-                )
-                self._rejected_exact_trades[sig] = self.round_count + 4
                 self.event_log.append(f"Trade REJECTED by {self.get_player_name(target)}.")
 
         self.pending_trade = None
