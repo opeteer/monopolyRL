@@ -31,9 +31,9 @@ Berdasarkan inspeksi langsung atas [`model_2/`](file:///home/opeteer/monopolyRL/
 
 | Komponen | Model-2 (Saat Ini) | Upgrade pada Model-3 | Tujuan & Dampak Strategis |
 |---|---|---|---|
-| **Engine & Trade Protocol** | `1-for-1` properti (`41 x 41`), kas kelipatan `$100` (`$0..$2,000`), langsung terima/tolak | **Multi-Property Bundle Trade** (hingga `3-for-3` + kartu `GOOJF`), kas `$25/$50` s.d. `$2,500`, + opsi **1x Counter-Offer** | Membuka negosiasi pro (*2-for-1 + kas*), mencegah penjualan properti monopoli murah |
+| **Engine & Trade Protocol** | `1-for-1` properti (`41 x 41`), kas kelipatan `$100` (`$0..$2,000`), langsung terima/tolak | **Unconstrained Multi-Property Bundle Trade** (**`0..semua` properti legal bebas + hingga `2` kartu `GOOJF`** lewat *Target-Conditioned Multi-Bernoulli Set*), kas `$25/$50` s.d. `$2,500`, + opsi **1x Counter-Offer** | Membebaskan model menyusun paket berapa pun ukurannya (*2-for-1*, *5-for-2 + kas*, likuidasi massal) tanpa batas 3 slot |
 | **Observasi Actor** | Flat `500` dim *stateless* (`prefix_314 + id + suffix_9 + syn_64 + auc + trade_101`) | **Structured Board + Opponent Telemetry + Bank Lock Features** (`~640` dim) + **Riwayat 24 Event Terakhir** | Sadar stok `32 rumah`, zona bahaya lawan 2–12 petak, dan kecenderungan bid/trade tiap kursi |
-| **Arsitektur Actor** | MLP `500 -> 384` + `1 ResBlock` + `trade_resp_branch` (`SiLU`) | **Board-Entity Attention + Opponent Transformer/GRU Encoder + Factorized Bundle Heads** | Invarian permutasi warna/kursi, memori negosiasi, dan adaptasi lawan *real-time* |
+| **Arsitektur Actor** | MLP `500 -> 384` + `1 ResBlock` + `trade_resp_branch` (`SiLU`) | **Board Spatial `TileMixer` + Temporal `EventMixer`/Conv + Factorized Bundle Heads** | Sadar topologi papan 40 petak & memori 24 event dengan **kecepatan ~10x lebih tinggi di CPU-only** daripada Transformer+GRU |
 | **Centralized Critic** | Scalar Value `V^i(S_global)` (`2032 -> 640 -> 4`, Huber Loss) | **Distributional Quantile Critic (`QR-Critic`, `32` kuantil $\times 4$ agen)** | Mengukur *tail-risk* (CVaR) kebangkrutan akibat sewa besar, bukan sekadar rata-rata |
 | **PBRS & Reward Shaping** | `8` term (`w1=0.025, w2=0.0034, w_cash=0.0034, w4=0.0006`, dll.) tanpa sewa masuk | Tambah **Expected Rent Income** (hanya properti tak digadai) + **House-Lock Scarcity**; *annealing* bobot shaping di fase lanjut | Menghilangkan *instant-mortgage* saat kas aman & menjaga fokus kemenangan murni (`+10/-10`) |
 | **Inference & Decision** | Pure *1-pass* `Categorical` sampling ($\tau = 0.65$) | **Hybrid Neural + Bounded Chance-Node Search (Expectiminimax/MCTS ringan)** pada `Buy/Auction`, `Manage`, `TradeResp` | Menguasai *4-house lock*, *jail stalling*, bid batas EV tepat, dan menolak trade merugikan |
@@ -46,12 +46,12 @@ Berdasarkan inspeksi langsung atas [`model_2/`](file:///home/opeteer/monopolyRL/
 
 ### 3.1. Engine & Action Space Pro (`MonopolyCore v3`)
 Tetap mempertahankan aturan turnamen resmi 100% tanpa aturan *hardcoded* (sejalan dengan prinsip Model-2), namun memperkaya protokol transaksi:
-1. **Multi-Property Bundle Trade (Sequential Set Action Space)**:
-   - Di fase `PHASE_PROPERTY_MANAGE`, bila agen memilih membuat proposal trade:
-     - `trade_target`: 3 opsi lawan aktif.
-     - `offer_bundle`: pemilihan sekuensial **0 hingga 3 properti** milik sendiri + flag **0–2 kartu GOOJF**, diakhiri token `DONE` (maks 4 langkah internal mikro tanpa membebani langkah dadu).
-     - `req_bundle`: pemilihan sekuensial **0 hingga 3 properti** milik target + flag **0–2 kartu GOOJF**.
-     - `offer_cash` & `req_cash`: tetap menjaga **aturan mutual-exclusion dari Model-2** (nol dual-cash, nol giveaway sepihak) dengan resolusi lebih rapat: `[0, 25, 50, 75, 100, 150, 200, ..., 2500]` (`~32` bracket).
+1. **Unconstrained Multi-Property Bundle Trade (*Target-Conditioned Multi-Bernoulli Set*)**:
+   - Di fase `PHASE_PROPERTY_MANAGE`, bila agen memilih membuat proposal trade, aksi direpresentasikan sebagai vektor biner himpunan (**tanpa batas maksimum 3 properti**) dengan urutan autoregresif 1-langkah mikro:
+     - `trade_target`: 3 opsi lawan aktif (memastikan seluruh aset yang diminta berasal dari 1 target bilateral yang sah).
+     - `req_bundle` (`{0, 1}^{42}`): pemilihan bebas **0 hingga seluruh properti legal milik target** (`0..39` indeks petak) + **0–2 kartu `GOOJF`** (`40..41`) secara simultan via *Masked Multi-Bernoulli*.
+     - `offer_bundle` (`{0, 1}^{42}`): dikondisikan pada `trade_target` + **Permutation-Invariant Set Embedding** dari `req_bundle` ($z_{\text{req}} = \sum_i a^{\text{req}}_i E_{\text{item}}(i)$), sehingga model bebas menawarkan **0 hingga seluruh properti legal miliknya sendiri** agar nilainya seimbang dengan paket yang diminta.
+     - `offer_cash` & `req_cash`: tetap menjaga **aturan mutual-exclusion dari Model-2** (nol dual-cash, nol giveaway sepihak; jika kedua bundel kosong otomatis dianggap batal/no-op) dengan resolusi lebih rapat: `[0, 25, 50, 75, 100, 150, 200, ..., 2500]` (`~32` bracket).
    - **Protokol Counter-Offer (Maks 1 Balasan)**: Target dapat memilih `Reject (0)`, `Accept (1)`, atau `Counter (2)` (terbatasi 1 balasan per giliran agar bebas *infinite loop*). Ini mereplikasi tawar-menawar pro yang sesungguhnya.
 
 ### 3.2. Fitur Observasi Baru & *Opponent Telemetry*
@@ -69,12 +69,14 @@ Memperluas vektor observasi [`_build_shared_obs_parts`](file:///home/opeteer/mon
    - Setiap event penting (pembelian, pemenang & harga lelang, proposal trade + hasil `Accepted/Rejected`, pembangunan rumah, masuk penjara) di-encode ke token kompak (`event_type, actor_id, tile_or_group, cash_ratio`) untuk diproses oleh encoder sekuensial.
 
 ### 3.3. Arsitektur Jaringan Neural (`ActorNetwork v3` & `QR-Critic v3`)
-1. **Board & Entity Transformer + History GRU**:
-   - Memecah input `40` petak menjadi token petak (*tile embeddings* memuat jenis, pemilik, jumlah rumah, status gadai, posisi pemain di petak) yang diproses oleh **2-layer Self-Attention (Pre-LN, 4 heads)** sehingga jaringan memahami korelasi spasial dadu (`+6/+7/+8` dari penjara) dan sinergi grup warna secara alami.
-   - Memadukan *board representation* dengan **GRU (`hidden=192`)** atau **Causal Attention** atas 24 event terakhir (membawa state memori di `RolloutBuffer` dengan truncated BPTT).
-2. **Autoregressive Bundle Trade Heads**:
-   - Mempertahankan pola *conditioned masking* & `emb_trade_*` dari [`ActorNetwork`](file:///home/opeteer/monopolyRL/model_2/models/actor_network.py#L77-L85), diperluas dengan **Pointer / Mask-Filtered Sequential Head** (`step 1..3 + STOP`) untuk `offer_bundle` dan `req_bundle` sehingga tidak pernah memilih properti yang sama dua kali atau memicu *dual-cash*.
-   - **Wajib mempertahankan perbaikan Model-2**: [`_valid_logit_l2`](file:///home/opeteer/monopolyRL/model_2/models/actor_network.py) yang memfilter `logits > -1e4` dan mengevaluasi mask kondisional aktual agar gradien tetap terkendali (`~1e-3`).
+1. **Board Spatial `TileMixer` + `EventMixer` (Optimasi CPU-Only 24 Jam)**:
+   - Alih-alih `2L Transformer (d=128) + GRU(24)` yang lambat di CPU (`694.3 ms/batch` saat latih), Model-3 memakai **2-Layer Spatial-Channel Board Mixer (`TileMixer`, `d=64..96`)**: memproses `40` token petak (termasuk posisi dadu `+2..+12`, pemilik, rumah, gadai, & grup warna) melalui *token-mixing* tetap atas 40 petak + *channel-mixing* MLP (`~6.7x–10.3x` lebih cepat di CPU BLAS dan cocok dengan topologi papan tetap Monopoly!).
+   - Memproses 24 event terakhir (`event_ring`) lewat **Temporal `EventMixer` / 1D Causal Conv** (`14.8x` lebih cepat inferensi di CPU daripada *unrolled* GRU, serta aman untuk *random mini-batch shuffle* PPO tanpa *stale hidden state*).
+   - *(Opsional tetap mendukung varian `Light 1L-Transformer` jika diinginkan untuk eksperimen perbandingan).*
+2. **Set-Conditioned Bundle Trade Heads (Bebas Kardinalitas)**:
+   - Mempertahankan pola *conditioned masking* & `emb_trade_*` dari [`ActorNetwork`](file:///home/opeteer/monopolyRL/model_2/models/actor_network.py#L77-L85), tetapi mengganti kepala kategorikal `1-for-1` dengan **Per-Tile Pointer/Bernoulli Scoring Head** yang mengambil token petak dari *Board `TileMixer`* (`H_tiles[:, 0:40, :]`) + `2` slot `GOOJF` untuk memprediksi probabilitas penyertaan tiap aset secara independen bersyarat (*Masked Multi-Bernoulli*), ditambah **Set Sum Pooling** ($z_{\text{req}}, z_{\text{offer}}$) menuju head `offer_cash` dan `req_cash`.
+   - Keunggulannya: ukuran tensor tetap statis (`42` bit), **nol ambiguitas permutasi urutan** (`{A, B}` == `{B, A}`), dan bebas batas maksimum properti (`0..28` properti sekaligus).
+   - **Wajib mempertahankan perbaikan Model-2**: [`_valid_logit_l2`](file:///home/opeteer/monopolyRL/model_2/models/actor_network.py) & `KL-to-Uniform(p=0.5)` berbasis mask item valid (`mask > 0`) hanya ketika fase trade proposal benar-benar aktif agar gradien Bernoulli tetap stabil (`~1e-3`).
 3. **Distributional Quantile Critic (`QR-Critic`)**:
    - Mengganti `value_head(features) -> (B, 4)` pada [`CentralizedCritic`](file:///home/opeteer/monopolyRL/model_2/models/critic_network.py#L45) menjadi `quantile_head(features) -> (B, 4, N_quantiles)` (misal $N = 32$ kuantil dengan **Quantile Huber Loss**).
    - **Keunggulan Pro**: Menangkap distribusi bimodal Monopoly (menang besar vs bangkrut mendadak karena salah langkah di *Boardwalk Hotel*). Advantage dihitung memakai kombinasi **Mean + CVaR ($\alpha=0.25$)** agar agen paham bahwa menjaga bantalan kas saat bahaya tinggi jauh lebih bernilai daripada selisih EV kecil.
@@ -119,7 +121,7 @@ Untuk mengatasi masalah *overfitting* terhadap gaya *self-play* sendiri:
 
 | Fase | Lingkup Pekerjaan | Kriteria Keberhasilan (Exit Gate) |
 |---|---|---|
-| **Fase 1: PBRS v3 & Telemetry (Low-Risk Upgrade)** | Tambah `Expected Rent Income`, `Housing Scarcity Control`, `Opponent Telemetry (+30 dim)`, dan *GRU History* di atas engine Model-2 | *Instant-mortgage rate* saat kas `>$600` turun `<5%`; menang >= 60% melawan `Barracuda 180M` & >= 70% vs `3x M1-100M` |
-| **Fase 2: Bundle Trade & QR-Critic** | Implementasi *multi-property bundle trade (up to 3-for-3 + GOOJF)*, *1x counter-offer*, dan `QR-Critic (32 quantiles)` dengan CVaR advantage | Trade *2-for-1* muncul alami tanpa *1-way giveaway*; `ForcedLiq` terkendali; stabilitas pelatihan tanpa *policy collapse* |
+| **Fase 1: PBRS v3 & Telemetry (Low-Risk Upgrade)** | Tambah `Expected Rent Income`, `Housing Scarcity Control`, `Opponent Telemetry (+30 dim)`, `TileMixer`, dan `EventMixer` di atas engine Model-2 | *Instant-mortgage rate* saat kas `>$600` turun `<5%`; menang >= 60% melawan `Barracuda 180M` & >= 70% vs `3x M1-100M` |
+| **Fase 2: Bundle Trade & QR-Critic** | Implementasi *Unconstrained Multi-Property Bundle Trade (`0..semua` properti via Multi-Bernoulli + GOOJF)*, *1x counter-offer*, dan `QR-Critic (32 quantiles)` dengan CVaR advantage | Trade *multi-properti* muncul alami tanpa *1-way giveaway*; `ForcedLiq` terkendali; stabilitas pelatihan tanpa *policy collapse* |
 | **Fase 3: Search Distillation & PSRO League** | Tambahkan *Chance-Node Expectiminimax/PUCT Search* untuk fase kritis + *Search Distillation* + Liga PSRO dengan *Pro-Heuristic Bot* | Agen konsisten mengeksekusi *4-house lock* saat `bank_houses` tipis & *late-game jail stalling*; kalahkan *Pro-Heuristic Bot* `>= 65%` |
 | **Fase 4: Uji Turnamen vs Pemain Pro Manusia** | *Blind human-vs-AI match* dengan UI Model-3 (log transaksi lengkap, *win-prob telemetry*, audit Plackett-Luce Elo) | Plackett-Luce Elo menembus **`>= 1450+`** (anchor `M1-50M=1200`), rasio kemenangan `>35–40%` di meja 4-pemain melawan pemain turnamen pro |
