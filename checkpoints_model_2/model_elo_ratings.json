@@ -10,9 +10,9 @@
         1202.8,
         1430.4
       ],
-      "tier": "Grandmaster / Flagship",
+      "tier": "Supreme Grandmaster / Flagship",
       "checkpoint_path": "checkpoints_model_2/Model-2_Barracuda.pt",
-      "training_steps": 149995520,
+      "training_steps": "150M + 30M Fine-Tune (180M total)",
       "seat_games_160": 224,
       "seat_wins_160": 80.0,
       "seat_win_rate_160_pct": 35.71,
