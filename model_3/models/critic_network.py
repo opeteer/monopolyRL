@@ -83,8 +83,7 @@ class QuantileCritic(nn.Module):
             return mean_v
         n_q = quantiles.shape[-1]
         k = max(1, int(round(cvar_alpha * n_q)))
-        sorted_q, _ = torch.sort(quantiles, dim=-1)
-        cvar_v = sorted_q[..., :k].mean(dim=-1)
+        cvar_v = torch.topk(quantiles, k=k, dim=-1, largest=False).values.mean(dim=-1)
         return (1.0 - cvar_weight) * mean_v + cvar_weight * cvar_v
 
     def get_risk_value(

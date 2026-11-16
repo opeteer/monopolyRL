@@ -49,6 +49,7 @@ tmp_checkpoints/
 checkpoints_backup*/
 sessions/
 sessions_model_2/
+runs_model_3/
 
 # Operating System Files
 .DS_Store

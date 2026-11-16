@@ -294,14 +294,15 @@ class MAPPOTrainerV3:
         alive_mask: torch.Tensor,
         kappa: float = 1.0,
     ) -> torch.Tensor:
-        """Computes adaptive-scaled Quantile Huber Loss across 4 centralized seats."""
-        # u: (B, 4, N_pred, N_target)
-        u = (target_quantiles.unsqueeze(2) - pred_quantiles.unsqueeze(3)) / max(1.0, float(scale))
-        abs_u = torch.abs(u)
-        huber = torch.where(abs_u <= kappa, 0.5 * u * u, kappa * (abs_u - 0.5 * kappa))
-        tau_view = taus.view(1, 1, -1, 1).to(u.dtype)
-        pinball = torch.abs(tau_view - (u < 0.0).to(u.dtype))
-        per_seat = (pinball * huber / kappa).mean(dim=(-1, -2))
+        """Computes adaptive-scaled Quantile Huber Loss across 4 centralized seats using native C++ kernels."""
+        s = max(1.0, float(scale))
+        p_q = (pred_quantiles.unsqueeze(3) / s).expand(-1, -1, -1, target_quantiles.shape[-1])
+        t_q = (target_quantiles.unsqueeze(2) / s).expand(-1, -1, pred_quantiles.shape[-1], -1)
+        diff = t_q - p_q
+        huber = F.huber_loss(p_q, t_q, delta=kappa, reduction="none")
+        tau_view = taus.view(1, 1, -1, 1).to(diff.dtype)
+        pinball = torch.abs(tau_view - (diff < 0.0).to(diff.dtype))
+        per_seat = (pinball * huber).mean(dim=(-1, -2))
         return (per_seat * alive_mask).sum() / alive_mask.sum().clamp(min=1.0)
 
     def train_step(

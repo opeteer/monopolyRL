@@ -407,6 +407,28 @@ class ActorNetworkV3(nn.Module):
             else:
                 actions_out[k] = given_actions[k].to(device).long()
 
+        # Fast-path during rollout inference: if no agent in batch is proposing trade / countering,
+        # skip expensive bundle tile-MLP scoring and cash heads (zero impact on log_prob as is_trade_proposal==0)
+        if given_actions is None:
+            is_manage = scalar_obs[..., 44] > 0.5
+            is_counter = scalar_obs[..., 46] > 0.5
+            prop_proposes = actions_out["property"] == ACT_PROP_PROPOSE_TRADE
+            is_trade_active = (is_manage & prop_proposes) | is_counter
+            if not torch.any(is_trade_active):
+                actions_out["trade_req_bundle"] = torch.zeros((B, BUNDLE_DIM), dtype=torch.int8, device=device)
+                actions_out["trade_offer_bundle"] = torch.zeros((B, BUNDLE_DIM), dtype=torch.int8, device=device)
+                actions_out["trade_offer_cash"] = torch.zeros((B,), dtype=torch.long, device=device)
+                actions_out["trade_req_cash"] = torch.zeros((B,), dtype=torch.long, device=device)
+                logits_dict["trade_req_bundle"] = torch.zeros((B, BUNDLE_DIM), dtype=features.dtype, device=device)
+                logits_dict["trade_offer_bundle"] = torch.zeros((B, BUNDLE_DIM), dtype=features.dtype, device=device)
+                logits_dict["trade_offer_cash"] = torch.zeros((B, self.trade_cash_dim), dtype=features.dtype, device=device)
+                logits_dict["trade_req_cash"] = torch.zeros((B, self.trade_cash_dim), dtype=features.dtype, device=device)
+                cond_masks["trade_req_bundle"] = action_masks["trade_req_bundle"][:, 0].to(device)
+                cond_masks["trade_offer_bundle"] = action_masks["trade_offer_bundle"].to(device)
+                cond_masks["trade_offer_cash"] = action_masks["trade_offer_cash"].to(device)
+                cond_masks["trade_req_cash"] = action_masks["trade_req_cash"].to(device)
+                return logits_dict, actions_out, cond_masks, {"features": features}
+
         # 2. Target-Conditioned Req Bundle ({0, 1}^42 via Multi-Bernoulli)
         target_idx = actions_out["trade_target"].clamp(0, 2)
         req_masks_all = action_masks["trade_req_bundle"].to(device)  # (B, 3, 42)

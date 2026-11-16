@@ -58,13 +58,16 @@ def _sample_policy_actions_for_seats(
     seat_indices: List[int],
     deterministic: bool = False,
 ) -> Tuple[Dict[str, np.ndarray], np.ndarray]:
-    """Runs one batched forward pass for the subset (env_indices, seat_indices)."""
-    with torch.no_grad():
-        t_t = torch.from_numpy(tile_np[env_indices, seat_indices].copy())
-        s_t = torch.from_numpy(scalar_np[env_indices, seat_indices].copy())
-        e_t = torch.from_numpy(ev_np[env_indices, seat_indices].astype(np.int64))
+    """Runs one batched forward pass for the subset (env_indices, seat_indices) under inference_mode."""
+    with torch.inference_mode():
+        t_sub = np.ascontiguousarray(tile_np[env_indices, seat_indices])
+        s_sub = np.ascontiguousarray(scalar_np[env_indices, seat_indices])
+        e_sub = np.ascontiguousarray(ev_np[env_indices, seat_indices])
+        t_t = torch.from_numpy(t_sub)
+        s_t = torch.from_numpy(s_sub)
+        e_t = torch.from_numpy(e_sub)
         m_t = {
-            k: torch.from_numpy(mask_bufs[k][env_indices, seat_indices].astype(np.float32))
+            k: torch.from_numpy(np.ascontiguousarray(mask_bufs[k][env_indices, seat_indices]))
             for k in ACTION_KEYS
         }
         acts, lps, _ = policy(t_t, s_t, e_t, m_t, deterministic=deterministic)
@@ -74,6 +77,60 @@ def _sample_policy_actions_for_seats(
         arr = acts[k].cpu().numpy()
         out_acts[k] = arr.astype(np.int8 if len(ACT_SHAPES[k]) > 0 else np.int64, copy=False)
     return out_acts, lps.cpu().numpy().astype(np.float32, copy=False)
+
+
+def save_named_model(
+    actor: ActorNetworkV3,
+    critic: torch.nn.Module,
+    exploiter_actor: ActorNetworkV3,
+    exploiter_optimizer: torch.optim.Optimizer,
+    trainer: MAPPOTrainerV3,
+    total_steps: int,
+    it: int,
+    model_name: Optional[str],
+    checkpoint_dir: str,
+    league: Optional[PSROLeagueManager] = None,
+):
+    """Saves designated named model checkpoint (e.g. Model-3 Dragonfly)."""
+    if not model_name:
+        return
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    sanitized = model_name.replace(" ", "_")
+    named_primary = os.path.join(checkpoint_dir, f"{sanitized}.pt")
+    named_direct = os.path.join(checkpoint_dir, f"{model_name}.pt")
+    payload = {
+        "model_name": model_name,
+        "iteration": int(it),
+        "total_steps": int(total_steps),
+        "model_config": {
+            "arch": actor.arch,
+            "d_model": actor.d_model,
+            "hidden_dim": actor.hidden_dim,
+            "critic_hidden_dim": getattr(critic, "hidden_dim", 512),
+            "num_quantiles": getattr(critic, "num_quantiles", 32),
+        },
+        "state_dict": {k: v.detach().cpu() for k, v in actor.state_dict().items()},
+        "actor_state_dict": {k: v.detach().cpu() for k, v in actor.state_dict().items()},
+        "critic_state_dict": {k: v.detach().cpu() for k, v in critic.state_dict().items()},
+        "exploiter_state_dict": {k: v.detach().cpu() for k, v in exploiter_actor.state_dict().items()},
+        "exploiter_optimizer": exploiter_optimizer.state_dict(),
+        "trainer_state": trainer.state_dict(),
+        "metadata": {
+            "model_name": model_name,
+            "total_steps": int(total_steps),
+            "final_elo": league.main_record.elo if (league and hasattr(league, "main_record")) else 1200.0,
+            "final_win_rate": league.main_record.win_rate if (league and hasattr(league, "main_record")) else 0.0,
+            "timestamp": time.time(),
+        },
+    }
+    tmp = named_primary + ".tmp"
+    torch.save(payload, tmp)
+    os.replace(tmp, named_primary)
+    if named_direct != named_primary:
+        tmp_dir = named_direct + ".tmp"
+        torch.save(payload, tmp_dir)
+        os.replace(tmp_dir, named_direct)
+    print(f"--> [Designated Named Model Saved] {named_primary}")
 
 
 def evaluate_gauntlet(
@@ -164,6 +221,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--preset", type=str, default="server_cpu_standard", choices=list(PRESETS.keys()))
     p.add_argument("--session_name", type=str, default=None)
     p.add_argument("--base_dir", type=str, default="runs_model_3")
+    p.add_argument("--checkpoint_dir", type=str, default="checkpoints_model_3", help="Directory for persistent named model checkpoints")
+    p.add_argument("--model_name", type=str, default="Model-3 Dragonfly", help="Designated model name saved on completion (default: 'Model-3 Dragonfly')")
     p.add_argument("--auto_hardware", action="store_true")
     p.add_argument("--arch", type=str, default=None, choices=["tile_mixer", "light_tx"])
     p.add_argument("--d_model", type=int, default=None)
@@ -173,6 +232,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--num_envs", type=int, default=None)
     p.add_argument("--num_workers", type=int, default=None)
     p.add_argument("--num_threads", type=int, default=None)
+    p.add_argument("--ppo_epochs", type=int, default=None, help="PPO update epochs (default from preset)")
+    p.add_argument("--num_mini_batches", type=int, default=None, help="Number of PPO mini-batches (default from preset)")
     p.add_argument("--search_worker_ratio", type=float, default=None)
     p.add_argument("--pbrs_anneal", dest="pbrs_anneal", action="store_true")
     p.add_argument("--no_pbrs_anneal", dest="pbrs_anneal", action="store_false")
@@ -193,7 +254,7 @@ def build_config(args: argparse.Namespace) -> TrainingConfigV3:
         cfg.num_threads = hw.recommended_torch_threads
         cfg.rollout_steps = hw.recommended_rollout_steps
 
-    for attr in ("arch", "d_model", "hidden_dim", "total_steps", "rollout_steps", "num_envs", "num_workers", "num_threads", "search_worker_ratio", "pbrs_anneal"):
+    for attr in ("arch", "d_model", "hidden_dim", "total_steps", "rollout_steps", "num_envs", "num_workers", "num_threads", "ppo_epochs", "num_mini_batches", "search_worker_ratio", "pbrs_anneal"):
         val = getattr(args, attr, None)
         if val is not None:
             setattr(cfg, attr, val)
@@ -234,6 +295,8 @@ def train(args: argparse.Namespace):
         config_dict=cfg.to_dict(),
     )
     league = PSROLeagueManager(checkpoint_dir=session.checkpoint_dir, device=device)
+    if args.model_name and hasattr(league, "main_record"):
+        league.main_record.name = args.model_name
 
     actor = ActorNetworkV3(
         d_model=cfg.d_model,
@@ -392,16 +455,11 @@ def train(args: argparse.Namespace):
             houses_built = 0
 
             for _ in range(cfg.rollout_steps):
-                # Evaluate centralized critic on current states
-                snap_gs = gs.copy()
-                snap_t = tile.copy()
-                snap_s = scalar.copy()
-                snap_e = ev.copy()
-                snap_masks = {k: masks[k].copy() for k in ACTION_KEYS}
+                step_idx = buffer.insert_obs(tile, scalar, ev, gs, masks)
 
-                with torch.no_grad():
+                with torch.inference_mode():
                     rv, qs = critic.get_risk_value(
-                        torch.from_numpy(snap_gs),
+                        buffer.global_states[step_idx],
                         cvar_alpha=cfg.cvar_alpha,
                         cvar_weight=cfg.cvar_weight,
                     )
@@ -439,7 +497,7 @@ def train(args: argparse.Namespace):
 
                 for pol, e_list, p_list in policy_groups.values():
                     sampled, lps_sub = _sample_policy_actions_for_seats(
-                        pol, snap_t, snap_s, snap_e, snap_masks, e_list, p_list, deterministic=False
+                        pol, tile, scalar, ev, masks, e_list, p_list, deterministic=False
                     )
                     for k in ACTION_KEYS:
                         vec_env.act_bufs[k][e_list, p_list] = sampled[k]
@@ -453,8 +511,7 @@ def train(args: argparse.Namespace):
                     s_heads_hi = []
                     for s_e in search_env_indices:
                         a_p = int(ap[s_e])
-                        # Detect active phase cleanly from scalar_obs[40:48] one-hot
-                        ph_vec = snap_s[s_e, a_p, 40:48]
+                        ph_vec = scalar[s_e, a_p, 40:48]
                         ph = int(np.argmax(ph_vec)) if np.any(ph_vec > 0.5) else 0
                         h_name = _active_head_for_phase(ph)
                         if h_name is not None:
@@ -462,12 +519,12 @@ def train(args: argparse.Namespace):
                             s_ps_hi.append(a_p)
                             s_heads_hi.append(h_name)
                     if s_envs_hi:
-                        with torch.no_grad():
+                        with torch.inference_mode():
                             l_dict = actor.get_head_logits(
-                                torch.from_numpy(snap_t[s_envs_hi, s_ps_hi]),
-                                torch.from_numpy(snap_s[s_envs_hi, s_ps_hi]),
-                                torch.from_numpy(snap_e[s_envs_hi, s_ps_hi].astype(np.int64)),
-                                {k: torch.from_numpy(snap_masks[k][s_envs_hi, s_ps_hi].astype(np.float32)) for k in ACTION_KEYS},
+                                torch.from_numpy(tile[s_envs_hi, s_ps_hi]),
+                                torch.from_numpy(scalar[s_envs_hi, s_ps_hi]),
+                                torch.from_numpy(ev[s_envs_hi, s_ps_hi].astype(np.int64)),
+                                {k: torch.from_numpy(masks[k][s_envs_hi, s_ps_hi]) for k in ACTION_KEYS},
                             )
                         for idx_s, (s_e, h_name) in enumerate(zip(s_envs_hi, s_heads_hi)):
                             vec_env.search_prior_logits_buf[s_e, : l_dict[h_name].shape[-1]] = (
@@ -482,23 +539,19 @@ def train(args: argparse.Namespace):
                 if np.any(overridden > 0.5):
                     active_mask_step[overridden > 0.5] = 0.0
 
-                buffer.insert(
-                    snap_t,
-                    snap_s,
-                    snap_e,
-                    snap_gs,
+                buffer.insert_step(
+                    step_idx,
                     acts_step,
-                    snap_masks,
-                    rews.copy(),
-                    dones.copy(),
+                    rews,
+                    dones,
                     rv_np,
                     qs_np,
                     lps_step,
                     active_masks=active_mask_step,
                     exploiter_masks=exploiter_mask_step,
-                    search_valid=vec_env.search_valid_buf.copy(),
-                    search_head=vec_env.search_head_buf.copy(),
-                    search_probs=vec_env.search_probs_buf.copy(),
+                    search_valid=vec_env.search_valid_buf,
+                    search_head=vec_env.search_head_buf,
+                    search_probs=vec_env.search_probs_buf,
                 )
 
                 ep_count += step_stats["episodes"]
@@ -580,6 +633,18 @@ def train(args: argparse.Namespace):
                     exploiter_optimizer=exploiter_optimizer,
                     trainer_state=trainer.state_dict(),
                 )
+                save_named_model(
+                    actor=actor,
+                    critic=critic,
+                    exploiter_actor=exploiter_actor,
+                    exploiter_optimizer=exploiter_optimizer,
+                    trainer=trainer,
+                    total_steps=total_steps,
+                    it=it,
+                    model_name=args.model_name,
+                    checkpoint_dir=args.checkpoint_dir,
+                    league=league,
+                )
     finally:
         if last_iter >= start_iter:
             target_ckpt = (
@@ -596,6 +661,18 @@ def train(args: argparse.Namespace):
                 exploiter_actor=exploiter_actor,
                 exploiter_optimizer=exploiter_optimizer,
                 trainer_state=trainer.state_dict(),
+            )
+            save_named_model(
+                actor=actor,
+                critic=critic,
+                exploiter_actor=exploiter_actor,
+                exploiter_optimizer=exploiter_optimizer,
+                trainer=trainer,
+                total_steps=total_steps,
+                it=last_iter,
+                model_name=args.model_name,
+                checkpoint_dir=args.checkpoint_dir,
+                league=league,
             )
         vec_env.close()
         session.save_summary(

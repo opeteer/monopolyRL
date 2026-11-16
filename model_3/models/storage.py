@@ -106,6 +106,69 @@ class RolloutBufferV3:
         self.step = 0
         self.full = False
 
+    def insert_obs(
+        self,
+        tile_state: Any,
+        scalar_obs: Any,
+        event_ring: Any,
+        global_state: Any,
+        action_masks: Dict[str, Any],
+    ) -> int:
+        """Writes pre-step observations directly into buffer tensors without redundant intermediate copies."""
+        idx = self.step
+        self.tile_states[idx] = torch.as_tensor(tile_state, dtype=torch.float16, device=self.device)
+        self.scalar_obs[idx] = torch.as_tensor(scalar_obs, dtype=torch.float32, device=self.device)
+        self.event_rings[idx] = torch.as_tensor(event_ring, dtype=torch.int16, device=self.device)
+        self.global_states[idx] = torch.as_tensor(global_state, dtype=torch.float32, device=self.device)
+        for k in self.action_keys:
+            self.action_masks[k][idx] = torch.as_tensor(action_masks[k], dtype=torch.float32, device=self.device)
+        return idx
+
+    def insert_step(
+        self,
+        idx: int,
+        actions: Dict[str, Any],
+        rewards: Any,
+        dones: Any,
+        values: Any,
+        quantiles: Any,
+        log_probs: Any,
+        active_masks: Optional[Any] = None,
+        exploiter_masks: Optional[Any] = None,
+        search_valid: Optional[Any] = None,
+        search_head: Optional[Any] = None,
+        search_probs: Optional[Any] = None,
+    ):
+        """Writes transition outcomes and advantages for slot idx without copying observations."""
+        for k in self.action_keys:
+            a_dtype = torch.int8 if len(self.act_shapes[k]) > 0 else torch.int64
+            self.actions[k][idx] = torch.as_tensor(actions[k], dtype=a_dtype, device=self.device)
+
+        self.rewards[idx] = torch.as_tensor(rewards, dtype=torch.float32, device=self.device)
+        self.dones[idx] = torch.as_tensor(dones, dtype=torch.float32, device=self.device)
+        self.values[idx] = torch.as_tensor(values, dtype=torch.float32, device=self.device)
+        self.quantiles[idx] = torch.as_tensor(quantiles, dtype=torch.float32, device=self.device)
+        self.log_probs[idx] = torch.as_tensor(log_probs, dtype=torch.float32, device=self.device)
+        if active_masks is not None:
+            self.active_masks[idx] = torch.as_tensor(active_masks, dtype=torch.float32, device=self.device)
+        else:
+            self.active_masks[idx] = 1.0
+        if exploiter_masks is not None:
+            self.exploiter_masks[idx] = torch.as_tensor(exploiter_masks, dtype=torch.float32, device=self.device)
+        else:
+            self.exploiter_masks[idx].zero_()
+
+        if search_valid is not None and search_head is not None and search_probs is not None:
+            self.search_valid[idx] = torch.as_tensor(search_valid, dtype=torch.float32, device=self.device)
+            self.search_head[idx] = torch.as_tensor(search_head, dtype=torch.int64, device=self.device)
+            self.search_probs[idx] = torch.as_tensor(search_probs, dtype=torch.float32, device=self.device)
+        else:
+            self.search_valid[idx].zero_()
+
+        self.step = (self.step + 1) % self.buffer_size
+        if self.step == 0:
+            self.full = True
+
     def insert(
         self,
         tile_state: Any,
