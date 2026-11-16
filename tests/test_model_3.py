@@ -434,3 +434,111 @@ def test_vec_env_and_mappo_smoke_iteration():
         loaded = PSROLeagueManager.load_training_checkpoint(ckpt_path)
         assert loaded["iteration"] == 3 and loaded["total_steps"] == 1024
         assert loaded["model_config"]["arch"] == "tile_mixer"
+
+
+def test_reward_calibration_zero_sum_and_td_lambda_quantiles():
+    """Verifies zero-sum terminal payoffs, mortgage anti-thrash friction, 4h lock incentive, and TD(lambda) propagation."""
+    # 1. Zero-sum timeout payoff verification across ranked survivors & 1 already-bankrupt seat
+    c_to = MonopolyCore(seed=11, max_rounds=10, pbrs_scale=0.0)
+    c_to.reset(seed=11)
+    c_to.round_count = 10
+    c_to.cash = [0, 2200, 1400, 800]
+    c_to.bankrupt = [True, False, False, False]
+    c_to.elimination_order = [0]
+    c_to.phase = 0
+    c_to.active_decision_player = 1
+    _, rews_to, dones_to, _ = c_to.step({"player_1": make_noop_action_v3()}, skip_obs=True)
+    assert dones_to["__all__"] is True
+    # P0 took -5.5 earlier; P1, P2, P3 take +8.0, -0.5, -2.0 -> sum across survivors = +5.5 (exact zero-sum with -5.5!)
+    surv_sum = rews_to["player_1"] + rews_to["player_2"] + rews_to["player_3"]
+    assert abs(surv_sum - 5.5) < 1e-6, f"Expected +5.5 survivor pool balancing -5.5, got {surv_sum} ({rews_to})"
+
+    # 2. Zero-sum sequential knockout check (+11 - 2 - 3.5 - 5.5 == 0.0) with pbrs_scale=0.0
+    c_ko = MonopolyCore(seed=12, max_rounds=80, pbrs_scale=0.0)
+    c_ko.reset(seed=12)
+    c_ko.cash = [1500, -100, 1500, 1500]
+    c_ko.phase = 0
+    c_ko.active_decision_player = 0
+    _, r1, _, _ = c_ko.step({"player_0": make_noop_action_v3()}, skip_obs=True)
+    assert abs(r1["player_1"] - (-5.5)) < 1e-6
+    c_ko.cash[2] = -100
+    c_ko.cash[3] = -100
+    _, r2, d2, _ = c_ko.step({f"player_{c_ko.active_decision_player}": make_noop_action_v3()}, skip_obs=True)
+    assert d2["__all__"] is True
+    assert abs(r2["player_0"] - 11.0) < 1e-6
+    total_ep = sum(r1[f"player_{i}"] + r2[f"player_{i}"] for i in range(4))
+    assert abs(total_ep) < 1e-6, f"Knockout episode not zero-sum: {total_ep}"
+
+    # 3. Mortgage -> Unmortgage cycle strictly penalized (anti-thrash), and 4-house shortage lock beats 4->5 hotel
+    c_pbrs = MonopolyCore(seed=13)
+    c_pbrs.reset(seed=13)
+    c_pbrs.phase = PHASE_PROPERTY_MANAGE
+    c_pbrs.current_player = 0
+    c_pbrs.active_decision_player = 0
+    c_pbrs.cash = [1200, 1200, 1200, 1200]
+    for t in COLOR_GROUPS["ORANGE"]:
+        c_pbrs.property_owner[t] = 0
+        c_pbrs.property_houses[t] = 4
+    for t in COLOR_GROUPS["LIGHT_BLUE"]:
+        c_pbrs.property_owner[t] = 1
+        c_pbrs.property_houses[t] = 1
+    c_pbrs.property_owner[1] = 0  # Mediterranean Ave ($60, mortgage $30)
+    c_pbrs.bank_houses = 32 - 12 - 3  # 17 houses -> buy 1 house or scarce? Make it 15 <= 16:
+    c_pbrs.property_houses[6] = 2
+    c_pbrs.property_houses[8] = 2
+    c_pbrs.bank_houses = 15
+    c_pbrs.prev_potentials = [c_pbrs._compute_potential(i) for i in range(4)]
+    phi_hold_4h = c_pbrs._compute_potential(0)
+    # Check PBRS stays moderate compared to +11.0 terminal win
+    assert abs(phi_hold_4h) < 8.0, f"PBRS potential too huge vs +11 win: {phi_hold_4h}"
+
+    snap = c_pbrs.save_snapshot()
+    # Upgrade St. James (16) from 4 -> Hotel (returns 4 houses to bank, breaking shortage lock)
+    act_hotel = make_noop_action_v3()
+    act_hotel["property"] = 16
+    _, r_hotel, _, _ = c_pbrs.step({"player_0": act_hotel}, skip_obs=True)
+    assert r_hotel["player_0"] < 0.0, f"Breaking 4-house shortage lock for hotel should be net negative vs holding! {r_hotel['player_0']}"
+
+    # Restore and test mortgage(Med=1) then next-turn unmortgage(Med=1) net delta < 0
+    c_pbrs.restore_snapshot(snap)
+    c_pbrs.prev_potentials = [c_pbrs._compute_potential(i) for i in range(4)]
+    phi_before_mtg = c_pbrs.prev_potentials[0]
+    c_pbrs.property_mortgaged[1] = True
+    c_pbrs.cash[0] += 30
+    phi_after_mtg = c_pbrs._compute_potential(0)
+    assert phi_after_mtg < phi_before_mtg, f"Mortgaging should not give free PBRS gain: {phi_after_mtg} vs {phi_before_mtg}"
+
+    # 4. Sparse Bernoulli KL check (minimized cleanly at sigmoid(z) == 0.15)
+    import math
+    z_opt = torch.full((2, 10), math.log(0.15 / 0.85))
+    m_ones = torch.ones((2, 10))
+    kl_at_opt = ActorNetworkV3._valid_uniform_kl_bern(z_opt, m_ones)
+    assert (kl_at_opt.abs() < 1e-5).all()
+
+    # 5. Multi-step Distributional TD(lambda) propagation in RolloutBufferV3
+    T, E = 24, 2
+    buf = RolloutBufferV3(buffer_size=T, num_envs=E, num_quantiles=32, gamma=0.997, gae_lambda=0.955)
+    for t in range(T):
+        rew = np.zeros((E, 4), dtype=np.float32)
+        dn = np.zeros((E, 4), dtype=np.float32)
+        if t == T - 1:
+            rew[:, 0] = 11.0
+            rew[:, 1:] = -3.66
+            dn[:, :] = 1.0
+        buf.insert(
+            np.zeros((E, 4, 40, TILE_FEAT_DIM), dtype=np.float32),
+            np.zeros((E, 4, SCALAR_OBS_DIM), dtype=np.float32),
+            np.zeros((E, 4, EVENT_RING_LEN, EVENT_FEAT_DIM), dtype=np.int16),
+            np.zeros((E, GLOBAL_STATE_DIM), dtype=np.float32),
+            {k: np.zeros((E, 4) + ACT_SHAPES[k], dtype=np.int8 if len(ACT_SHAPES[k]) > 0 else np.int64) for k in ACTION_KEYS},
+            {k: np.ones((E, 4) + MASK_SHAPES[k], dtype=np.float32) for k in ACTION_KEYS},
+            rew, dn, np.zeros((E, 4), dtype=np.float32),
+            np.zeros((E, 4, 32), dtype=np.float32), np.zeros((E, 4), dtype=np.float32),
+        )
+    buf.compute_gae_and_quantile_targets(np.zeros((E, 4, 32), dtype=np.float32), np.ones((E, 4), dtype=np.float32))
+    # Even 20 steps before terminal, P0 quantile target must already receive positive multi-step win signal!
+    assert buf.quantile_targets[3, :, 0].mean().item() > 2.5, (
+        f"TD(lambda) failed to propagate terminal +11 back 20 steps: {buf.quantile_targets[3, :, 0].mean().item()}"
+    )
+    assert buf.quantile_targets[3, :, 1].mean().item() < -0.8
+

@@ -224,35 +224,33 @@ class RolloutBufferV3:
             self.full = True
 
     def compute_gae_and_quantile_targets(self, last_quantiles: Any, last_dones: Any):
-        """Computes CVaR risk-sensitive GAE and 1-step distributional Bellman quantile targets."""
+        """Computes CVaR risk-sensitive GAE and multi-step Distributional TD(lambda) quantile targets."""
         last_q_t = torch.as_tensor(last_quantiles, dtype=torch.float32, device=self.device)
         last_d_t = torch.as_tensor(last_dones, dtype=torch.float32, device=self.device)
         last_values = QuantileCritic.risk_value_from_quantiles(
             last_q_t, cvar_alpha=self.cvar_alpha, cvar_weight=self.cvar_weight
         )
         gae = torch.zeros((self.num_envs, 4), dtype=torch.float32, device=self.device)
-        # Compute 1-step (and TD(lambda)-aligned) quantile targets via GAE offset on predicted quantiles
+        q_lambda = last_q_t
         for t in reversed(range(self.buffer_size)):
             if t == self.buffer_size - 1:
                 next_val = last_values
-                next_q = last_q_t
                 next_non_terminal = 1.0 - last_d_t
+                q_next_blend = last_q_t
             else:
                 next_val = self.values[t + 1]
                 next_q = self.quantiles[t + 1]
                 next_non_terminal = 1.0 - self.dones[t]
+                q_next_blend = (1.0 - self.gae_lambda) * next_q + self.gae_lambda * q_lambda
 
             delta = self.rewards[t] + self.gamma * next_val * next_non_terminal - self.values[t]
             gae = delta + self.gamma * self.gae_lambda * next_non_terminal * gae
             self.advantages[t] = gae
             self.returns[t] = gae + self.values[t]
 
-            # 1-step Distributional Bellman target shifted slightly by GAE residual toward multi-step return
-            # Pure 1-step Bellman keeps spread well-calibrated: r + gamma*(1-d)*Z(s')
-            self.quantile_targets[t] = (
-                self.rewards[t].unsqueeze(-1)
-                + self.gamma * next_non_terminal.unsqueeze(-1) * next_q
-            )
+            # Exact multi-step Distributional TD(lambda) target: propagates terminal outcomes rapidly
+            q_lambda = self.rewards[t].unsqueeze(-1) + self.gamma * next_non_terminal.unsqueeze(-1) * q_next_blend
+            self.quantile_targets[t] = q_lambda
 
     @staticmethod
     def _normalize_masked_advantages(flat_advantages: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:

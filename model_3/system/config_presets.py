@@ -29,7 +29,7 @@ class TrainingConfigV3:
     search_worker_ratio: float = 0.125
     search_top_k: int = 4
     search_temperature: float = 0.25
-    search_distill_coef: float = 0.05
+    search_distill_coef: float = 0.08
 
     # Risk-Sensitive Quantile RL & PPO Hyperparameters
     gamma: float = 0.997
@@ -39,11 +39,12 @@ class TrainingConfigV3:
     quantile_huber_kappa: float = 1.0
     lr_actor: float = 2.0e-4
     lr_actor_min: float = 2.5e-5
-    lr_critic: float = 4.0e-4
+    lr_critic: float = 5.0e-4
     lr_critic_min: float = 5.0e-5
     no_lr_anneal: bool = False
     clip_param: float = 0.15
-    ppo_epochs: int = 4
+    ppo_epochs: int = 3
+    critic_extra_epochs: int = 2
     num_mini_batches: int = 8
     target_kl: float = 0.018
     value_loss_coef: float = 0.50
@@ -60,9 +61,9 @@ class TrainingConfigV3:
     curriculum: bool = True
     curriculum_trade_frac: float = 0.08
     pbrs_anneal: bool = True
-    pbrs_min_scale: float = 0.15
-    w_income: float = 0.015
-    w_house_lock: float = 0.12
+    pbrs_min_scale: float = 0.0
+    w_income: float = 0.0002
+    w_house_lock: float = 0.30
 
     # League & 24/7 Checkpointing
     sparring_prob: float = 0.20
@@ -160,7 +161,7 @@ PRESETS: Dict[str, TrainingConfigV3] = {
     ),
     "server_cpu_24h": TrainingConfigV3(
         preset_name="server_cpu_24h",
-        description="Long-horizon 24/7 CPU server marathon (100M steps, auto-checkpoint + PBRS anneal)",
+        description="Long-horizon 24/7 CPU server marathon (100M steps, selective search + QR TD-lambda + PBRS anneal)",
         total_steps=100_000_000,
         rollout_steps=512,
         num_envs=100,
@@ -171,9 +172,10 @@ PRESETS: Dict[str, TrainingConfigV3] = {
         hidden_dim=384,
         critic_hidden_dim=512,
         num_quantiles=32,
-        search_worker_ratio=0.0,
-        ppo_epochs=2,
-        num_mini_batches=4,
+        search_worker_ratio=0.10,
+        ppo_epochs=3,
+        critic_extra_epochs=2,
+        num_mini_batches=8,
         checkpoint_interval=20,
         historical_save_interval=20,
         eval_interval=15,
@@ -181,7 +183,7 @@ PRESETS: Dict[str, TrainingConfigV3] = {
     ),
     "dragonfly_100m": TrainingConfigV3(
         preset_name="dragonfly_100m",
-        description="Model-3 Dragonfly 100M steps server marathon (10 workers, 100 envs, TileMixer d=64, peak ~1750 SPS)",
+        description="Model-3 Dragonfly v2 100M steps (selective search, QR TD-lambda, calibrated zero-sum rewards)",
         total_steps=100_000_000,
         rollout_steps=512,
         num_envs=100,
@@ -192,9 +194,10 @@ PRESETS: Dict[str, TrainingConfigV3] = {
         hidden_dim=384,
         critic_hidden_dim=512,
         num_quantiles=32,
-        search_worker_ratio=0.0,
-        ppo_epochs=2,
-        num_mini_batches=4,
+        search_worker_ratio=0.10,
+        ppo_epochs=3,
+        critic_extra_epochs=2,
+        num_mini_batches=8,
         checkpoint_interval=20,
         historical_save_interval=20,
         eval_interval=15,

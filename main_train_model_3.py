@@ -233,6 +233,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--num_workers", type=int, default=None)
     p.add_argument("--num_threads", type=int, default=None)
     p.add_argument("--ppo_epochs", type=int, default=None, help="PPO update epochs (default from preset)")
+    p.add_argument("--critic_extra_epochs", type=int, default=None, help="Extra Critic-only epochs per iteration")
     p.add_argument("--num_mini_batches", type=int, default=None, help="Number of PPO mini-batches (default from preset)")
     p.add_argument("--search_worker_ratio", type=float, default=None)
     p.add_argument("--pbrs_anneal", dest="pbrs_anneal", action="store_true")
@@ -254,7 +255,7 @@ def build_config(args: argparse.Namespace) -> TrainingConfigV3:
         cfg.num_threads = hw.recommended_torch_threads
         cfg.rollout_steps = hw.recommended_rollout_steps
 
-    for attr in ("arch", "d_model", "hidden_dim", "total_steps", "rollout_steps", "num_envs", "num_workers", "num_threads", "ppo_epochs", "num_mini_batches", "search_worker_ratio", "pbrs_anneal"):
+    for attr in ("arch", "d_model", "hidden_dim", "total_steps", "rollout_steps", "num_envs", "num_workers", "num_threads", "ppo_epochs", "critic_extra_epochs", "num_mini_batches", "search_worker_ratio", "pbrs_anneal"):
         val = getattr(args, attr, None)
         if val is not None:
             setattr(cfg, attr, val)
@@ -322,6 +323,7 @@ def train(args: argparse.Namespace):
         lr_critic=cfg.lr_critic,
         clip_param=cfg.clip_param,
         ppo_epochs=cfg.ppo_epochs,
+        critic_extra_epochs=cfg.critic_extra_epochs,
         num_mini_batches=cfg.num_mini_batches,
         value_loss_coef=cfg.value_loss_coef,
         entropy_coef=cfg.entropy_coef,

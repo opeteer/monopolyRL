@@ -38,15 +38,16 @@ class MAPPOTrainerV3:
         actor: ActorNetworkV3,
         critic: QuantileCritic,
         lr_actor: float = 2.0e-4,
-        lr_critic: float = 4.0e-4,
+        lr_critic: float = 5.0e-4,
         clip_param: float = 0.15,
-        ppo_epochs: int = 4,
+        ppo_epochs: int = 3,
+        critic_extra_epochs: int = 2,
         num_mini_batches: int = 8,
         value_loss_coef: float = 0.5,
         entropy_coef: float = 0.0035,
         uniform_kl_coef: float = 0.020,
         logit_l2_coef: float = 0.0015,
-        search_distill_coef: float = 0.05,
+        search_distill_coef: float = 0.08,
         quantile_huber_kappa: float = 1.0,
         cvar_alpha: float = 0.25,
         cvar_weight: float = 0.30,
@@ -59,6 +60,7 @@ class MAPPOTrainerV3:
         self.critic = critic
         self.clip_param = float(clip_param)
         self.ppo_epochs = int(ppo_epochs)
+        self.critic_extra_epochs = max(0, int(critic_extra_epochs))
         self.num_mini_batches = int(num_mini_batches)
         self.value_loss_coef = float(value_loss_coef)
         self.entropy_coef = float(entropy_coef)
@@ -302,8 +304,49 @@ class MAPPOTrainerV3:
         huber = F.huber_loss(p_q, t_q, delta=kappa, reduction="none")
         tau_view = taus.view(1, 1, -1, 1).to(diff.dtype)
         pinball = torch.abs(tau_view - (diff < 0.0).to(diff.dtype))
-        per_seat = (pinball * huber).mean(dim=(-1, -2))
+        # Standard QR-DQN reduction: mean over target samples j, SUM over quantile predictions i
+        # (prevents 1/N=1/32 gradient attenuation on trunk layers)
+        per_seat = (pinball * huber).mean(dim=-1).sum(dim=-1)
         return (per_seat * alive_mask).sum() / alive_mask.sum().clamp(min=1.0)
+
+    def _critic_step(
+        self,
+        global_state: torch.Tensor,
+        returns: torch.Tensor,
+        quantile_targets: torch.Tensor,
+    ) -> float:
+        bankrupt_flags = global_state[:, list(GLOBAL_BANKRUPT_INDICES)]
+        alive_mask = (1.0 - bankrupt_flags).clamp(0.0, 1.0)
+        if not torch.any(alive_mask > 0.5):
+            alive_mask = torch.ones_like(returns)
+
+        with torch.no_grad():
+            live_targs = quantile_targets[alive_mask > 0.5]
+            if live_targs.numel() > 1:
+                batch_std = float(live_targs.std(unbiased=False).clamp(min=1.0, max=100.0).item())
+                if not self._ret_std_initialized:
+                    self.ret_std = batch_std
+                    self._ret_std_initialized = True
+                else:
+                    self.ret_std = 0.95 * self.ret_std + 0.05 * batch_std
+
+        scale = max(1.0, float(self.ret_std))
+        pred_quantiles = self.critic(global_state)
+        q_loss = self.quantile_huber_loss(
+            pred_quantiles=pred_quantiles,
+            target_quantiles=quantile_targets,
+            taus=self.critic.taus,
+            scale=scale,
+            alive_mask=alive_mask,
+            kappa=self.quantile_huber_kappa,
+        )
+        critic_loss = self.value_loss_coef * q_loss
+
+        self.optimizer_critic.zero_grad()
+        critic_loss.backward()
+        nn.utils.clip_grad_norm_(self.critic.parameters(), self.max_grad_norm)
+        self.optimizer_critic.step()
+        return float(critic_loss.item())
 
     def train_step(
         self,
@@ -398,39 +441,15 @@ class MAPPOTrainerV3:
                         exploiter_early_stopped = True
 
                 # 2. Centralized Quantile Regression Critic update
-                bankrupt_flags = global_state[:, list(GLOBAL_BANKRUPT_INDICES)]
-                alive_mask = (1.0 - bankrupt_flags).clamp(0.0, 1.0)
-                if not torch.any(alive_mask > 0.5):
-                    alive_mask = torch.ones_like(returns)
+                total_value_loss += self._critic_step(global_state, returns, quantile_targets)
+                num_critic_updates += 1
 
-                with torch.no_grad():
-                    live_rets = returns[alive_mask > 0.5]
-                    if live_rets.numel() > 1:
-                        batch_std = float(live_rets.std(unbiased=False).clamp(min=1.0, max=100.0).item())
-                        if not self._ret_std_initialized:
-                            self.ret_std = batch_std
-                            self._ret_std_initialized = True
-                        else:
-                            self.ret_std = 0.95 * self.ret_std + 0.05 * batch_std
-
-                scale = max(1.0, float(self.ret_std))
-                pred_quantiles = self.critic(global_state)
-                q_loss = self.quantile_huber_loss(
-                    pred_quantiles=pred_quantiles,
-                    target_quantiles=quantile_targets,
-                    taus=self.critic.taus,
-                    scale=scale,
-                    alive_mask=alive_mask,
-                    kappa=self.quantile_huber_kappa,
+        # Extra Critic-only passes so QuantileCritic tracks multi-step outcomes accurately
+        for _ in range(self.critic_extra_epochs):
+            for sample in buffer.get_generator(self.num_mini_batches):
+                total_value_loss += self._critic_step(
+                    sample["global_state"], sample["returns"], sample["quantile_targets"]
                 )
-                critic_loss = self.value_loss_coef * q_loss
-
-                self.optimizer_critic.zero_grad()
-                critic_loss.backward()
-                nn.utils.clip_grad_norm_(self.critic.parameters(), self.max_grad_norm)
-                self.optimizer_critic.step()
-
-                total_value_loss += float(critic_loss.item())
                 num_critic_updates += 1
 
         return {

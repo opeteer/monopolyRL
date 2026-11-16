@@ -321,12 +321,14 @@ class ActorNetworkV3(nn.Module):
         return uni_kl * has_choice
 
     @staticmethod
-    def _valid_uniform_kl_bern(logits: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
-        """Exact KL(Bernoulli(0.5) || Bernoulli(sigmoid(z))) averaged cleanly over valid mask bits."""
+    def _valid_uniform_kl_bern(logits: torch.Tensor, mask: torch.Tensor, p_prior: float = 0.15) -> torch.Tensor:
+        """Exact KL(Bernoulli(p_prior) || Bernoulli(sigmoid(z))) preventing overly dense 50% bundle spam."""
         m = (mask > 0).to(logits.dtype).to(logits.device)
         cnt = m.sum(dim=-1)
         has_choice = (cnt > 0.5).to(logits.dtype)
-        kl_bits = 0.5 * (F.softplus(-logits) + F.softplus(logits)) - math.log(2.0)
+        # KL(p0 || sig(z)) = softplus(z) - p0*z - H(p0), strictly >= 0 and minimized cleanly at sig(z) == p0
+        h_prior = -(p_prior * math.log(p_prior) + (1.0 - p_prior) * math.log(1.0 - p_prior))
+        kl_bits = F.softplus(logits) - p_prior * logits - h_prior
         return ((kl_bits.clamp(min=0.0) * m).sum(dim=-1) / cnt.clamp(min=1.0)) * has_choice
 
     @staticmethod

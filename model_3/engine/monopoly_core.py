@@ -228,18 +228,18 @@ class MonopolyCore:
         seed: Optional[int] = None,
         max_rounds: Optional[int] = 80,
         gamma: float = 0.997,
-        w1: float = 0.025,
-        w2: float = 0.0034,
-        w3: float = 0.014,
-        w4: float = 0.0006,
-        w_syn: float = 0.030,
-        beta_starve: float = 4.0,
-        w_house: float = 0.0145,
-        w_cash: float = 0.0034,
-        w_opp_mono: float = 0.85,
-        w_lead: float = 0.80,
-        w_income: float = 0.0005,
-        w_house_lock: float = 0.35,
+        w1: float = 0.006,
+        w2: float = 0.0005,
+        w3: float = 0.0022,
+        w4: float = 0.00015,
+        w_syn: float = 0.005,
+        beta_starve: float = 0.6,
+        w_house: float = 0.0015,
+        w_cash: float = 0.0004,
+        w_opp_mono: float = 0.18,
+        w_lead: float = 0.25,
+        w_income: float = 0.0002,
+        w_house_lock: float = 0.30,
         pbrs_scale: float = 1.0,
         allow_trade: bool = True,
         player_names: Optional[List[str]] = None,
@@ -670,12 +670,16 @@ class MonopolyCore:
         term2_prop = 0.0
         term2_house = 0.0
         my_non_hotel_houses = 0
+        # Diminishing marginal house stage weights (3h strong ROI; 4->5 hotel mild to respect shortage lock)
+        house_stage_w = (0.0, 1.0, 2.0, 3.1, 4.0, 4.35)
         for p in PURCHASABLE_TILES_TUPLE:
             if self.property_owner[p] == player_id:
                 m_p = 1.0 if self.property_mortgaged[p] else 0.0
-                term2_prop += self._tile_prices_f[p] - m_p * 1.12 * self._tile_mortgages_f[p]
+                # 1.28x mortgage penalty deters pointless mortgage<->unmortgage 10% burn
+                term2_prop += self._tile_prices_f[p] - m_p * 1.28 * self._tile_mortgages_f[p]
                 h_p = self.property_houses[p]
-                term2_house += float(h_p * self._tile_house_costs_f[p])
+                if h_p > 0:
+                    term2_house += house_stage_w[min(5, h_p)] * self._tile_house_costs_f[p]
                 if 1 <= h_p <= 4:
                     my_non_hotel_houses += h_p
         term2 = (self.w2 * term2_prop) + (self.w_house * term2_house)
@@ -702,7 +706,7 @@ class MonopolyCore:
         term3 = self.w3 * term3_sum
         term7_opp_threat = self.w_opp_mono * opp_threat_score
 
-        # Expected rent hazard (Term 4) & Expected rent receivable (Term 9)
+        # Expected rent hazard (Term 4) & liquidity reserve shortfall
         term4_sum = 0.0
         if not self.in_jail[player_id]:
             pos_i = self.position[player_id]
@@ -711,7 +715,8 @@ class MonopolyCore:
                 owner = self.property_owner[t_tile]
                 if owner != -1 and owner != player_id and not self.bankrupt[owner] and not self.property_mortgaged[t_tile]:
                     term4_sum += prob * self._calculate_rent(t_tile, dice_sum=d)
-        term4 = self.w4 * term4_sum
+        reserve_shortfall = max(0.0, 0.5 * term4_sum - float(c_i))
+        term4 = (self.w4 * term4_sum) + (0.0006 * min(600.0, reserve_shortfall))
 
         term9_sum = 0.0
         if self.w_income > 0.0:
@@ -745,10 +750,11 @@ class MonopolyCore:
             avg_opp_nw = sum(float(self.get_player_net_worth(pl)) for pl in alive_opps) / float(len(alive_opps))
             term8_lead = self.w_lead * math.tanh((my_nw - avg_opp_nw) / 1500.0)
 
-        # Term 10: Housing Shortage Lock Control (incentivize holding 4-house locks when bank houses are tight)
+        # Term 10: Housing Shortage Lock Control (scaled proportionally to scarcity when bank houses <= 16)
         term10_house_lock = 0.0
-        if self.w_house_lock > 0.0 and self.bank_houses <= 16 and opp_has_underbuilt_monopoly:
-            term10_house_lock = self.w_house_lock * (my_non_hotel_houses / 32.0)
+        if self.w_house_lock > 0.0 and self.bank_houses <= 16 and opp_has_underbuilt_monopoly and my_non_hotel_houses > 0:
+            scarcity = (17.0 - float(self.bank_houses)) / 16.0
+            term10_house_lock = self.w_house_lock * scarcity * (float(my_non_hotel_houses) / 12.0)
 
         raw_phi = (
             term1 + term2 + term3 - term4 + term5 - term6_starve
@@ -1468,13 +1474,15 @@ class MonopolyCore:
         elif self.phase == PHASE_TRADE_RESPONSE:
             self._handle_trade_response(p, trade_response)
 
-        # Resolve negative cash / bankruptcy
+        # Resolve negative cash / bankruptcy (exact zero-sum rank-scaled elimination penalties)
+        elim_penalties = (-5.5, -3.5, -2.0, -1.0)
         batch_creditor = self.last_creditor
         for pl in range(4):
             if not self.bankrupt[pl] and self.cash[pl] < 0:
                 self._resolve_bankruptcy(pl, creditor_override=batch_creditor)
                 if self.bankrupt[pl]:
-                    env_rewards[pl] -= 10.0
+                    e_pos = self.elimination_order.index(pl) if pl in self.elimination_order else max(0, len(self.elimination_order) - 1)
+                    env_rewards[pl] += elim_penalties[min(3, e_pos)]
         self.last_creditor = None
 
         active_players = [pl for pl in range(4) if not self.bankrupt[pl]]
@@ -1488,21 +1496,27 @@ class MonopolyCore:
             dones["__all__"] = True
             if len(active_players) == 1:
                 winner = active_players[0]
-                env_rewards[winner] += 10.0
+                env_rewards[winner] += 11.0
                 self._log(f"Game Over! {self.get_player_name(winner)} is CHAMPION!")
             elif len(active_players) > 1:
-                net_worths = [self.get_player_net_worth(pl) if not self.bankrupt[pl] else -99999 for pl in range(4)]
-                max_nw = max(net_worths[pl] for pl in active_players)
-                leaders = [pl for pl in active_players if net_worths[pl] == max_nw]
-                if len(leaders) == 1:
-                    winner = leaders[0]
-                    env_rewards[winner] += 1.0
-                    for pl in active_players:
-                        if pl != winner:
-                            env_rewards[pl] -= 10.0
-                else:
-                    for pl in active_players:
-                        env_rewards[pl] -= 10.0
+                # Zero-sum timeout payoffs ranked cleanly by net worth, balancing earlier elimination penalties
+                k_alive = len(active_players)
+                timeout_slots = {
+                    4: (7.5, -1.0, -2.5, -4.0),
+                    3: (8.0, -0.5, -2.0),
+                    2: (9.0, 0.0),
+                }[k_alive]
+                net_worths = {pl: self.get_player_net_worth(pl) for pl in active_players}
+                ranked = sorted(active_players, key=lambda x: net_worths[x], reverse=True)
+                idx = 0
+                while idx < len(ranked):
+                    j = idx + 1
+                    while j < len(ranked) and net_worths[ranked[j]] == net_worths[ranked[idx]]:
+                        j += 1
+                    avg_payoff = sum(timeout_slots[idx:j]) / float(j - idx)
+                    for m_i in range(idx, j):
+                        env_rewards[ranked[m_i]] += avg_payoff
+                    idx = j
         else:
             dones["__all__"] = False
 
